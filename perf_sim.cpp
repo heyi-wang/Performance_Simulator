@@ -571,11 +571,26 @@ struct Worker : sc_module
         wait(cyc * CYCLE);
     }
 
-    void issue(uint64_t addr, uint64_t svc_cycles)
+    // Handle for an in-flight accelerator request.
+    // Returned by issue_begin(); must be finalized with issue_end().
+    struct PendingReq
     {
-        auto *gp = new tlm_generic_payload();
-        // gp->acquire();
+        tlm_generic_payload *gp = nullptr;
+        ReqExt *req_ext = nullptr;
+        TxnExt *tx_ext = nullptr;
+        sc_event *done_ev = nullptr;
+        uint64_t svc_cycles = 0;
+        bool sync_done = false;
+    };
 
+    // Send a request to the accelerator and return immediately.
+    // The caller may do other work (scalar overhead) before calling issue_end().
+    PendingReq issue_begin(uint64_t addr, uint64_t svc_cycles)
+    {
+        PendingReq p;
+        p.svc_cycles = svc_cycles;
+
+        auto *gp = new tlm_generic_payload();
         gp->set_command(TLM_IGNORE_COMMAND);
         gp->set_address(addr);
         gp->set_data_ptr(nullptr);
@@ -584,79 +599,108 @@ struct Worker : sc_module
         gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
 
         auto *req = new ReqExt(tid, svc_cycles, A_bytes + B_bytes, C_bytes);
-        auto *tx = new TxnExt();
+        auto *tx  = new TxnExt();
         tx->src_worker = tid;
 
         gp->set_extension(req);
         gp->set_extension(tx);
 
-        sc_event done_ev;
-        done_map[gp] = &done_ev;
+        p.gp      = gp;
+        p.req_ext = req;
+        p.tx_ext  = tx;
+        p.done_ev = new sc_event();
+        done_map[gp] = p.done_ev;
 
-        sc_time t0 = sc_time_stamp();
         tlm_phase phase = BEGIN_REQ;
-        sc_time delay = SC_ZERO_TIME;
-
+        sc_time   delay = SC_ZERO_TIME;
         auto status = init->nb_transport_fw(*gp, phase, delay);
 
         if (status == TLM_COMPLETED)
         {
-            // immediate completion case
-        }
-        else
-        {
-            wait(done_ev);
+            done_map.erase(gp);
+            p.sync_done = true;
         }
 
-        sc_time t1 = sc_time_stamp();
+        return p;
+    }
+
+    // Wait for a previously issued request to complete, collect stats,
+    // close the TLM handshake, and free resources.
+    void issue_end(PendingReq &p)
+    {
+        if (!p.sync_done)
+            wait(*p.done_ev);
+
+        done_map.erase(p.gp);
+        delete p.done_ev;
+        p.done_ev = nullptr;
 
         ReqExt *ext = nullptr;
-        gp->get_extension(ext);
+        p.gp->get_extension(ext);
 
-        wait_cycles += ext ? ext->accel_qwait_cycles : 0;
-        compute_cycles += svc_cycles;
-        mem_cycles_accum += ext ? ext->mem_cycles : 0;
+        wait_cycles       += ext ? ext->accel_qwait_cycles : 0;
+        compute_cycles    += p.svc_cycles;
+        mem_cycles_accum  += ext ? ext->mem_cycles : 0;
 
-        // Close response handshake
         tlm_phase end_phase = END_RESP;
-        sc_time end_delay = SC_ZERO_TIME;
-        init->nb_transport_fw(*gp, end_phase, end_delay);
+        sc_time   end_delay = SC_ZERO_TIME;
+        init->nb_transport_fw(*p.gp, end_phase, end_delay);
 
-        done_map.erase(gp);
+        p.gp->clear_extension(p.req_ext);
+        p.gp->clear_extension(p.tx_ext);
+        delete p.req_ext;
+        delete p.tx_ext;
+        delete p.gp;
 
-        gp->clear_extension(req);
-        gp->clear_extension(tx);
-        delete req;
-        delete tx;
-
-        // gp->release();
-        delete gp;
-
-        (void)t0;
-        (void)t1;
+        p.gp      = nullptr;
+        p.req_ext = nullptr;
+        p.tx_ext  = nullptr;
     }
 
     void run()
     {
         sc_time start = sc_time_stamp();
 
-        for (uint64_t i = 0; i < access_mat; i++)
+        // Pipeline pattern for matrix accelerator:
+        //   send[i] → scalar_overhead (preparing [i+1]) ∥ accel processes [i]
+        //           → wait[i] → send[i+1] → ...
+        // The last request has no subsequent scalar overhead.
+        if (access_mat > 0)
         {
-            do_scalar(scalar_cycles);
-            issue(Interconnect::ADDR_MAT, mat_cycles);
+            auto pending = issue_begin(Interconnect::ADDR_MAT, mat_cycles);
             mat_calls++;
+
+            for (uint64_t i = 1; i < access_mat; i++)
+            {
+                do_scalar(scalar_cycles); // overlapped with accelerator processing
+                issue_end(pending);
+                pending = issue_begin(Interconnect::ADDR_MAT, mat_cycles);
+                mat_calls++;
+            }
+
+            issue_end(pending);
         }
 
-        for (uint64_t i = 0; i < access_vec; i++)
+        // Same pipeline pattern for vector accelerator
+        if (access_vec > 0)
         {
-            do_scalar(scalar_cycles);
-            issue(Interconnect::ADDR_VEC, vec_cycles);
+            auto pending = issue_begin(Interconnect::ADDR_VEC, vec_cycles);
             vec_calls++;
+
+            for (uint64_t i = 1; i < access_vec; i++)
+            {
+                do_scalar(scalar_cycles);
+                issue_end(pending);
+                pending = issue_begin(Interconnect::ADDR_VEC, vec_cycles);
+                vec_calls++;
+            }
+
+            issue_end(pending);
         }
 
         sc_time end = sc_time_stamp();
         uint64_t elapsed_cycles = (uint64_t)((end - start) / CYCLE);
-        uint64_t total_cycles = compute_cycles + wait_cycles + mem_cycles_accum;
+        uint64_t total_cycles   = compute_cycles + wait_cycles + mem_cycles_accum;
 
         std::cout << "[T" << tid << "]"
                   << " mat_calls=" << mat_calls
