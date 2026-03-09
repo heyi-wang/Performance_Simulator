@@ -169,9 +169,9 @@ void Worker::run()
         issue_end(pending);
     }
 
-    sc_time  end           = sc_time_stamp();
-    uint64_t elapsed_cycles = (uint64_t)((end - start) / CYCLE);
-    uint64_t total_cycles   = compute_cycles + wait_cycles + mem_cycles_accum;
+    sc_time end        = sc_time_stamp();
+    elapsed_cycles     = (uint64_t)((end - start) / CYCLE);
+    uint64_t total_cycles = compute_cycles + wait_cycles + mem_cycles_accum;
 
     std::cout << "[T" << tid << "]"
               << " mat_calls="  << mat_calls

@@ -26,11 +26,12 @@ struct Worker : sc_module
     uint64_t vec_cycles;
     uint64_t scalar_cycles;
 
-    uint64_t compute_cycles  = 0;
-    uint64_t wait_cycles     = 0;
+    uint64_t compute_cycles   = 0;
+    uint64_t wait_cycles      = 0;
     uint64_t mem_cycles_accum = 0;
     uint64_t mat_calls        = 0;
     uint64_t vec_calls        = 0;
+    uint64_t elapsed_cycles   = 0;   // set at end of run(); used for GFLOPS reporting
 
     uint64_t A_bytes = 0;
     uint64_t B_bytes = 0;
