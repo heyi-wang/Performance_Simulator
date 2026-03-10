@@ -1,135 +1,397 @@
 # CLAUDE.md
 
-## Project goal
+## Project Goal
 
-Build a **functionally abstract performance simulator** in **C** for a specific **NAFNet** network that is already implemented in C.
+Build a **SystemC TLM-2.0 performance simulator** for a specific **NAFNet network**.
 
-The simulator should **not** execute the real neural network numerics for correctness. Instead, it should estimate performance by modeling:
+The simulator is based on an existing architecture skeleton that already models:
 
-- layer-by-layer compute cost
-- memory access cost
-- data movement cost
-- latency accumulation
-- optional cycle breakdown by layer type
+- multiple worker threads
+- one shared matrix accelerator
+- one shared vector accelerator
+- one shared memory system
 
-The target network contains:
+The simulator does **not** need to perform full neural-network numerical inference for correctness.  
+Its main purpose is to **estimate execution cycles** of the NAFNet workload on the modeled hardware architecture.
 
-- standard convolution layers
-- depth-wise convolution layers
+The simulator should map NAFNet layers into hardware requests and simulate:
 
-The simulator must be designed specifically for this network style, and the code structure should make it easy to extend later with:
+- compute latency
+- memory latency
+- accelerator contention
+- worker waiting time
+- total execution cycles
+- per-layer timing breakdown
 
-- pointwise convolution
-- activation
+---
+
+## Base Architecture
+
+The simulator is built on the following hardware model:
+
+Top
+ ├── Workers (N)  
+ │     Simulating CPU threads generating accelerator requests from layer tasks  
+ │
+ ├── MatrixAccelerator  
+ │     Processes matrix-related operations  
+ │
+ ├── VectorAccelerator  
+ │     Processes vector-related operations  
+ │
+ └── Memory  
+       Handles shared memory access latency
+
+This base simulator skeleton already provides the shared-resource architecture.  
+The NAFNet simulator must be built **on top of this structure**, not as a completely separate design.
+
+---
+
+## Communication Model
+
+Use **TLM-2.0 sockets** for communication.
+
+
+### Transport style
+
+Use the transport style already chosen in the base simulator skeleton.
+
+If the base simulator already uses:
+
+- `nb_transport_fw` / `nb_transport_bw`, then preserve the non-blocking architecture
+
+Do **not** rewrite the simulator into a different communication style unless explicitly requested.
+
+---
+
+## Timing Model
+
+Simulation is cycle-based.
+
+- `CYCLE = 1 ns`
+
+All latencies must be expressed in cycles and converted into `sc_time`.
+
+The simulator must include:
+
+- accelerator compute cycles
+- memory access cycles
+- waiting time when accelerators are busy
+- total completion time of all worker tasks
+
+The model is performance-oriented, so timing behavior is more important than actual arithmetic results.
+
+---
+
+## Purpose of the NAFNet Simulator
+
+The NAFNet simulator should represent the execution of a NAFNet network as a sequence of layer tasks.
+
+The simulator must estimate how the network runs on the hardware architecture by modeling:
+
+- which accelerator each layer uses
+- how many requests each layer generates
+- how long each request takes
+- how much memory traffic each layer causes
+- how workers contend for shared resources
+- how much total execution time the network needs
+
+The simulator should support at least the following NAFNet-relevant operators first:
+
+1. standard/pointwise convolution 
+2. depth-wise convolution
+
+Later it should be easy to extend to:
+
 - elementwise add
+- activation-like vector operations
 - layer normalization
-- pooling
-- upsampling / pixel shuffle related operators
+- pixel shuffle / reshape-like steps
 
 ---
 
-## High-level requirements
+## Mapping NAFNet Layers to Hardware
 
-When generating code for this project, always follow these principles:
+The simulator must map NAFNet layers to the base hardware as follows.
 
-1. **Use C, not C++**
-   - Do not use classes, templates, STL, or C++ syntax.
-   - Use plain C structs, enums, arrays, and functions.
+### 1. Standard convolution / 
+Standard convolution is mainly modeled as a **matrix accelerator workload**.
+After the matrix task, a vector task as **vector accelerator workload is followed to quantize the output back to smaller datatype
 
-2. **Beginner-first coding style**
-   - Write the first version in a very clear and explicit way.
-   - Prefer readable loops and direct formulas over overly clever abstractions.
-   - Comments should explain why each step exists.
+For each standard convolution layer, the simulator should estimate:
 
-3. **Performance simulator, not full inference engine**
-   - Do not implement real convolution math unless explicitly requested.
-   - The simulator only needs metadata such as tensor sizes, kernel sizes, channels, stride, padding, etc.
-   - The purpose is cycle estimation and bottleneck analysis.
+- total compute cycles on matrix accelerator
+- memory reads for input feature map
+- memory reads for weights
+- memory writes for output feature map
 
-4. **Network-specific but structured**
-   - The simulator should work well for this NAFNet-style network.
-   - Still keep a modular structure so new operators can be added later.
+The layer may be split into multiple accelerator requests if needed.
 
-5. **Deterministic and inspectable**
-   - Every cycle contribution should come from a clear formula.
-   - The program should be able to print a per-layer report and a final summary.
+### 2. Depth-wise convolution
+Depth-wise convolution should be modeled separately from normal convolution.
+
+In the first version, depth-wise convolution should be mapped to the **vector accelerator** unless the user later specifies a different mapping.
+
+This is because depth-wise convolution has lower cross-channel reuse and should be treated differently from dense convolution in the performance model.
+
+For each depth-wise convolution layer, estimate:
+
+- compute cycles on vector accelerator
+- input memory reads
+- weight memory reads
+- output memory writes
+
+### 3. Optional future mapping
+If later requested, the simulator may support more detailed mappings, for example:
+
+- pointwise conv → matrix accelerator
+- activation / scale / add → vector accelerator
+- normalization → vector accelerator
+- reshape / shuffle → memory-only or lightweight vector operations
+
+But the first implementation should focus on:
+
+- standard conv
+- depth-wise conv
 
 ---
 
-## What the simulator should model
+## Design Rules
 
-The simulator should estimate the latency of each layer using a simplified hardware-aware model.
+Always follow these rules:
 
-For each layer, model at least:
+1. Accelerators are shared resources.
+2. Only one request can be processed on an accelerator at a time.
+3. If multiple workers request the same accelerator, later requests must wait.
+4. Waiting time contributes to the worker’s total cycle count.
+5. Memory latency must be included in total layer latency.
+6. Each accelerator may generate memory transactions while processing a request.
+7. The simulator must preserve timing causality of the base SystemC/TLM model.
+8. each nb_transport_fw call from the worker generates certain scalar overhead. 
 
-- input tensor shape
-- output tensor shape
+---
+
+## Worker Role in the NAFNet Simulator
+
+Workers do not execute real convolution numerics.
+
+Instead, workers act as **task generators** for the NAFNet workload.
+
+Each worker should process assigned portions of the network workload and send requests to the correct accelerator.
+
+Possible workload partitioning strategies:
+
+- layer-by-layer assignment
+- tile-based assignment
+- output-channel partitioning
+- spatial partitioning
+
+For the first implementation, prefer the simplest clear strategy.
+
+Recommended default:
+- represent the NAFNet as an ordered layer list
+- each worker issues requests corresponding to its assigned work units
+- requests carry metadata describing the work
+
+The simulator must be structured so that the partitioning strategy can be changed later without redesigning the whole system.
+
+---
+
+## Required Metadata in Transactions
+
+Use `tlm_extension` to attach request metadata.
+
+Each request extension should contain at least:
+
+- source worker id
+- layer id
+- layer type
+- computation cycles
+- memory read bytes
+- memory write bytes
+
+Optional fields that may be added later:
+
+- tile id
+- input tensor dimensions
+- output tensor dimensions
+- kernel dimensions
+- request start cycle
+- queue waiting cycles
+- memory service cycles
+
+Example intent of metadata:
+- identify which worker sent the request
+- identify which layer the request belongs to
+- allow accelerator and memory modules to compute timing correctly
+- support reporting later
+
+---
+
+## NAFNet Layer Representation
+
+Represent the NAFNet network explicitly as a list of layer descriptors.
+
+Do **not** try to automatically parse arbitrary C source in the first version.
+
+The first version should use a hardcoded structural description of the network.
+
+Each NAFNet layer descriptor should contain at least:
+
+- layer name
+- layer type
+- input height / width / channels
+- output height / width / channels
 - kernel size
 - stride
 - padding
-- number of channels
-- operation type
-- total MACs / ops
-- estimated memory reads
-- estimated memory writes
-- estimated cycle count
+- groups
+- estimated compute cycles
+- estimated memory traffic
 
-For the whole network, report at least:
+Suggested layer types:
 
+- `LAYER_CONV`
+- `LAYER_DWCONV`
+
+Future layer types may include:
+
+- `LAYER_PWCONV`
+- `LAYER_ADD`
+- `LAYER_ACT`
+- `LAYER_NORM`
+- `LAYER_SHUFFLE`
+
+The first task is to build a correct simulator for the first two.
+
+---
+
+## Performance Model
+
+The simulator is cycle-based and uses predefined cycle assumptions.
+
+For each NAFNet layer or tile, estimate:
+
+- accelerator compute cycles
+- memory read latency
+- memory write latency
+- waiting time due to accelerator contention
+
+### Standard convolution
+Treat as matrix accelerator workload.
+
+The compute cycles may be estimated from convolution shape information such as:
+
+- `Hout`
+- `Wout`
+- `Cin`
+- `Cout`
+- `Kh`
+- `Kw`
+
+A simple first model is acceptable, for example using total MAC count and accelerator throughput.
+
+### Depth-wise convolution
+Treat as vector accelerator workload in the first version.
+
+Its cycle model should be separate from standard convolution, because its computation and memory behavior differ.
+
+### Memory
+Memory latency must be included whenever an accelerator fetches input/weights or writes back output.
+
+The memory system is shared.  
+If the existing base simulator models memory as a simple fixed-latency target, keep that behavior first.
+
+Later extensions may model:
+
+- bandwidth
+- burst count
+- read/write separation
+- contention
+
+But first keep it simple and consistent with the base simulator.
+
+---
+
+## Layer Latency Composition
+
+For each request, total timing should conceptually include:
+
+- time waiting for accelerator availability
+- compute time on accelerator
+- memory access time triggered by accelerator
+
+For each worker, total cycles should accumulate:
+
+- local scalar overhead if applicable
+- waiting cycles
+- accelerator service cycles
+- memory cycles
+
+For the whole network, the simulator should report:
+
+- total simulated time
+- per-worker accumulated cycles
+- per-layer accumulated cycles
+- per-accelerator utilization estimate
+
+---
+
+## Reporting Requirements
+
+The simulator must produce a readable report.
+
+At minimum, report:
+
+### Global summary
+- total simulation time
 - total cycles
-- total MACs
-- total bytes read
-- total bytes written
-- per-layer cycle table
-- percentage of time spent in:
-  - normal convolution
-  - depth-wise convolution
-  - memory traffic
+- number of workers
+- number of requests sent to matrix accelerator
+- number of requests sent to vector accelerator
+- total memory transactions
+
+### Per-layer summary
+For each NAFNet layer, print:
+
+- layer id
+- layer name
+- layer type
+- assigned accelerator
+- number of requests
+- compute cycles
+- memory bytes read
+- memory bytes written
+- estimated total cycles
+
+### Per-worker summary
+For each worker, print:
+
+- worker id
+- total accumulated cycles
+- waiting cycles
+- number of issued requests
+
+### Optional later reports
+- matrix accelerator busy timeline
+- vector accelerator busy timeline
+- memory access timeline
+- CSV export
 
 ---
 
-## Supported layer types
+## Coding Style
 
-Implement these layer types first:
+Always follow these coding rules:
 
-### 1. Standard convolution
-A normal convolution with:
-
-- `Cin` input channels
-- `Cout` output channels
-- kernel `Kh x Kw`
-- output feature map `Hout x Wout`
-
-Basic operation count:
-
-- MACs = `Hout * Wout * Cout * Cin * Kh * Kw`
-
-### 2. Depth-wise convolution
-A depth-wise convolution with:
-
-- one spatial kernel per input channel
-- usually `groups = Cin = Cout`
-
-Basic operation count:
-
-- MACs = `Hout * Wout * Cin * Kh * Kw`
-
-This must be modeled separately because its compute density and memory behavior differ from standard convolution.
+1. Use `struct` for SystemC modules.
+2. Keep the existing base simulator style consistent.
+3. Use explicit and readable code first.
+4. Prefer beginner-friendly logic over over-engineered abstractions.
+5. Keep comments in English.
+6. Separate module responsibilities clearly.
+7. Use clear names for layers, transactions, and timing fields.
+8. Preserve the SystemC/TLM structure instead of hiding behavior in overly generic utilities.
 
 ---
 
-## Performance model assumptions
-
-Unless the user provides a different hardware model, assume a simple configurable accelerator model.
-
-Use a parameter struct such as:
-
-```c
-typedef struct {
-    unsigned long macs_per_cycle_conv;
-    unsigned long macs_per_cycle_dwconv;
-    unsigned long bytes_per_cycle_mem;
-    unsigned long cache_line_bytes;
-    unsigned long memory_latency_cycles;
-    unsigned long kernel_launch_overhead_cycles;
-} HardwareConfig;
