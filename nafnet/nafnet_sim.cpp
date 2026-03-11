@@ -102,18 +102,28 @@ struct NafWorker : sc_module
     uint64_t vec_calls           = 0;
     uint64_t elapsed_cycles      = 0;
 
+    // Synchronization entry for one in-flight request.
+    // fired is set to true by peq_thread before notifying done_ev, so
+    // issue_end can skip the wait() if the response already arrived
+    // (e.g. when accelerator service time < scalar overhead).
+    struct DoneEntry
+    {
+        sc_event *ev    = nullptr;
+        bool      fired = false;
+    };
+
     // In-flight request registry
-    std::unordered_map<tlm_generic_payload *, sc_event *> done_map;
+    std::unordered_map<tlm_generic_payload *, DoneEntry *> done_map;
 
     // Handle returned by issue_begin; consumed by issue_end.
     struct PendingReq
     {
-        tlm_generic_payload *gp       = nullptr;
-        ReqExt              *req_ext  = nullptr;
-        TxnExt              *tx_ext   = nullptr;
-        NafLayerExt         *naf_ext  = nullptr;
-        sc_event            *done_ev  = nullptr;
-        uint64_t             svc_cyc  = 0;
+        tlm_generic_payload *gp         = nullptr;
+        ReqExt              *req_ext    = nullptr;
+        TxnExt              *tx_ext     = nullptr;
+        NafLayerExt         *naf_ext    = nullptr;
+        DoneEntry           *done_entry = nullptr;
+        uint64_t             svc_cyc   = 0;
         bool                 sync_done = false;
     };
 
@@ -149,7 +159,9 @@ struct NafWorker : sc_module
     }
 
     // ----------------------------------------------------------
-    // peq_thread: wake up done events when responses arrive
+    // peq_thread: wake up done events when responses arrive.
+    // Always set fired=true before notifying so issue_end can
+    // detect a response that arrived before wait() was called.
     // ----------------------------------------------------------
     void peq_thread()
     {
@@ -160,7 +172,10 @@ struct NafWorker : sc_module
             {
                 auto it = done_map.find(gp);
                 if (it != done_map.end() && it->second)
-                    it->second->notify(SC_ZERO_TIME);
+                {
+                    it->second->fired = true;
+                    it->second->ev->notify(SC_ZERO_TIME);
+                }
             }
         }
     }
@@ -208,12 +223,14 @@ struct NafWorker : sc_module
         gp->set_extension(tx);
         gp->set_extension(naf);
 
-        p.gp      = gp;
-        p.req_ext = req;
-        p.tx_ext  = tx;
-        p.naf_ext = naf;
-        p.done_ev = new sc_event();
-        done_map[gp] = p.done_ev;
+        p.gp         = gp;
+        p.req_ext    = req;
+        p.tx_ext     = tx;
+        p.naf_ext    = naf;
+        p.done_entry = new DoneEntry();
+        p.done_entry->ev    = new sc_event();
+        p.done_entry->fired = false;
+        done_map[gp] = p.done_entry;
 
         tlm_phase phase = BEGIN_REQ;
         sc_time   delay = SC_ZERO_TIME;
@@ -232,12 +249,15 @@ struct NafWorker : sc_module
     // ----------------------------------------------------------
     void issue_end(PendingReq &p, NafLayerStats &s)
     {
-        if (!p.sync_done)
-            wait(*p.done_ev);
+        // If the response already arrived (fired=true) before we get
+        // here, skip wait() to avoid blocking on a stale event.
+        if (!p.sync_done && !p.done_entry->fired)
+            wait(*p.done_entry->ev);
 
         done_map.erase(p.gp);
-        delete p.done_ev;
-        p.done_ev = nullptr;
+        delete p.done_entry->ev;
+        delete p.done_entry;
+        p.done_entry = nullptr;
 
         // Read back timing filled in by AcceleratorTLM
         ReqExt *ext = nullptr;
@@ -282,64 +302,79 @@ struct NafWorker : sc_module
 
             if (l.type == LAYER_CONV)
             {
+                // Per-worker DMA budget for this layer.
+                // Reads happen once (DMA load before first MAT tile).
+                // Writes happen once (DMA write-back after last VEC tile).
+                uint64_t rd_layer = cdiv64(layer_rd_bytes(l),
+                                           (uint64_t)n_workers);
+                uint64_t wr_layer = cdiv64(layer_wr_bytes(l),
+                                           (uint64_t)n_workers);
+
                 // --- MAT phase: one request per hardware tile ---
-                uint64_t mat_t   = cdiv64(conv_mat_tiles(l),
-                                          (uint64_t)n_workers);
-                uint64_t rd_tile = cdiv64(layer_rd_bytes(l),
-                                          mat_t * (uint64_t)n_workers);
+                // Only the first tile carries rd_bytes (DMA load into SRAM).
+                // All subsequent tiles read from on-chip SRAM (zero DRAM bytes).
+                uint64_t mat_t = cdiv64(conv_mat_tiles(l),
+                                        (uint64_t)n_workers);
 
                 for (uint64_t t = 0; t < mat_t; ++t)
                 {
+                    uint64_t rd = (t == 0) ? rd_layer : 0;
                     auto pm = issue_begin(Interconnect::ADDR_MAT,
-                                          MATMUL_ACC_CYCLE, rd_tile, 0,
+                                          MATMUL_ACC_CYCLE, rd, 0,
                                           l.id, l.type);
                     ++mat_calls;
                     ++s.mat_reqs;
                     s.accel_cycles += MATMUL_ACC_CYCLE;
-                    s.rd_bytes     += rd_tile;
+                    s.rd_bytes     += rd;
                     do_scalar(SCALAR_OVERHEAD);
                     issue_end(pm, s);
                 }
 
                 // --- VEC phase: one request per requantize tile ---
-                uint64_t vec_t   = cdiv64(conv_vec_quant_tiles(l),
-                                          (uint64_t)n_workers);
-                uint64_t wr_tile = cdiv64(layer_wr_bytes(l),
-                                          vec_t * (uint64_t)n_workers);
+                // Only the last tile carries wr_bytes (DMA write-back from SRAM).
+                uint64_t vec_t = cdiv64(conv_vec_quant_tiles(l),
+                                        (uint64_t)n_workers);
 
                 for (uint64_t t = 0; t < vec_t; ++t)
                 {
+                    uint64_t wr = (t == vec_t - 1) ? wr_layer : 0;
                     auto pv = issue_begin(Interconnect::ADDR_VEC,
-                                          DWCONV_ACC_CYCLE, 0, wr_tile,
+                                          DWCONV_ACC_CYCLE, 0, wr,
                                           l.id, l.type);
                     ++vec_calls;
                     ++s.vec_reqs;
                     s.accel_cycles += DWCONV_ACC_CYCLE;
-                    s.wr_bytes     += wr_tile;
+                    s.wr_bytes     += wr;
                     do_scalar(SCALAR_OVERHEAD);
                     issue_end(pv, s);
                 }
             }
             else // LAYER_DWCONV
             {
+                // Per-worker DMA budget for this layer.
+                uint64_t rd_layer = cdiv64(layer_rd_bytes(l),
+                                           (uint64_t)n_workers);
+                uint64_t wr_layer = cdiv64(layer_wr_bytes(l),
+                                           (uint64_t)n_workers);
+
                 // --- VEC phase: one request per DW-conv tile ---
-                uint64_t dw_t    = cdiv64(dwconv_vec_tiles(l),
-                                          (uint64_t)n_workers);
-                uint64_t rd_tile = cdiv64(layer_rd_bytes(l),
-                                          dw_t * (uint64_t)n_workers);
-                uint64_t wr_tile = cdiv64(layer_wr_bytes(l),
-                                          dw_t * (uint64_t)n_workers);
+                // First tile: DMA load (rd_bytes). Last tile: DMA write-back (wr_bytes).
+                // Middle tiles: on-chip SRAM only (zero DRAM bytes).
+                uint64_t dw_t = cdiv64(dwconv_vec_tiles(l),
+                                       (uint64_t)n_workers);
 
                 for (uint64_t t = 0; t < dw_t; ++t)
                 {
+                    uint64_t rd = (t == 0)          ? rd_layer : 0;
+                    uint64_t wr = (t == dw_t - 1)   ? wr_layer : 0;
                     auto pv = issue_begin(Interconnect::ADDR_VEC,
-                                          DWCONV_ACC_CYCLE, rd_tile, wr_tile,
+                                          DWCONV_ACC_CYCLE, rd, wr,
                                           l.id, l.type);
                     ++vec_calls;
                     ++s.vec_reqs;
                     s.accel_cycles += DWCONV_ACC_CYCLE;
-                    s.rd_bytes     += rd_tile;
-                    s.wr_bytes     += wr_tile;
+                    s.rd_bytes     += rd;
+                    s.wr_bytes     += wr;
                     do_scalar(SCALAR_OVERHEAD);
                     issue_end(pv, s);
                 }
