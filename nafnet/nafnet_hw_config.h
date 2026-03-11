@@ -60,7 +60,7 @@ static const uint64_t CPU_THROUGHPUT    = 4;  // scalar ops / cycle
 // Every accelerator request triggers memory traffic.
 // Latency model:  cycles = MEM_BASE_LAT + ceil(bytes / MEM_BW)
 // ------------------------------------------------------------
-static const uint64_t MEM_BASE_LAT      = 20; // fixed base latency (cycles)
+static const uint64_t MEM_BASE_LAT      = 10; // fixed base latency (cycles)
 static const uint64_t MEM_BW            = 32; // bytes per cycle
 
 // ------------------------------------------------------------

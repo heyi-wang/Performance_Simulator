@@ -75,6 +75,34 @@ inline uint64_t dwconv_vec_cycles(const LayerDesc &l)
 }
 
 // ============================================================
+// Tile-count helpers
+//   Return the TOTAL number of accelerator tiles for a layer.
+//   Per-worker tile count = cdiv64(total_tiles, N_WORKERS).
+// ============================================================
+
+// MAT tiles for one CONV layer (sp × co × ci tile decomposition)
+inline uint64_t conv_mat_tiles(const LayerDesc &l)
+{
+    return cdiv64((uint64_t)l.Hout * l.Wout, MATMUL_M)
+         * cdiv64((uint64_t)l.Cout, MATMUL_N)
+         * cdiv64((uint64_t)l.Cin * l.Kh * l.Kw, MATMUL_K);
+}
+
+// VEC tiles for the requantize pass that follows each CONV layer
+inline uint64_t conv_vec_quant_tiles(const LayerDesc &l)
+{
+    return cdiv64((uint64_t)l.Hout * l.Wout * l.Cout, DWCONV_CAP);
+}
+
+// VEC tiles for a DWCONV layer
+inline uint64_t dwconv_vec_tiles(const LayerDesc &l)
+{
+    return cdiv64((uint64_t)l.Hout * l.Wout * l.Cout
+                  * (uint64_t)l.Kh * l.Kw,
+                  DWCONV_CAP);
+}
+
+// ============================================================
 // Memory-traffic helpers (int8, 1 byte per element)
 // ============================================================
 
