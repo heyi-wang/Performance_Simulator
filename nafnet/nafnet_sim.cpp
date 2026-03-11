@@ -151,10 +151,13 @@ struct NafWorker : sc_module
     // fired is set to true by peq_thread before notifying done_ev, so
     // issue_end can skip the wait() if the response already arrived
     // (e.g. when accelerator service time < scalar overhead).
+    // admit_ev is notified by nb_transport_bw when the accelerator sends
+    // a deferred END_REQ (backpressure case: queue was full at issue time).
     struct DoneEntry
     {
-        sc_event *ev    = nullptr;
-        bool      fired = false;
+        sc_event *ev       = nullptr;
+        sc_event *admit_ev = nullptr;
+        bool      fired    = false;
     };
 
     // In-flight request registry
@@ -163,13 +166,14 @@ struct NafWorker : sc_module
     // Handle returned by issue_begin; consumed by issue_end.
     struct PendingReq
     {
-        tlm_generic_payload *gp         = nullptr;
-        ReqExt              *req_ext    = nullptr;
-        TxnExt              *tx_ext     = nullptr;
-        NafLayerExt         *naf_ext    = nullptr;
-        DoneEntry           *done_entry = nullptr;
-        uint64_t             svc_cyc   = 0;
-        bool                 sync_done = false;
+        tlm_generic_payload *gp          = nullptr;
+        ReqExt              *req_ext     = nullptr;
+        TxnExt              *tx_ext      = nullptr;
+        NafLayerExt         *naf_ext     = nullptr;
+        DoneEntry           *done_entry  = nullptr;
+        uint64_t             svc_cyc     = 0;
+        uint64_t             stall_cycles = 0; // cycles blocked waiting for queue slot
+        bool                 sync_done   = false;
     };
 
     SC_HAS_PROCESS(NafWorker);
@@ -194,14 +198,26 @@ struct NafWorker : sc_module
     }
 
     // ----------------------------------------------------------
-    // nb_transport_bw: receive BEGIN_RESP from downstream
+    // nb_transport_bw: receive BEGIN_RESP or deferred END_REQ
     // ----------------------------------------------------------
     tlm_sync_enum nb_transport_bw(tlm_generic_payload &gp,
                                   tlm_phase           &phase,
                                   sc_time             &delay)
     {
         if (phase == BEGIN_RESP)
+        {
             peq.notify(gp, delay);
+            return TLM_ACCEPTED;
+        }
+        if (phase == END_REQ)
+        {
+            // Deferred admission: the accelerator had a full queue and is now
+            // granting a slot.  Wake up issue_begin which is waiting on admit_ev.
+            auto it = done_map.find(&gp);
+            if (it != done_map.end() && it->second && it->second->admit_ev)
+                it->second->admit_ev->notify(SC_ZERO_TIME);
+            return TLM_ACCEPTED;
+        }
         return TLM_ACCEPTED;
     }
 
@@ -275,15 +291,24 @@ struct NafWorker : sc_module
         p.tx_ext     = tx;
         p.naf_ext    = naf;
         p.done_entry = new DoneEntry();
-        p.done_entry->ev    = new sc_event();
-        p.done_entry->fired = false;
+        p.done_entry->ev       = new sc_event();
+        p.done_entry->admit_ev = new sc_event();
+        p.done_entry->fired    = false;
         done_map[gp] = p.done_entry;
 
         tlm_phase phase = BEGIN_REQ;
         sc_time   delay = SC_ZERO_TIME;
         auto status = init->nb_transport_fw(*gp, phase, delay);
 
-        if (status == TLM_COMPLETED)
+        if (status == TLM_ACCEPTED)
+        {
+            // Queue was full: block here until the accelerator grants a slot
+            // (it will send END_REQ backward, which notifies admit_ev).
+            sc_time t_stall_start = sc_time_stamp();
+            wait(*p.done_entry->admit_ev);
+            p.stall_cycles = (uint64_t)((sc_time_stamp() - t_stall_start) / CYCLE);
+        }
+        else if (status == TLM_COMPLETED)
         {
             done_map.erase(gp);
             p.sync_done = true;
@@ -303,6 +328,7 @@ struct NafWorker : sc_module
 
         done_map.erase(p.gp);
         delete p.done_entry->ev;
+        delete p.done_entry->admit_ev;
         delete p.done_entry;
         p.done_entry = nullptr;
 
@@ -314,11 +340,11 @@ struct NafWorker : sc_module
 
         // Accumulate into global worker totals
         total_accel_cycles += p.svc_cyc;
-        total_wait_cycles  += qwait;
+        total_wait_cycles  += qwait + p.stall_cycles;
         total_mem_cycles   += mec;
 
         // Accumulate into per-layer stats
-        s.wait_cycles += qwait;
+        s.wait_cycles += qwait + p.stall_cycles;
         s.mem_cycles  += mec;
 
         // Acknowledge END_RESP to the interconnect
@@ -491,8 +517,8 @@ struct NafTop : sc_module
     std::vector<LayerDesc>   layers;   // shared layer list
 
     SC_CTOR(NafTop)
-        : mat_acc("mat_acc"),
-          vec_acc("vec_acc"),
+        : mat_acc("mat_acc", ACC_QUEUE_DEPTH),
+          vec_acc("vec_acc", ACC_QUEUE_DEPTH),
           noc("noc"),
           memory("memory", MEM_BASE_LAT, MEM_BW),
           barrier(N_WORKERS)

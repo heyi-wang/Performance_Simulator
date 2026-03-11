@@ -71,3 +71,14 @@ static const uint64_t MEM_BW            = 32; // bytes per cycle
 // and after each accelerator invocation.
 // ------------------------------------------------------------
 static const uint64_t SCALAR_OVERHEAD   = 8;  // cycles per call
+
+// ------------------------------------------------------------
+// Accelerator request queue depth
+//
+// Each accelerator (matrix and vector) holds at most
+// ACC_QUEUE_DEPTH admitted requests at one time (including
+// the one currently being serviced and those waiting in the
+// internal FIFO queue).  Workers that try to issue a request
+// when the queue is full are stalled until a slot opens.
+// ------------------------------------------------------------
+static const size_t ACC_QUEUE_DEPTH     = 4;  // max admitted requests per accelerator

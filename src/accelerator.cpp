@@ -3,11 +3,12 @@
 
 SC_HAS_PROCESS(AcceleratorTLM);
 
-AcceleratorTLM::AcceleratorTLM(sc_module_name name)
+AcceleratorTLM::AcceleratorTLM(sc_module_name name, size_t cap)
     : sc_module(name),
       tgt("tgt"),
       to_mem("to_mem"),
-      peq("peq")
+      peq("peq"),
+      queue_capacity(cap)
 {
     tgt.register_nb_transport_fw(this, &AcceleratorTLM::nb_transport_fw);
     to_mem.register_nb_transport_bw(this, &AcceleratorTLM::nb_transport_bw_mem);
@@ -21,10 +22,22 @@ tlm_sync_enum AcceleratorTLM::nb_transport_fw(tlm_generic_payload &gp,
 {
     if (phase == BEGIN_REQ)
     {
-        peq.notify(gp, delay);
-        phase = END_REQ;
-        delay = SC_ZERO_TIME;
-        return TLM_UPDATED;
+        if (admitted < queue_capacity)
+        {
+            // Slot available: admit immediately through the PEQ.
+            ++admitted;
+            peq.notify(gp, delay);
+            phase = END_REQ;
+            delay = SC_ZERO_TIME;
+            return TLM_UPDATED;
+        }
+        else
+        {
+            // Queue full: park the GP and stall the worker.
+            // END_REQ will be sent back via nb_transport_bw once a slot opens.
+            stall_fifo.push_back(&gp);
+            return TLM_ACCEPTED;
+        }
     }
     return TLM_ACCEPTED;
 }
@@ -129,6 +142,28 @@ void AcceleratorTLM::service_thread()
         wait(svc * CYCLE);
 
         e.gp->set_response_status(TLM_OK_RESPONSE);
+
+        // Release the admitted slot or hand it to the next stalled request.
+        if (!stall_fifo.empty())
+        {
+            // Admit the oldest stalled GP: route it through the PEQ so that
+            // peq_thread picks it up and enqueues it into q normally.
+            tlm_generic_payload *next_gp = stall_fifo.front();
+            stall_fifo.pop_front();
+            sc_time zero = SC_ZERO_TIME;
+            peq.notify(*next_gp, zero);
+
+            // Send the deferred END_REQ back to the worker so that
+            // issue_begin (which is blocked waiting for admit_ev) unblocks.
+            tlm_phase end_req_phase = END_REQ;
+            sc_time   end_req_delay = SC_ZERO_TIME;
+            tgt->nb_transport_bw(*next_gp, end_req_phase, end_req_delay);
+            // admitted stays the same: the slot is reused by next_gp.
+        }
+        else
+        {
+            --admitted;
+        }
 
         tlm_phase phase = BEGIN_RESP;
         sc_time   delay = SC_ZERO_TIME;
