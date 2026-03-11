@@ -12,8 +12,9 @@
 // ============================================================
 enum LayerType
 {
-    LAYER_CONV,   // standard / pointwise conv  →  matrix accelerator
-    LAYER_DWCONV  // depth-wise conv            →  vector accelerator
+    LAYER_CONV,    // standard / pointwise conv  →  matrix accelerator
+    LAYER_DWCONV,  // depth-wise conv            →  vector accelerator
+    LAYER_SCALAR   // scalar CPU-only op         →  no accelerator, single-threaded
 };
 
 // ============================================================
@@ -31,6 +32,14 @@ struct LayerDesc
     int Hout, Wout, Cout;
     // Kernel / stride / padding / groups
     int Kh, Kw, stride, pad, groups;
+
+    // Whether this layer is parallelised across N_WORKERS.
+    // CONV and DWCONV: true.  LAYER_SCALAR: false (worker 0 only).
+    bool multithreaded = true;
+
+    // Total scalar arithmetic ops for LAYER_SCALAR.
+    // Cycles = ceil(scalar_ops / CPU_THROUGHPUT).
+    uint64_t scalar_ops = 0;
 };
 
 // ------------------------------------------------------------
@@ -74,6 +83,12 @@ inline uint64_t dwconv_vec_cycles(const LayerDesc &l)
            * DWCONV_ACC_CYCLE;
 }
 
+// CPU cycles for a LAYER_SCALAR layer.
+inline uint64_t scalar_cpu_cycles(const LayerDesc &l)
+{
+    return cdiv64(l.scalar_ops, CPU_THROUGHPUT);
+}
+
 // ============================================================
 // Tile-count helpers
 //   Return the TOTAL number of accelerator tiles for a layer.
@@ -107,8 +122,11 @@ inline uint64_t dwconv_vec_tiles(const LayerDesc &l)
 // ============================================================
 
 // Read bytes: input feature map + weight tensor
+// For LAYER_SCALAR, weights = 0 (no weight memory).
 inline uint64_t layer_rd_bytes(const LayerDesc &l)
 {
+    if (l.type == LAYER_SCALAR)
+        return (uint64_t)l.Hin * l.Win * l.Cin;
     uint64_t ifmap   = (uint64_t)l.Hin * l.Win * l.Cin;
     uint64_t weights = (uint64_t)(l.Cin / l.groups) * l.Cout * l.Kh * l.Kw;
     return ifmap + weights;
@@ -121,8 +139,10 @@ inline uint64_t layer_wr_bytes(const LayerDesc &l)
 }
 
 // ============================================================
-// Internal factory helper
+// Internal factory helpers
 // ============================================================
+
+// Standard accelerator layer (CONV / DWCONV)
 static inline LayerDesc make_layer(int &id_ctr, const char *name,
                                    LayerType type,
                                    int Hin, int Win, int Cin,
@@ -133,24 +153,55 @@ static inline LayerDesc make_layer(int &id_ctr, const char *name,
     LayerDesc l{};
     l.id = id_ctr++;
     std::snprintf(l.name, sizeof(l.name), "%s", name);
-    l.type   = type;
-    l.Hin    = Hin;  l.Win  = Win;  l.Cin  = Cin;
-    l.Hout   = Hout; l.Wout = Wout; l.Cout = Cout;
-    l.Kh     = Kh;   l.Kw   = Kw;
-    l.stride = stride; l.pad = pad; l.groups = groups;
+    l.type         = type;
+    l.Hin          = Hin;  l.Win  = Win;  l.Cin  = Cin;
+    l.Hout         = Hout; l.Wout = Wout; l.Cout = Cout;
+    l.Kh           = Kh;   l.Kw   = Kw;
+    l.stride       = stride; l.pad = pad; l.groups = groups;
+    l.multithreaded = (type != LAYER_SCALAR);
+    l.scalar_ops   = 0;
+    return l;
+}
+
+// Scalar CPU-only layer (LAYER_SCALAR).
+// H/W/C describe the tensor being processed; ops = total scalar ops.
+static inline LayerDesc make_scalar_layer(int &id_ctr, const char *name,
+                                          int H, int W, int Cin, int Cout,
+                                          uint64_t ops)
+{
+    LayerDesc l{};
+    l.id = id_ctr++;
+    std::snprintf(l.name, sizeof(l.name), "%s", name);
+    l.type          = LAYER_SCALAR;
+    l.Hin           = H;   l.Win  = W;    l.Cin  = Cin;
+    l.Hout          = H;   l.Wout = W;    l.Cout = Cout;
+    l.Kh            = 1;   l.Kw   = 1;
+    l.stride        = 1;   l.pad  = 0;    l.groups = 1;
+    l.multithreaded = false;
+    l.scalar_ops    = ops;
     return l;
 }
 
 // ============================================================
 // add_nafblock_layers
 //
-// Appends the 5 accelerator-mapped operations of one NAFBlock.
+// Appends all operations of one NAFBlock (accelerator + scalar).
 //
-//   Branch 1: conv1(C→2C) · dw_conv3(2C) · conv2(C→C)
-//   Branch 2: conv1(C→2C) · conv2(C→C)
-//
-// Scalar steps (LayerNorm, SimpleGate, SCA, residual-add)
-// are not modelled as accelerator requests in the first version.
+// Full NAFBlock execution order:
+//   0. LayerNorm                     (SCALAR)
+//   Branch 1:
+//     1. conv1   C→2C  (1×1)         (CONV)
+//     2. dw_conv 2C    (3×3)         (DWCONV)
+//     3. SimpleGate    2C→C          (SCALAR)
+//     4. SCA attention C             (SCALAR)
+//     5. proj    C→C   (1×1)         (CONV)
+//   Branch 2:
+//     6. conv1   C→2C  (1×1)         (CONV)
+//     7. SimpleGate    2C→C          (SCALAR)
+//     8. proj    C→C   (1×1)         (CONV)
+//   Merge:
+//     9. branch_add    branch1+branch2 (SCALAR)
+//    10. residual_add  input+out      (SCALAR)
 // ============================================================
 static inline void add_nafblock_layers(std::vector<LayerDesc> &layers,
                                        int &id,
@@ -158,6 +209,11 @@ static inline void add_nafblock_layers(std::vector<LayerDesc> &layers,
                                        int C, int H, int W)
 {
     char nm[64];
+
+    // 0. LayerNorm: 8 ops per element (mean, var, normalise, scale, bias + overhead)
+    std::snprintf(nm, sizeof(nm), "%s_ln", prefix);
+    layers.push_back(make_scalar_layer(id, nm, H, W, C, C,
+                                       (uint64_t)H * W * C * 8));
 
     // Branch 1 – expand conv1 (C → 2C)
     std::snprintf(nm, sizeof(nm), "%s_b1_expand", prefix);
@@ -169,7 +225,20 @@ static inline void add_nafblock_layers(std::vector<LayerDesc> &layers,
     layers.push_back(make_layer(id, nm, LAYER_DWCONV,
                                 H, W, 2*C, H, W, 2*C, 3, 3, 1, 1, 2*C));
 
-    // Branch 1 – project conv (C → C, after SimpleGate halves channels)
+    // Branch 1 – SimpleGate: split 2C channels and multiply element-wise
+    //   2 ops per spatial position per half-channel pair
+    std::snprintf(nm, sizeof(nm), "%s_b1_gate", prefix);
+    layers.push_back(make_scalar_layer(id, nm, H, W, 2*C, C,
+                                       (uint64_t)H * W * 2*C * 2));
+
+    // Branch 1 – SCA (Simplified Channel Attention):
+    //   global avg-pool C→C (H×W×C adds) + scale (C mul) + elem-wise mul (H×W×C)
+    //   approx 6 ops per output element
+    std::snprintf(nm, sizeof(nm), "%s_b1_sca", prefix);
+    layers.push_back(make_scalar_layer(id, nm, H, W, C, C,
+                                       (uint64_t)H * W * C * 6));
+
+    // Branch 1 – project conv (C → C)
     std::snprintf(nm, sizeof(nm), "%s_b1_proj", prefix);
     layers.push_back(make_layer(id, nm, LAYER_CONV,
                                 H, W, C, H, W, C, 1, 1, 1, 0, 1));
@@ -179,17 +248,32 @@ static inline void add_nafblock_layers(std::vector<LayerDesc> &layers,
     layers.push_back(make_layer(id, nm, LAYER_CONV,
                                 H, W, C, H, W, 2*C, 1, 1, 1, 0, 1));
 
-    // Branch 2 – project conv (C → C, after SimpleGate)
+    // Branch 2 – SimpleGate: split 2C → C
+    std::snprintf(nm, sizeof(nm), "%s_b2_gate", prefix);
+    layers.push_back(make_scalar_layer(id, nm, H, W, 2*C, C,
+                                       (uint64_t)H * W * 2*C * 2));
+
+    // Branch 2 – project conv (C → C)
     std::snprintf(nm, sizeof(nm), "%s_b2_proj", prefix);
     layers.push_back(make_layer(id, nm, LAYER_CONV,
                                 H, W, C, H, W, C, 1, 1, 1, 0, 1));
+
+    // Merge – branch add (branch1 output + branch2 output, both C channels)
+    std::snprintf(nm, sizeof(nm), "%s_branch_add", prefix);
+    layers.push_back(make_scalar_layer(id, nm, H, W, C, C,
+                                       (uint64_t)H * W * C));
+
+    // Merge – residual add (block input + merged output)
+    std::snprintf(nm, sizeof(nm), "%s_res_add", prefix);
+    layers.push_back(make_scalar_layer(id, nm, H, W, C, C,
+                                       (uint64_t)H * W * C));
 }
 
 // ============================================================
 // build_nafnet32_layers
 //
-// Returns the ordered list of all accelerator-mapped operations
-// in a NAFNet-32 forward pass (64×64 input image patch).
+// Returns the ordered list of ALL operations in a NAFNet-32
+// forward pass (64×64 input image patch), including scalar ops.
 //
 // Network structure:
 //   Intro (3→32, 64×64)
@@ -207,7 +291,7 @@ static inline void add_nafblock_layers(std::vector<LayerDesc> &layers,
 inline std::vector<LayerDesc> build_nafnet32_layers()
 {
     std::vector<LayerDesc> layers;
-    layers.reserve(256);
+    layers.reserve(512);
     int id = 0;
     char nm[64];
 

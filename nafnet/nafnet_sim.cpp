@@ -33,6 +33,47 @@ using namespace sc_core;
 using namespace tlm;
 
 // ============================================================
+// Barrier — generation-based synchronisation barrier for
+// N_WORKERS SC_THREADs.
+//
+// The generation counter prevents "stale" notifications from
+// releasing a thread that has already moved on to the next
+// barrier epoch.  The last arriving thread atomically resets
+// the counter, increments the generation, and notifies; all
+// waiting threads re-check generation before returning.
+//
+// NOTE: Barrier::sync() must only be called from an SC_THREAD
+// (or from a function called within one) because it calls wait().
+// ============================================================
+struct Barrier
+{
+    int      n_workers;
+    int      arrived    = 0;
+    int      generation = 0;
+    sc_event released;
+
+    explicit Barrier(int n) : n_workers(n) {}
+
+    void sync()
+    {
+        int my_gen = generation;
+        if (++arrived == n_workers)
+        {
+            arrived = 0;
+            ++generation;
+            released.notify(SC_ZERO_TIME);
+        }
+        else
+        {
+            // Loop guards against spurious wakeups and reuse of
+            // the released event across multiple barrier epochs.
+            while (generation == my_gen)
+                wait(released);
+        }
+    }
+};
+
+// ============================================================
 // NafLayerExt — additional TLM extension carrying NAFNet
 // layer metadata.  Attached alongside ReqExt and TxnExt.
 // AcceleratorTLM / Interconnect / Memory do not read this.
@@ -61,6 +102,7 @@ struct NafLayerStats
     uint64_t mat_reqs     = 0;  // matrix-acc requests
     uint64_t vec_reqs     = 0;  // vector-acc requests
     uint64_t accel_cycles = 0;  // accelerator service cycles (sum of tile cycles)
+    uint64_t cpu_cycles   = 0;  // scalar CPU cycles (LAYER_SCALAR only)
     uint64_t wait_cycles  = 0;  // sum of queue-wait cycles
     uint64_t mem_cycles   = 0;  // sum of memory-access cycles
     uint64_t rd_bytes     = 0;
@@ -70,15 +112,16 @@ struct NafLayerStats
 // ============================================================
 // NafWorker — NAFNet task generator
 //
-// Each worker owns a full copy of the layer list and processes
-// every layer, taking a 1/N_WORKERS share of the spatial work.
+// Each worker owns a full copy of the layer list.
 //
-// Per CONV layer :
-//   issue_begin(MAT)  →  do_scalar  →  issue_end
-//   issue_begin(VEC)  →  do_scalar  →  issue_end   (requantize)
+// Multi-threaded layers (CONV, DWCONV, multithreaded=true):
+//   All N workers synchronise at a barrier, then each takes
+//   1/N_WORKERS share of the tile work in parallel.
 //
-// Per DWCONV layer :
-//   issue_begin(VEC)  →  do_scalar  →  issue_end
+// Single-threaded layers (LAYER_SCALAR, multithreaded=false):
+//   Worker 0 executes the full layer on the scalar CPU.
+//   Workers 1..N-1 skip the layer immediately and wait at
+//   the next multi-threaded barrier.
 // ============================================================
 struct NafWorker : sc_module
 {
@@ -87,6 +130,7 @@ struct NafWorker : sc_module
 
     int      tid;
     int      n_workers;
+    Barrier *barrier;  // shared barrier, owned by NafTop
 
     const std::vector<LayerDesc> &layers; // shared, read-only
 
@@ -94,15 +138,16 @@ struct NafWorker : sc_module
     std::vector<NafLayerStats> layer_stats;
 
     // Global worker totals
-    uint64_t total_scalar_cycles = 0;  // CPU scalar overhead only (from do_scalar)
-    uint64_t total_accel_cycles  = 0;  // accelerator service cycles (reported separately)
+    uint64_t total_dispatch_cycles = 0; // CPU overhead per accelerator tile call (dispatch bookkeeping)
+    uint64_t total_cpu_cycles      = 0; // CPU time for LAYER_SCALAR compute (LayerNorm, SimpleGate, etc.)
+    uint64_t total_accel_cycles  = 0;  // accelerator service cycles
     uint64_t total_wait_cycles   = 0;
     uint64_t total_mem_cycles    = 0;
     uint64_t mat_calls           = 0;
     uint64_t vec_calls           = 0;
     uint64_t elapsed_cycles      = 0;
 
-    // Synchronization entry for one in-flight request.
+    // Synchronisation entry for one in-flight request.
     // fired is set to true by peq_thread before notifying done_ev, so
     // issue_end can skip the wait() if the response already arrived
     // (e.g. when accelerator service time < scalar overhead).
@@ -132,12 +177,14 @@ struct NafWorker : sc_module
     NafWorker(sc_module_name name,
               int tid_,
               int n_workers_,
-              const std::vector<LayerDesc> &layers_)
+              const std::vector<LayerDesc> &layers_,
+              Barrier *barrier_)
         : sc_module(name),
           init("init"),
           peq("peq"),
           tid(tid_),
           n_workers(n_workers_),
+          barrier(barrier_),
           layers(layers_),
           layer_stats(layers_.size())
     {
@@ -185,7 +232,7 @@ struct NafWorker : sc_module
     // ----------------------------------------------------------
     void do_scalar(uint64_t cyc)
     {
-        total_scalar_cycles += cyc;
+        total_dispatch_cycles += cyc;
         wait(cyc * CYCLE);
     }
 
@@ -266,7 +313,7 @@ struct NafWorker : sc_module
         uint64_t mec   = ext ? ext->mem_cycles : 0;
 
         // Accumulate into global worker totals
-        total_accel_cycles += p.svc_cyc;  // accel service cycles stay on accel side
+        total_accel_cycles += p.svc_cyc;
         total_wait_cycles  += qwait;
         total_mem_cycles   += mec;
 
@@ -290,6 +337,99 @@ struct NafWorker : sc_module
     }
 
     // ----------------------------------------------------------
+    // run_accel_layer: execute one CONV or DWCONV layer.
+    //   eff_workers: how many workers share this layer's tiles.
+    // ----------------------------------------------------------
+    void run_accel_layer(const LayerDesc &l, int eff_workers)
+    {
+        NafLayerStats &s = layer_stats[l.id];
+
+        uint64_t rd_layer = cdiv64(layer_rd_bytes(l),  (uint64_t)eff_workers);
+        uint64_t wr_layer = cdiv64(layer_wr_bytes(l),  (uint64_t)eff_workers);
+
+        if (l.type == LAYER_CONV)
+        {
+            // --- MAT phase: one request per hardware tile ---
+            // Only the first tile carries rd_bytes (DMA load into SRAM).
+            uint64_t mat_t = cdiv64(conv_mat_tiles(l), (uint64_t)eff_workers);
+
+            for (uint64_t t = 0; t < mat_t; ++t)
+            {
+                uint64_t rd = (t == 0) ? rd_layer : 0;
+                auto pm = issue_begin(Interconnect::ADDR_MAT,
+                                      MATMUL_ACC_CYCLE, rd, 0,
+                                      l.id, l.type);
+                ++mat_calls;
+                ++s.mat_reqs;
+                s.accel_cycles += MATMUL_ACC_CYCLE;
+                s.rd_bytes     += rd;
+                do_scalar(SCALAR_OVERHEAD);
+                issue_end(pm, s);
+            }
+
+            // --- VEC phase: one request per requantize tile ---
+            // Only the last tile carries wr_bytes (DMA write-back from SRAM).
+            uint64_t vec_t = cdiv64(conv_vec_quant_tiles(l), (uint64_t)eff_workers);
+
+            for (uint64_t t = 0; t < vec_t; ++t)
+            {
+                uint64_t wr = (t == vec_t - 1) ? wr_layer : 0;
+                auto pv = issue_begin(Interconnect::ADDR_VEC,
+                                      DWCONV_ACC_CYCLE, 0, wr,
+                                      l.id, l.type);
+                ++vec_calls;
+                ++s.vec_reqs;
+                s.accel_cycles += DWCONV_ACC_CYCLE;
+                s.wr_bytes     += wr;
+                do_scalar(SCALAR_OVERHEAD);
+                issue_end(pv, s);
+            }
+        }
+        else // LAYER_DWCONV
+        {
+            // --- VEC phase: one request per DW-conv tile ---
+            // First tile: DMA load (rd_bytes). Last tile: DMA write-back (wr_bytes).
+            uint64_t dw_t = cdiv64(dwconv_vec_tiles(l), (uint64_t)eff_workers);
+
+            for (uint64_t t = 0; t < dw_t; ++t)
+            {
+                uint64_t rd = (t == 0)        ? rd_layer : 0;
+                uint64_t wr = (t == dw_t - 1) ? wr_layer : 0;
+                auto pv = issue_begin(Interconnect::ADDR_VEC,
+                                      DWCONV_ACC_CYCLE, rd, wr,
+                                      l.id, l.type);
+                ++vec_calls;
+                ++s.vec_reqs;
+                s.accel_cycles += DWCONV_ACC_CYCLE;
+                s.rd_bytes     += rd;
+                s.wr_bytes     += wr;
+                do_scalar(SCALAR_OVERHEAD);
+                issue_end(pv, s);
+            }
+        }
+    }
+
+    // ----------------------------------------------------------
+    // run_scalar_layer: execute one LAYER_SCALAR on the CPU.
+    //   Only called by worker 0; other workers skip entirely.
+    //   Memory traffic is NOT sent as a TLM transaction — the
+    //   scalar pipeline accesses SRAM/cache, not DRAM directly.
+    //   We model it as pure CPU time only.
+    // ----------------------------------------------------------
+    void run_scalar_layer(const LayerDesc &l)
+    {
+        NafLayerStats &s = layer_stats[l.id];
+        uint64_t cyc = scalar_cpu_cycles(l);
+
+        total_cpu_cycles += cyc;
+        s.cpu_cycles     += cyc;
+        s.rd_bytes       += layer_rd_bytes(l);
+        s.wr_bytes       += layer_wr_bytes(l);
+
+        wait(cyc * CYCLE);
+    }
+
+    // ----------------------------------------------------------
     // run: main worker thread — iterate through all NAFNet layers
     // ----------------------------------------------------------
     void run()
@@ -298,92 +438,26 @@ struct NafWorker : sc_module
 
         for (const LayerDesc &l : layers)
         {
-            NafLayerStats &s = layer_stats[l.id];
-
-            if (l.type == LAYER_CONV)
+            if (l.multithreaded)
             {
-                // Per-worker DMA budget for this layer.
-                // Reads happen once (DMA load before first MAT tile).
-                // Writes happen once (DMA write-back after last VEC tile).
-                uint64_t rd_layer = cdiv64(layer_rd_bytes(l),
-                                           (uint64_t)n_workers);
-                uint64_t wr_layer = cdiv64(layer_wr_bytes(l),
-                                           (uint64_t)n_workers);
-
-                // --- MAT phase: one request per hardware tile ---
-                // Only the first tile carries rd_bytes (DMA load into SRAM).
-                // All subsequent tiles read from on-chip SRAM (zero DRAM bytes).
-                uint64_t mat_t = cdiv64(conv_mat_tiles(l),
-                                        (uint64_t)n_workers);
-
-                for (uint64_t t = 0; t < mat_t; ++t)
-                {
-                    uint64_t rd = (t == 0) ? rd_layer : 0;
-                    auto pm = issue_begin(Interconnect::ADDR_MAT,
-                                          MATMUL_ACC_CYCLE, rd, 0,
-                                          l.id, l.type);
-                    ++mat_calls;
-                    ++s.mat_reqs;
-                    s.accel_cycles += MATMUL_ACC_CYCLE;
-                    s.rd_bytes     += rd;
-                    do_scalar(SCALAR_OVERHEAD);
-                    issue_end(pm, s);
-                }
-
-                // --- VEC phase: one request per requantize tile ---
-                // Only the last tile carries wr_bytes (DMA write-back from SRAM).
-                uint64_t vec_t = cdiv64(conv_vec_quant_tiles(l),
-                                        (uint64_t)n_workers);
-
-                for (uint64_t t = 0; t < vec_t; ++t)
-                {
-                    uint64_t wr = (t == vec_t - 1) ? wr_layer : 0;
-                    auto pv = issue_begin(Interconnect::ADDR_VEC,
-                                          DWCONV_ACC_CYCLE, 0, wr,
-                                          l.id, l.type);
-                    ++vec_calls;
-                    ++s.vec_reqs;
-                    s.accel_cycles += DWCONV_ACC_CYCLE;
-                    s.wr_bytes     += wr;
-                    do_scalar(SCALAR_OVERHEAD);
-                    issue_end(pv, s);
-                }
+                // Synchronise all workers before starting this parallel layer.
+                // The last arriving worker notifies the rest; all then proceed.
+                barrier->sync();
+                run_accel_layer(l, n_workers);
             }
-            else // LAYER_DWCONV
+            else // LAYER_SCALAR — single-threaded, worker 0 only
             {
-                // Per-worker DMA budget for this layer.
-                uint64_t rd_layer = cdiv64(layer_rd_bytes(l),
-                                           (uint64_t)n_workers);
-                uint64_t wr_layer = cdiv64(layer_wr_bytes(l),
-                                           (uint64_t)n_workers);
-
-                // --- VEC phase: one request per DW-conv tile ---
-                // First tile: DMA load (rd_bytes). Last tile: DMA write-back (wr_bytes).
-                // Middle tiles: on-chip SRAM only (zero DRAM bytes).
-                uint64_t dw_t = cdiv64(dwconv_vec_tiles(l),
-                                       (uint64_t)n_workers);
-
-                for (uint64_t t = 0; t < dw_t; ++t)
-                {
-                    uint64_t rd = (t == 0)          ? rd_layer : 0;
-                    uint64_t wr = (t == dw_t - 1)   ? wr_layer : 0;
-                    auto pv = issue_begin(Interconnect::ADDR_VEC,
-                                          DWCONV_ACC_CYCLE, rd, wr,
-                                          l.id, l.type);
-                    ++vec_calls;
-                    ++s.vec_reqs;
-                    s.accel_cycles += DWCONV_ACC_CYCLE;
-                    s.rd_bytes     += rd;
-                    s.wr_bytes     += wr;
-                    do_scalar(SCALAR_OVERHEAD);
-                    issue_end(pv, s);
-                }
+                if (tid == 0)
+                    run_scalar_layer(l);
+                // Workers 1..N-1 skip and fall through to the next iteration.
+                // They will wait at the barrier of the next multithreaded layer.
             }
         }
 
         sc_time t_end     = sc_time_stamp();
         elapsed_cycles    = (uint64_t)((t_end - t_start) / CYCLE);
-        uint64_t total    = total_scalar_cycles
+        uint64_t total    = total_dispatch_cycles
+                          + total_cpu_cycles
                           + total_accel_cycles
                           + total_wait_cycles
                           + total_mem_cycles;
@@ -391,7 +465,8 @@ struct NafWorker : sc_module
         std::cout << "[Worker " << tid << "]"
                   << "  mat_calls="  << mat_calls
                   << "  vec_calls="  << vec_calls
-                  << "  scalar="     << total_scalar_cycles
+                  << "  dispatch="   << total_dispatch_cycles
+                  << "  cpu="        << total_cpu_cycles
                   << "  accel="      << total_accel_cycles
                   << "  wait="       << total_wait_cycles
                   << "  mem="        << total_mem_cycles
@@ -410,6 +485,7 @@ struct NafTop : sc_module
     AcceleratorTLM vec_acc;
     Interconnect   noc;
     Memory         memory;
+    Barrier        barrier;
 
     std::vector<NafWorker *> workers;
     std::vector<LayerDesc>   layers;   // shared layer list
@@ -418,7 +494,8 @@ struct NafTop : sc_module
         : mat_acc("mat_acc"),
           vec_acc("vec_acc"),
           noc("noc"),
-          memory("memory", MEM_BASE_LAT, MEM_BW)
+          memory("memory", MEM_BASE_LAT, MEM_BW),
+          barrier(N_WORKERS)
     {
         // Bind accelerators and memory to the interconnect
         noc.to_mat.bind(mat_acc.tgt);
@@ -436,7 +513,7 @@ struct NafTop : sc_module
         for (int i = 0; i < N_WORKERS; ++i)
         {
             auto *w = new NafWorker(sc_gen_unique_name("naf_worker"),
-                                    i, N_WORKERS, layers);
+                                    i, N_WORKERS, layers, &barrier);
             workers.push_back(w);
             w->init.bind(noc.tgt);
         }
@@ -473,6 +550,7 @@ int sc_main(int /*argc*/, char * /*argv*/[])
             global[i].mat_reqs     += ws.mat_reqs;
             global[i].vec_reqs     += ws.vec_reqs;
             global[i].accel_cycles += ws.accel_cycles;
+            global[i].cpu_cycles   += ws.cpu_cycles;
             global[i].wait_cycles  += ws.wait_cycles;
             global[i].mem_cycles   += ws.mem_cycles;
             global[i].rd_bytes     += ws.rd_bytes;
@@ -499,35 +577,45 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     std::cout << std::left
               << std::setw(4)  << "ID"
               << std::setw(28) << "Name"
-              << std::setw(7)  << "Type"
+              << std::setw(8)  << "Type"
               << std::setw(5)  << "Acc"
               << std::setw(9)  << "Reqs"
               << std::setw(12) << "AccelCyc"
+              << std::setw(10) << "CpuCyc"
               << std::setw(12) << "WaitCyc"
               << std::setw(12) << "MemCyc"
               << std::setw(12) << "RdBytes"
               << std::setw(12) << "WrBytes"
               << "\n";
-    std::cout << std::string(113, '-') << "\n";
+    std::cout << std::string(124, '-') << "\n";
 
+    uint64_t scalar_layer_count = 0;
     for (size_t i = 0; i < n_layers; ++i)
     {
         const LayerDesc     &l = layers[i];
         const NafLayerStats &s = global[i];
         uint64_t reqs = s.mat_reqs + s.vec_reqs;
 
+        const char *type_str = (l.type == LAYER_CONV)   ? "CONV"   :
+                               (l.type == LAYER_DWCONV) ? "DWCONV" : "SCALAR";
+        const char *acc_str  = (l.type == LAYER_CONV)   ? "MAT"    :
+                               (l.type == LAYER_DWCONV) ? "VEC"    : "CPU";
+
         std::cout << std::left
                   << std::setw(4)  << l.id
                   << std::setw(28) << l.name
-                  << std::setw(7)  << (l.type == LAYER_CONV ? "CONV" : "DWCONV")
-                  << std::setw(5)  << (l.type == LAYER_CONV ? "MAT" : "VEC")
+                  << std::setw(8)  << type_str
+                  << std::setw(5)  << acc_str
                   << std::setw(9)  << reqs
                   << std::setw(12) << s.accel_cycles
+                  << std::setw(10) << s.cpu_cycles
                   << std::setw(12) << s.wait_cycles
                   << std::setw(12) << s.mem_cycles
                   << std::setw(12) << s.rd_bytes
                   << std::setw(12) << s.wr_bytes
                   << "\n";
+
+        if (l.type == LAYER_SCALAR) ++scalar_layer_count;
     }
 
     // ----------------------------------------------------------
@@ -536,7 +624,8 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     std::cout << "\n--- Per-Worker Summary ---\n";
     std::cout << std::left
               << std::setw(8)  << "Worker"
-              << std::setw(12) << "ScalarCyc"
+              << std::setw(12) << "DispatchCyc"
+              << std::setw(10) << "CpuCyc"
               << std::setw(12) << "AccelCyc"
               << std::setw(10) << "WaitCyc"
               << std::setw(10) << "MemCyc"
@@ -544,14 +633,15 @@ int sc_main(int /*argc*/, char * /*argv*/[])
               << std::setw(10) << "VecReqs"
               << std::setw(12) << "ElapsedCyc"
               << "\n";
-    std::cout << std::string(84, '-') << "\n";
+    std::cout << std::string(94, '-') << "\n";
 
     uint64_t max_elapsed = 0;
     for (const auto *w : top.workers)
     {
         std::cout << std::left
                   << std::setw(8)  << w->tid
-                  << std::setw(12) << w->total_scalar_cycles
+                  << std::setw(12) << w->total_dispatch_cycles
+                  << std::setw(10) << w->total_cpu_cycles
                   << std::setw(12) << w->total_accel_cycles
                   << std::setw(10) << w->total_wait_cycles
                   << std::setw(10) << w->total_mem_cycles
@@ -567,23 +657,28 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     // ----------------------------------------------------------
     uint64_t total_mat_reqs = 0, total_vec_reqs = 0;
     uint64_t total_rd = 0, total_wr = 0;
+    uint64_t total_cpu_cyc = 0;
     for (const auto &s : global)
     {
         total_mat_reqs += s.mat_reqs;
         total_vec_reqs += s.vec_reqs;
         total_rd       += s.rd_bytes;
         total_wr       += s.wr_bytes;
+        total_cpu_cyc  += s.cpu_cycles;
     }
 
     std::cout << "\n--- Global Summary ---\n";
-    std::cout << "Simulation time        : " << sc_time_stamp() << "\n";
-    std::cout << "Max worker elapsed     : " << max_elapsed      << " cycles\n";
-    std::cout << "Workers                : " << N_WORKERS         << "\n";
-    std::cout << "NAFNet layers modelled : " << n_layers          << "\n";
-    std::cout << "Total mat-acc requests : " << total_mat_reqs    << "\n";
-    std::cout << "Total vec-acc requests : " << total_vec_reqs    << "\n";
-    std::cout << "Total memory reads     : " << total_rd          << " bytes\n";
-    std::cout << "Total memory writes    : " << total_wr          << " bytes\n";
+    std::cout << "Simulation time        : " << sc_time_stamp()    << "\n";
+    std::cout << "Max worker elapsed     : " << max_elapsed         << " cycles\n";
+    std::cout << "Workers                : " << N_WORKERS           << "\n";
+    std::cout << "NAFNet layers total    : " << n_layers            << "\n";
+    std::cout << "  Accel layers         : " << (n_layers - scalar_layer_count) << "\n";
+    std::cout << "  Scalar layers        : " << scalar_layer_count  << "\n";
+    std::cout << "Total mat-acc requests : " << total_mat_reqs      << "\n";
+    std::cout << "Total vec-acc requests : " << total_vec_reqs      << "\n";
+    std::cout << "Total scalar CPU cyc   : " << total_cpu_cyc       << "\n";
+    std::cout << "Total memory reads     : " << total_rd            << " bytes\n";
+    std::cout << "Total memory writes    : " << total_wr            << " bytes\n";
     std::cout << "\n";
     std::cout << "mat_acc : reqs="     << top.mat_acc.req_count
               << "  busy="             << top.mat_acc.busy_cycles
@@ -599,7 +694,6 @@ int sc_main(int /*argc*/, char * /*argv*/[])
               << "\n";
 
     // Utilisation = busy_cycles / total_simulation_cycles
-    // (fraction of wall-clock time the accelerator was actually working)
     double sim_cycles = static_cast<double>(sc_time_stamp() / CYCLE);
     double mat_util   = (sim_cycles > 0.0)
                       ? static_cast<double>(top.mat_acc.busy_cycles)
