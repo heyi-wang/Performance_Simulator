@@ -81,4 +81,4 @@ static const uint64_t SCALAR_OVERHEAD   = 8;  // cycles per call
 // internal FIFO queue).  Workers that try to issue a request
 // when the queue is full are stalled until a slot opens.
 // ------------------------------------------------------------
-static const size_t ACC_QUEUE_DEPTH     = 16;  // max admitted requests per accelerator
+static const size_t ACC_QUEUE_DEPTH     = 32;  // max admitted requests per accelerator

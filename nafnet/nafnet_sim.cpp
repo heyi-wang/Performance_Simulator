@@ -376,6 +376,13 @@ struct NafWorker : sc_module
     // ----------------------------------------------------------
     // run_accel_layer: execute one CONV or DWCONV layer.
     //   eff_workers: how many workers share this layer's tiles.
+    //
+    // Issue phase and completion phase are separated so that a
+    // worker keeps firing new requests as long as the accelerator
+    // queue has space.  issue_begin blocks only when the queue is
+    // full (TLM_ACCEPTED / admit_ev backpressure), which is the
+    // correct "fill the queue" behaviour.  After all tiles are
+    // issued, issue_end drains the in-flight window in order.
     // ----------------------------------------------------------
     void run_accel_layer(const LayerDesc &l, int eff_workers)
     {
@@ -390,9 +397,15 @@ struct NafWorker : sc_module
             // Only the first tile carries rd_bytes (DMA load into SRAM).
             uint64_t mat_t = cdiv64(conv_mat_tiles(l), (uint64_t)eff_workers);
 
+            std::vector<PendingReq> mat_pending;
+            mat_pending.reserve(mat_t);
+
             for (uint64_t t = 0; t < mat_t; ++t)
             {
                 uint64_t rd = (t == 0) ? rd_layer : 0;
+                // issue_begin blocks here only when the accelerator queue is
+                // full; otherwise it returns immediately and the loop
+                // continues, keeping the queue saturated.
                 auto pm = issue_begin(Interconnect::ADDR_MAT,
                                       MATMUL_ACC_CYCLE, rd, 0,
                                       l.id, l.type);
@@ -401,12 +414,18 @@ struct NafWorker : sc_module
                 s.accel_cycles += MATMUL_ACC_CYCLE;
                 s.rd_bytes     += rd;
                 do_scalar(SCALAR_OVERHEAD);
-                issue_end(pm, s);
+                mat_pending.push_back(std::move(pm));
             }
+
+            for (auto &pm : mat_pending)
+                issue_end(pm, s);
 
             // --- VEC phase: one request per requantize tile ---
             // Only the last tile carries wr_bytes (DMA write-back from SRAM).
             uint64_t vec_t = cdiv64(conv_vec_quant_tiles(l), (uint64_t)eff_workers);
+
+            std::vector<PendingReq> vec_pending;
+            vec_pending.reserve(vec_t);
 
             for (uint64_t t = 0; t < vec_t; ++t)
             {
@@ -419,14 +438,20 @@ struct NafWorker : sc_module
                 s.accel_cycles += DWCONV_ACC_CYCLE;
                 s.wr_bytes     += wr;
                 do_scalar(SCALAR_OVERHEAD);
-                issue_end(pv, s);
+                vec_pending.push_back(std::move(pv));
             }
+
+            for (auto &pv : vec_pending)
+                issue_end(pv, s);
         }
         else // LAYER_DWCONV
         {
             // --- VEC phase: one request per DW-conv tile ---
             // First tile: DMA load (rd_bytes). Last tile: DMA write-back (wr_bytes).
             uint64_t dw_t = cdiv64(dwconv_vec_tiles(l), (uint64_t)eff_workers);
+
+            std::vector<PendingReq> dw_pending;
+            dw_pending.reserve(dw_t);
 
             for (uint64_t t = 0; t < dw_t; ++t)
             {
@@ -441,8 +466,11 @@ struct NafWorker : sc_module
                 s.rd_bytes     += rd;
                 s.wr_bytes     += wr;
                 do_scalar(SCALAR_OVERHEAD);
-                issue_end(pv, s);
+                dw_pending.push_back(std::move(pv));
             }
+
+            for (auto &pv : dw_pending)
+                issue_end(pv, s);
         }
     }
 
