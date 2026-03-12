@@ -5,6 +5,7 @@
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm_utils/peq_with_get.h>
 #include <deque>
+#include <functional>
 #include <unordered_map>
 
 // ============================================================
@@ -39,6 +40,15 @@ struct AcceleratorTLM : sc_module
     // decrements it (or hands the slot to stall_fifo) after finishing.
     size_t admitted      = 0;
     size_t queue_capacity;
+
+    // Optional callback: called with (cycle, busy) at every busy/idle transition.
+    // Set via set_busy_callback() before sc_start().  Null by default.
+    std::function<void(uint64_t, bool)> busy_cb;
+
+    void set_busy_callback(std::function<void(uint64_t, bool)> cb)
+    {
+        busy_cb = std::move(cb);
+    }
 
     uint64_t busy_cycles       = 0;
     uint64_t queue_wait_cycles = 0;

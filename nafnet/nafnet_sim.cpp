@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <cstdio>
+#include <fstream>
 
 // Base modules (compiled separately, included via headers)
 #include "common.h"
@@ -28,6 +29,8 @@
 // NAFNet layer list + hardware config
 #include "nafnet_hw_config.h"
 #include "nafnet_layers.h"
+#include "waveform.h"
+#include "vcd_writer.h"
 
 using namespace sc_core;
 using namespace tlm;
@@ -304,9 +307,12 @@ struct NafWorker : sc_module
         {
             // Queue was full: block here until the accelerator grants a slot
             // (it will send END_REQ backward, which notifies admit_ev).
+            std::string wname = "worker_" + std::to_string(tid);
+            wave_log((uint64_t)(sc_time_stamp() / CYCLE), wname, 0); // stalled on full queue
             sc_time t_stall_start = sc_time_stamp();
             wait(*p.done_entry->admit_ev);
             p.stall_cycles = (uint64_t)((sc_time_stamp() - t_stall_start) / CYCLE);
+            wave_log((uint64_t)(sc_time_stamp() / CYCLE), wname, 1); // queue slot granted
         }
         else if (status == TLM_COMPLETED)
         {
@@ -324,7 +330,12 @@ struct NafWorker : sc_module
         // If the response already arrived (fired=true) before we get
         // here, skip wait() to avoid blocking on a stale event.
         if (!p.sync_done && !p.done_entry->fired)
+        {
+            std::string wname = "worker_" + std::to_string(tid);
+            wave_log((uint64_t)(sc_time_stamp() / CYCLE), wname, 0); // waiting for accelerator
             wait(*p.done_entry->ev);
+            wave_log((uint64_t)(sc_time_stamp() / CYCLE), wname, 1); // accelerator done
+        }
 
         done_map.erase(p.gp);
         delete p.done_entry->ev;
@@ -460,7 +471,9 @@ struct NafWorker : sc_module
     // ----------------------------------------------------------
     void run()
     {
+        std::string wname = "worker_" + std::to_string(tid);
         sc_time t_start = sc_time_stamp();
+        wave_log((uint64_t)(t_start / CYCLE), wname, 1);  // worker becomes active
 
         for (const LayerDesc &l : layers)
         {
@@ -468,7 +481,9 @@ struct NafWorker : sc_module
             {
                 // Synchronise all workers before starting this parallel layer.
                 // The last arriving worker notifies the rest; all then proceed.
+                wave_log((uint64_t)(sc_time_stamp() / CYCLE), wname, 0);  // entering barrier: idle
                 barrier->sync();
+                wave_log((uint64_t)(sc_time_stamp() / CYCLE), wname, 1);  // leaving barrier: busy
                 run_accel_layer(l, n_workers);
             }
             else // LAYER_SCALAR — single-threaded, worker 0 only
@@ -479,6 +494,8 @@ struct NafWorker : sc_module
                 // They will wait at the barrier of the next multithreaded layer.
             }
         }
+
+        wave_log((uint64_t)(sc_time_stamp() / CYCLE), wname, 0);  // worker done: idle
 
         sc_time t_end     = sc_time_stamp();
         elapsed_cycles    = (uint64_t)((t_end - t_start) / CYCLE);
@@ -516,8 +533,11 @@ struct NafTop : sc_module
     std::vector<NafWorker *> workers;
     std::vector<LayerDesc>   layers;   // shared layer list
 
-    SC_CTOR(NafTop)
-        : mat_acc("mat_acc", ACC_QUEUE_DEPTH),
+    SC_HAS_PROCESS(NafTop);
+
+    NafTop(sc_module_name name, bool intro_only_ = false)
+        : sc_module(name),
+          mat_acc("mat_acc", ACC_QUEUE_DEPTH),
           vec_acc("vec_acc", ACC_QUEUE_DEPTH),
           noc("noc"),
           memory("memory", MEM_BASE_LAT, MEM_BW),
@@ -532,8 +552,20 @@ struct NafTop : sc_module
         mat_acc.to_mem.bind(noc.tgt);
         vec_acc.to_mem.bind(noc.tgt);
 
+        // Wire busy-state callbacks for waveform logging
+        mat_acc.set_busy_callback([](uint64_t t, bool b) {
+            wave_log(t, "mat_acc", b ? 1 : 0);
+        });
+        vec_acc.set_busy_callback([](uint64_t t, bool b) {
+            wave_log(t, "vec_acc", b ? 1 : 0);
+        });
+
         // Build the NAFNet layer list (shared across workers)
         layers = build_nafnet32_layers();
+
+        // In intro-only mode keep only the first layer (id=0, "intro" CONV)
+        if (intro_only_)
+            layers.resize(1);
 
         // Create and connect workers
         for (int i = 0; i < N_WORKERS; ++i)
@@ -555,10 +587,38 @@ struct NafTop : sc_module
 // ============================================================
 // sc_main — run simulation and print three-section report
 // ============================================================
-int sc_main(int /*argc*/, char * /*argv*/[])
+int sc_main(int argc, char *argv[])
 {
-    NafTop top("nafnet_top");
+    bool intro_only = false;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string(argv[i]) == "--intro-only")
+            intro_only = true;
+    }
+
+    if (intro_only)
+        std::cout << "[Mode] intro-only: simulating only the intro CONV layer\n";
+
+    NafTop top("nafnet_top", intro_only);
     sc_start();
+
+    // ----------------------------------------------------------
+    // Export waveform to VCD for GTKWave
+    // ----------------------------------------------------------
+    {
+        auto &evts = wave_events();
+        // stable_sort preserves insertion order for same-cycle events,
+        // which maintains causal ordering within cooperative SC_THREADs.
+        std::stable_sort(evts.begin(), evts.end(),
+                         [](const WaveEvent &a, const WaveEvent &b) {
+                             return a.cycle < b.cycle;
+                         });
+
+        const char *vcd_name = intro_only ? "waveform_intro.vcd" : "waveform.vcd";
+        write_vcd(evts, vcd_name);
+        std::cout << "VCD waveform written to " << vcd_name
+                  << " (" << evts.size() << " events)\n";
+    }
 
     const auto  &layers   = top.layers;
     const size_t n_layers = layers.size();

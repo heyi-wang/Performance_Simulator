@@ -130,6 +130,10 @@ void AcceleratorTLM::service_thread()
         queue_wait_cycles += qwait;
         req_count         += 1;
 
+        // Signal busy start (includes memory access + compute wait)
+        if (busy_cb)
+            busy_cb((uint64_t)(sc_time_stamp() / CYCLE), true);
+
         sc_time m0 = sc_time_stamp();
         mem_access(false, ext ? ext->rd_bytes : 0);
         mem_access(true,  ext ? ext->wr_bytes : 0);
@@ -140,6 +144,10 @@ void AcceleratorTLM::service_thread()
 
         busy_cycles += svc;
         wait(svc * CYCLE);
+
+        // Signal busy end (compute finished, about to send response)
+        if (busy_cb)
+            busy_cb((uint64_t)(sc_time_stamp() / CYCLE), false);
 
         e.gp->set_response_status(TLM_OK_RESPONSE);
 
