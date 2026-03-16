@@ -154,6 +154,10 @@ void Worker::run()
         issue_end(pending);
     }
 
+    // Record mat-phase wall-clock and signal AccumCoordinator.
+    mat_elapsed_cycles = (uint64_t)((sc_time_stamp() - start) / CYCLE);
+    mat_done_ev.notify(SC_ZERO_TIME);
+
     if (access_vec > 0)
     {
         auto pending = issue_begin(Interconnect::ADDR_VEC, vec_cycles);

@@ -32,6 +32,11 @@ struct Worker : sc_module
     uint64_t mat_calls        = 0;
     uint64_t vec_calls        = 0;
     uint64_t elapsed_cycles   = 0;   // set at end of run(); used for GFLOPS reporting
+    uint64_t mat_elapsed_cycles = 0; // cycles until end of mat phase; set before mat_done_ev
+
+    // Fired when the matrix-multiply phase of run() completes.
+    // AccumCoordinator waits on this to start the accumulation stage.
+    sc_event  mat_done_ev;
 
     uint64_t A_bytes = 0;
     uint64_t B_bytes = 0;

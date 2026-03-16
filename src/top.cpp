@@ -2,8 +2,8 @@
 
 Top::Top(sc_module_name nm)
     : sc_module(nm),
-      mat_acc("mat_acc"),
-      vec_acc("vec_acc"),
+      mat_acc("mat_acc", NUM_THREADS),
+      vec_acc("vec_acc", NUM_THREADS),
       noc("noc"),
       memory("memory")
 {
