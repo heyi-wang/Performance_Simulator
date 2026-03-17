@@ -7,6 +7,7 @@ SC_HAS_PROCESS(AccumCoordinator);
 AccumCoordinator::AccumCoordinator(sc_module_name name,
                                    uint64_t vec_svc_cycles_,
                                    uint64_t accum_vec_calls_,
+                                   uint64_t scalar_cycles_,
                                    uint64_t accum_rd_bytes_,
                                    uint64_t accum_wr_bytes_)
     : sc_module(name),
@@ -14,6 +15,7 @@ AccumCoordinator::AccumCoordinator(sc_module_name name,
       peq("peq"),
       vec_svc_cycles(vec_svc_cycles_),
       accum_vec_calls(accum_vec_calls_),
+      scalar_cycles(scalar_cycles_),
       accum_rd_bytes(accum_rd_bytes_),
       accum_wr_bytes(accum_wr_bytes_)
 {
@@ -26,6 +28,10 @@ AccumCoordinator::~AccumCoordinator()
 {
     for (auto *ev : tree_events_)
         delete ev;
+    for (auto *t : tree_ready_times_)
+        delete t;
+    for (auto *ready : tree_ready_flags_)
+        delete ready;
 }
 
 // ----------------------------------------------------------
@@ -123,6 +129,12 @@ AccumCoordinator::PendingReq AccumCoordinator::issue_begin(uint64_t addr)
     return p;
 }
 
+void AccumCoordinator::do_scalar(uint64_t cyc)
+{
+    compute_cycles += cyc;
+    wait(cyc * CYCLE);
+}
+
 void AccumCoordinator::issue_end(PendingReq &p)
 {
     if (!p.sync_done && !p.done_entry->fired)
@@ -161,22 +173,34 @@ void AccumCoordinator::issue_end(PendingReq &p)
 // run_one_pair: issue accum_vec_calls sequential vec_acc
 // requests for one pairwise accumulation.  Records timing.
 // ----------------------------------------------------------
-void AccumCoordinator::run_one_pair()
+void AccumCoordinator::run_one_pair(size_t pair_id,
+                                    sc_time left_ready,
+                                    sc_time right_ready)
 {
     sc_time t0 = sc_time_stamp();
 
-    for (uint64_t i = 0; i < accum_vec_calls; i++)
+    if (accum_vec_calls > 0)
     {
-        auto p = issue_begin(Interconnect::ADDR_VEC);
+        auto pending = issue_begin(Interconnect::ADDR_VEC);
         vec_calls_total++;
-        issue_end(p);
+
+        for (uint64_t i = 1; i < accum_vec_calls; i++)
+        {
+            do_scalar(scalar_cycles);
+            issue_end(pending);
+            pending = issue_begin(Interconnect::ADDR_VEC);
+            vec_calls_total++;
+        }
+        issue_end(pending);
     }
 
     sc_time t1 = sc_time_stamp();
 
     stats_mutex.lock();
-    pair_start_times.push_back(t0);
-    pair_end_times.push_back(t1);
+    pair_start_times[pair_id] = t0;
+    pair_end_times[pair_id] = t1;
+    pair_left_ready_times[pair_id] = left_ready;
+    pair_right_ready_times[pair_id] = right_ready;
     stats_mutex.unlock();
 }
 
@@ -191,25 +215,50 @@ void AccumCoordinator::run_one_pair()
 void AccumCoordinator::run()
 {
     int n = (int)workers.size();
-    if (n <= 1)
+    if (n == 0)
     {
         accum_end_time = sc_time_stamp();
+        return;
+    }
+    if (n == 1)
+    {
+        wait(workers[0]->mat_done_ev);
+        accum_end_time = workers[0]->mat_done_time;
         return;
     }
 
     // Create proxy leaf events: one per worker.
     // A lightweight spawned thread waits on worker->mat_done_ev
     // (which fires after mat+quant) then fires the proxy.
-    std::vector<sc_event *> cur_evs;
+    struct ReadyNode
+    {
+        sc_event *ev = nullptr;
+        sc_time  *ready_time = nullptr;
+        bool     *ready = nullptr;
+    };
+
+    size_t total_pairs = (size_t)(n - 1);
+    pair_start_times.assign(total_pairs, SC_ZERO_TIME);
+    pair_end_times.assign(total_pairs, SC_ZERO_TIME);
+    pair_left_ready_times.assign(total_pairs, SC_ZERO_TIME);
+    pair_right_ready_times.assign(total_pairs, SC_ZERO_TIME);
+
+    std::vector<ReadyNode> cur_nodes;
     for (int i = 0; i < n; i++)
     {
         auto *ev = new sc_event();
+        auto *ready_time = new sc_time(SC_ZERO_TIME);
+        auto *ready = new bool(false);
         tree_events_.push_back(ev);
-        cur_evs.push_back(ev);
+        tree_ready_times_.push_back(ready_time);
+        tree_ready_flags_.push_back(ready);
+        cur_nodes.push_back({ev, ready_time, ready});
 
         Worker *w = workers[i];
-        sc_spawn([w, ev]() {
+        sc_spawn([w, ev, ready_time, ready]() {
             sc_core::wait(w->mat_done_ev);
+            *ready_time = w->mat_done_time;
+            *ready = true;
             ev->notify(SC_ZERO_TIME);
         });
     }
@@ -217,40 +266,52 @@ void AccumCoordinator::run()
     // Build the reduction tree level by level.
     // Each pair spawns a thread that waits for both inputs
     // then immediately calls run_one_pair().
-    while ((int)cur_evs.size() > 1)
+    size_t pair_id = 0;
+    while ((int)cur_nodes.size() > 1)
     {
-        int m     = (int)cur_evs.size();
+        int m     = (int)cur_nodes.size();
         int pairs = m / 2;
 
-        std::vector<sc_event *> next_evs;
-        next_evs.reserve((m + 1) / 2);
+        std::vector<ReadyNode> next_nodes;
+        next_nodes.reserve((m + 1) / 2);
 
         for (int i = 0; i < pairs; i++)
         {
-            sc_event *left  = cur_evs[2 * i];
-            sc_event *right = cur_evs[2 * i + 1];
+            ReadyNode left  = cur_nodes[2 * i];
+            ReadyNode right = cur_nodes[2 * i + 1];
 
             auto *out = new sc_event();
+            auto *ready_time = new sc_time(SC_ZERO_TIME);
+            auto *ready = new bool(false);
             tree_events_.push_back(out);
-            next_evs.push_back(out);
+            tree_ready_times_.push_back(ready_time);
+            tree_ready_flags_.push_back(ready);
+            next_nodes.push_back({out, ready_time, ready});
 
-            sc_spawn([this, left, right, out]() {
-                sc_core::wait(*left);
-                sc_core::wait(*right);
-                run_one_pair();
+            size_t this_pair = pair_id++;
+            sc_spawn([this, left, right, out, ready_time, ready, this_pair]() {
+                if (!*left.ready)
+                    sc_core::wait(*left.ev);
+                if (!*right.ready)
+                    sc_core::wait(*right.ev);
+                sc_time left_ready = *left.ready_time;
+                sc_time right_ready = *right.ready_time;
+                run_one_pair(this_pair, left_ready, right_ready);
+                *ready_time = sc_time_stamp();
+                *ready = true;
                 out->notify(SC_ZERO_TIME);
             });
         }
 
         // Odd survivor carries forward unchanged
         if (m % 2 == 1)
-            next_evs.push_back(cur_evs[m - 1]);
+            next_nodes.push_back(cur_nodes[m - 1]);
 
-        cur_evs = std::move(next_evs);
+        cur_nodes = std::move(next_nodes);
     }
 
     // Wait for the root event (entire tree complete)
-    wait(*cur_evs[0]);
+    wait(*cur_nodes[0].ev);
 
     accum_end_time = sc_time_stamp();
 

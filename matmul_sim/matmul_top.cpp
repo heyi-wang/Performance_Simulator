@@ -1,4 +1,5 @@
 #include "matmul_top.h"
+#include <algorithm>
 
 MatmulTop::MatmulTop(sc_module_name nm)
     : sc_module(nm),
@@ -26,9 +27,15 @@ MatmulTop::MatmulTop(sc_module_name nm)
     // -------------------------------------------------------
     for (int i = 0; i < NUM_THREADS; i++)
     {
+        uint64_t k_begin = (uint64_t)i * GEMM_K_PER_THREAD;
+        uint64_t k_end   = std::min<uint64_t>(GEMM_K, k_begin + GEMM_K_PER_THREAD);
+        uint64_t local_k = (k_begin < GEMM_K) ? (k_end - k_begin) : 0;
+        uint64_t local_tile_k = (local_k > 0) ? ceil_div_u64(local_k, MATMUL_K) : 0;
+        uint64_t local_access_mat = GEMM_TILE_M * local_tile_k * GEMM_TILE_N;
+
         auto *w = new Worker(sc_gen_unique_name("worker"),
                              i,
-                             GEMM_ACCESS_MAT,        // mat tiles for K-slice
+                             local_access_mat,       // mat tiles for this worker's K-slice
                              GEMM_QUANT_VEC_CALLS,   // quant tiles after mat
                              MATMUL_ACC_CYCLE,
                              VECTOR_ACC_CYCLE,
@@ -50,6 +57,7 @@ MatmulTop::MatmulTop(sc_module_name nm)
     coordinator = new AccumCoordinator("accum_coord",
                                        VECTOR_ACC_CYCLE,
                                        GEMM_ACCUM_VEC_CALLS,
+                                       SCALAR_OVERHEAD,
                                        GEMM_ACCUM_RD_BYTES,
                                        GEMM_ACCUM_WR_BYTES);
 

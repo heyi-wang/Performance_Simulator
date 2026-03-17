@@ -51,6 +51,7 @@ struct AcceleratorTLM : sc_module
     }
 
     uint64_t busy_cycles       = 0;
+    uint64_t occupied_cycles   = 0;
     uint64_t queue_wait_cycles = 0;
     uint64_t req_count         = 0;
 

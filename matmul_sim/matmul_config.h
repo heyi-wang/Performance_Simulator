@@ -29,9 +29,9 @@ static const uint64_t GEMM_TILE_N = ceil_div_u64(GEMM_N,             MATMUL_N);
 static const uint64_t GEMM_ACCESS_MAT = GEMM_TILE_M * GEMM_TILE_K * GEMM_TILE_N;
 
 // Memory traffic per tile (bytes)
-static const uint64_t GEMM_A_BYTES = MATMUL_M * MATMUL_K * sizeof(float);
-static const uint64_t GEMM_B_BYTES = MATMUL_K * MATMUL_N * sizeof(float);
-static const uint64_t GEMM_C_BYTES = MATMUL_M * MATMUL_N * sizeof(float);
+static const uint64_t GEMM_A_BYTES = MATMUL_M * MATMUL_K * sizeof(int8_t);
+static const uint64_t GEMM_B_BYTES = MATMUL_K * MATMUL_N * sizeof(int8_t);
+static const uint64_t GEMM_C_BYTES = MATMUL_M * MATMUL_N * sizeof(int32_t);
 
 // ============================================================
 // Accumulation phase (tree reduction)
@@ -45,12 +45,18 @@ static const uint64_t GEMM_C_BYTES = MATMUL_M * MATMUL_N * sizeof(float);
 // ============================================================
 static const uint64_t GEMM_PARTIAL_ELEMENTS = GEMM_M * GEMM_N;
 static const uint64_t GEMM_ACCUM_VEC_CALLS  = ceil_div_u64(GEMM_PARTIAL_ELEMENTS, VECTOR_ACC_CAP);
+static const uint64_t GEMM_QUANT_IN_ELEM_BYTES =
+    (uint64_t)sizeof(int32_t);
+static const uint64_t GEMM_QUANT_OUT_ELEM_BYTES =
+    (uint64_t)sizeof(uint8_t);
+static const uint64_t GEMM_ACCUM_IN_ELEM_BYTES  = GEMM_QUANT_OUT_ELEM_BYTES;
+static const uint64_t GEMM_ACCUM_OUT_ELEM_BYTES = GEMM_QUANT_OUT_ELEM_BYTES;
 
 // Read 2 partial matrices + write 1 result per vec_acc call
 static const uint64_t GEMM_ACCUM_RD_BYTES =
-    2 * VECTOR_ACC_CAP * (uint64_t)sizeof(float);
+    2 * VECTOR_ACC_CAP * GEMM_ACCUM_IN_ELEM_BYTES;
 static const uint64_t GEMM_ACCUM_WR_BYTES =
-    VECTOR_ACC_CAP * (uint64_t)sizeof(float);
+    VECTOR_ACC_CAP * GEMM_ACCUM_OUT_ELEM_BYTES;
 
 // ============================================================
 // Per-worker output quantization
@@ -64,9 +70,9 @@ static const uint64_t GEMM_ACCUM_WR_BYTES =
 static const uint64_t GEMM_QUANT_VEC_CALLS =
     ceil_div_u64(GEMM_PARTIAL_ELEMENTS, VECTOR_ACC_CAP);
 static const uint64_t GEMM_QUANT_RD_BYTES =
-    VECTOR_ACC_CAP * (uint64_t)sizeof(float);        // read fp32 partial result
+    VECTOR_ACC_CAP * GEMM_QUANT_IN_ELEM_BYTES;       // read fp32 partial result
 static const uint64_t GEMM_QUANT_WR_BYTES =
-    VECTOR_ACC_CAP * (uint64_t)sizeof(float) / 2;    // write fp16 quantized result
+    VECTOR_ACC_CAP * GEMM_QUANT_OUT_ELEM_BYTES;      // write fp16 quantized result
 
 // ============================================================
 // Configurable accelerator queue depths

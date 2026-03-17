@@ -34,12 +34,14 @@ struct AccumCoordinator : sc_module
 
     uint64_t vec_svc_cycles;   // VectorAccelerator service cycles per call
     uint64_t accum_vec_calls;  // vec_acc calls per pairwise accumulation
+    uint64_t scalar_cycles;    // scalar overhead cycles per vec_acc call
     uint64_t accum_rd_bytes;   // read bytes per vec_acc call
     uint64_t accum_wr_bytes;   // write bytes per vec_acc call
 
     // Statistics filled in after run() completes
     sc_time  accum_end_time;                // sim_time when final result is ready
     uint64_t vec_calls_total      = 0;      // total vec_acc calls issued
+    uint64_t compute_cycles       = 0;      // coordinator scalar-overhead cycles
     uint64_t wait_cycles          = 0;      // queue-wait + backpressure stall
     uint64_t stall_cycles         = 0;      // backpressure stall only
     uint64_t mem_cycles           = 0;      // accumulated memory cycles
@@ -47,10 +49,14 @@ struct AccumCoordinator : sc_module
     // Per-pair timing (one entry per pairwise accumulation, tree order)
     std::vector<sc_time> pair_start_times;
     std::vector<sc_time> pair_end_times;
+    std::vector<sc_time> pair_left_ready_times;
+    std::vector<sc_time> pair_right_ready_times;
     sc_mutex             stats_mutex;       // protects the two vectors above
 
     // Owns all sc_event objects for the reduction tree
     std::vector<sc_event *> tree_events_;
+    std::vector<sc_time *>  tree_ready_times_;
+    std::vector<bool *>     tree_ready_flags_;
 
     // ----------------------------------------------------------
     // DoneEntry — same backpressure pattern as Worker.
@@ -80,6 +86,7 @@ struct AccumCoordinator : sc_module
     AccumCoordinator(sc_module_name name,
                      uint64_t vec_svc_cycles_,
                      uint64_t accum_vec_calls_,
+                     uint64_t scalar_cycles_,
                      uint64_t accum_rd_bytes_,
                      uint64_t accum_wr_bytes_);
 
@@ -93,9 +100,10 @@ struct AccumCoordinator : sc_module
 
     PendingReq issue_begin(uint64_t addr);
     void       issue_end(PendingReq &p);
+    void       do_scalar(uint64_t cyc);
 
     // Run one pairwise accumulation: accum_vec_calls sequential vec_acc requests.
-    void run_one_pair();
+    void run_one_pair(size_t pair_id, sc_time left_ready, sc_time right_ready);
 
     void run();
 };

@@ -144,6 +144,7 @@ void AcceleratorTLM::service_thread()
 
         busy_cycles += svc;
         wait(svc * CYCLE);
+        occupied_cycles += (uint64_t)((sc_time_stamp() - t_start) / CYCLE);
 
         // Signal busy end (compute finished, about to send response)
         if (busy_cb)

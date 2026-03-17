@@ -39,6 +39,7 @@ struct Worker : sc_module
     uint64_t vec_calls        = 0;
     uint64_t elapsed_cycles   = 0;   // set at end of run(); used for GFLOPS reporting
     uint64_t mat_elapsed_cycles = 0; // cycles until mat+quant complete; set before mat_done_ev
+    sc_time  mat_done_time;
 
     // Fired after both mat tiles AND quantization vec tiles finish.
     // AccumCoordinator waits on this to start tree-reduction accumulation.

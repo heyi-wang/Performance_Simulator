@@ -243,7 +243,8 @@ void Worker::run()
     // Record mat+quant elapsed and signal AccumCoordinator.
     // The coordinator waits for this event before starting accumulation,
     // so it fires only after BOTH mat tiles AND quantization are done.
-    mat_elapsed_cycles = (uint64_t)((sc_time_stamp() - start) / CYCLE);
+    mat_done_time = sc_time_stamp();
+    mat_elapsed_cycles = (uint64_t)((mat_done_time - start) / CYCLE);
     mat_done_ev.notify(SC_ZERO_TIME);
 
     sc_time end        = sc_time_stamp();
