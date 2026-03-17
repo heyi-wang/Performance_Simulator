@@ -51,3 +51,31 @@ static const uint64_t GEMM_ACCUM_RD_BYTES =
     2 * VECTOR_ACC_CAP * (uint64_t)sizeof(float);
 static const uint64_t GEMM_ACCUM_WR_BYTES =
     VECTOR_ACC_CAP * (uint64_t)sizeof(float);
+
+// ============================================================
+// Per-worker output quantization
+//
+// After completing all mat tiles, each worker issues
+// GEMM_QUANT_VEC_CALLS vec_acc requests to quantize its
+// partial result [GEMM_M x GEMM_N] from fp32 → fp16.
+// Only after quantization does it fire mat_done_ev so the
+// AccumCoordinator can begin tree-reduction accumulation.
+// ============================================================
+static const uint64_t GEMM_QUANT_VEC_CALLS =
+    ceil_div_u64(GEMM_PARTIAL_ELEMENTS, VECTOR_ACC_CAP);
+static const uint64_t GEMM_QUANT_RD_BYTES =
+    VECTOR_ACC_CAP * (uint64_t)sizeof(float);        // read fp32 partial result
+static const uint64_t GEMM_QUANT_WR_BYTES =
+    VECTOR_ACC_CAP * (uint64_t)sizeof(float) / 2;    // write fp16 quantized result
+
+// ============================================================
+// Configurable accelerator queue depths
+//
+// Reduce VEC_ACC_QUEUE_CAP below NUM_THREADS to observe
+// backpressure: some workers will stall during quantization.
+// Set to NUM_THREADS for no stalls.
+// ============================================================
+static const size_t MAT_ACC_QUEUE_CAP =
+    static_cast<size_t>(NUM_THREADS);
+static const size_t VEC_ACC_QUEUE_CAP =
+    static_cast<size_t>(NUM_THREADS >= 2 ? NUM_THREADS / 2 : 1);

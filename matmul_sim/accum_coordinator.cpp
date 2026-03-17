@@ -28,15 +28,35 @@ AccumCoordinator::~AccumCoordinator()
         delete ev;
 }
 
+// ----------------------------------------------------------
+// nb_transport_bw: receive BEGIN_RESP or deferred END_REQ
+//
+//   BEGIN_RESP — request completed; route through PEQ.
+//   END_REQ    — queue slot granted after stall; notify admit_ev.
+// ----------------------------------------------------------
 tlm_sync_enum AccumCoordinator::nb_transport_bw(tlm_generic_payload &gp,
                                                  tlm_phase &phase,
                                                  sc_time &delay)
 {
     if (phase == BEGIN_RESP)
+    {
         peq.notify(gp, delay);
+        return TLM_ACCEPTED;
+    }
+    if (phase == END_REQ)
+    {
+        auto it = done_map.find(&gp);
+        if (it != done_map.end() && it->second && it->second->admit_ev)
+            it->second->admit_ev->notify(SC_ZERO_TIME);
+        return TLM_ACCEPTED;
+    }
     return TLM_ACCEPTED;
 }
 
+// ----------------------------------------------------------
+// peq_thread: set fired=true BEFORE notifying so issue_end
+// can skip wait() if the response arrived early.
+// ----------------------------------------------------------
 void AccumCoordinator::peq_thread()
 {
     while (true)
@@ -46,7 +66,10 @@ void AccumCoordinator::peq_thread()
         {
             auto it = done_map.find(gp);
             if (it != done_map.end() && it->second)
-                it->second->notify(SC_ZERO_TIME);
+            {
+                it->second->fired = true;
+                it->second->ev->notify(SC_ZERO_TIME);
+            }
         }
     }
 }
@@ -70,39 +93,54 @@ AccumCoordinator::PendingReq AccumCoordinator::issue_begin(uint64_t addr)
     gp->set_extension(req);
     gp->set_extension(tx);
 
-    p.gp      = gp;
-    p.req_ext = req;
-    p.tx_ext  = tx;
-    p.done_ev = new sc_event();
-    done_map[gp] = p.done_ev;
+    p.gp         = gp;
+    p.req_ext    = req;
+    p.tx_ext     = tx;
+    p.done_entry = new DoneEntry();
+    p.done_entry->ev       = new sc_event();
+    p.done_entry->admit_ev = new sc_event();
+    p.done_entry->fired    = false;
+    done_map[gp] = p.done_entry;
 
     tlm_phase phase = BEGIN_REQ;
     sc_time   delay = SC_ZERO_TIME;
     auto status = init->nb_transport_fw(*gp, phase, delay);
 
-    if (status == TLM_COMPLETED)
+    if (status == TLM_ACCEPTED)
+    {
+        // Queue full: stall until the accelerator grants a slot.
+        sc_time t_stall_start = sc_time_stamp();
+        wait(*p.done_entry->admit_ev);
+        p.stall_cycles = (uint64_t)((sc_time_stamp() - t_stall_start) / CYCLE);
+    }
+    else if (status == TLM_COMPLETED)
     {
         done_map.erase(gp);
         p.sync_done = true;
     }
+    // TLM_UPDATED: slot admitted immediately, no stall.
 
     return p;
 }
 
 void AccumCoordinator::issue_end(PendingReq &p)
 {
-    if (!p.sync_done)
-        wait(*p.done_ev);
+    if (!p.sync_done && !p.done_entry->fired)
+        wait(*p.done_entry->ev);
 
     done_map.erase(p.gp);
-    delete p.done_ev;
-    p.done_ev = nullptr;
+    delete p.done_entry->ev;
+    delete p.done_entry->admit_ev;
+    delete p.done_entry;
+    p.done_entry = nullptr;
 
     ReqExt *ext = nullptr;
     p.gp->get_extension(ext);
 
-    wait_cycles += ext ? ext->accel_qwait_cycles : 0;
-    mem_cycles  += ext ? ext->mem_cycles : 0;
+    uint64_t qwait = ext ? ext->accel_qwait_cycles : 0;
+    wait_cycles  += qwait + p.stall_cycles;
+    stall_cycles += p.stall_cycles;
+    mem_cycles   += ext ? ext->mem_cycles : 0;
 
     tlm_phase end_phase = END_RESP;
     sc_time   end_delay = SC_ZERO_TIME;
@@ -119,6 +157,10 @@ void AccumCoordinator::issue_end(PendingReq &p)
     p.tx_ext  = nullptr;
 }
 
+// ----------------------------------------------------------
+// run_one_pair: issue accum_vec_calls sequential vec_acc
+// requests for one pairwise accumulation.  Records timing.
+// ----------------------------------------------------------
 void AccumCoordinator::run_one_pair()
 {
     sc_time t0 = sc_time_stamp();
@@ -132,28 +174,20 @@ void AccumCoordinator::run_one_pair()
 
     sc_time t1 = sc_time_stamp();
 
-    // Record pair timing (protected because multiple spawned threads call this).
     stats_mutex.lock();
     pair_start_times.push_back(t0);
     pair_end_times.push_back(t1);
     stats_mutex.unlock();
 }
 
-// ============================================================
-// run() — build the event-driven reduction tree and wait for
-// the root result.
+// ----------------------------------------------------------
+// run() — build the event-driven reduction tree.
 //
-// For each internal node of the binary tree, an independent
-// SC_THREAD is spawned that:
-//   1. Waits for its left-input ready event.
-//   2. Waits for its right-input ready event.
-//   3. Immediately starts run_one_pair() (no global barrier).
-//   4. Fires its own output ready event.
-//
-// As a result, accumulation begins as soon as any pair of
-// partial results is available, overlapping with mat-phase
-// work that is still in progress on other workers.
-// ============================================================
+// For each internal node, an independent SC_THREAD is spawned
+// that waits for its two inputs then immediately accumulates
+// without any global barrier.  Accumulation begins as soon as
+// any pair of quantized partial results is available.
+// ----------------------------------------------------------
 void AccumCoordinator::run()
 {
     int n = (int)workers.size();
@@ -163,12 +197,9 @@ void AccumCoordinator::run()
         return;
     }
 
-    // ----------------------------------------------------------
-    // Create proxy "leaf" events: one per worker.
+    // Create proxy leaf events: one per worker.
     // A lightweight spawned thread waits on worker->mat_done_ev
-    // and then fires the proxy, decoupling the coordinator from
-    // the Worker's internal event object.
-    // ----------------------------------------------------------
+    // (which fires after mat+quant) then fires the proxy.
     std::vector<sc_event *> cur_evs;
     for (int i = 0; i < n; i++)
     {
@@ -183,12 +214,9 @@ void AccumCoordinator::run()
         });
     }
 
-    // ----------------------------------------------------------
     // Build the reduction tree level by level.
-    // For each pair (left, right) at the current level, spawn
-    // a thread that blocks on both inputs then accumulates.
-    // Odd survivors are forwarded unchanged to the next level.
-    // ----------------------------------------------------------
+    // Each pair spawns a thread that waits for both inputs
+    // then immediately calls run_one_pair().
     while ((int)cur_evs.size() > 1)
     {
         int m     = (int)cur_evs.size();
@@ -206,7 +234,6 @@ void AccumCoordinator::run()
             tree_events_.push_back(out);
             next_evs.push_back(out);
 
-            // Capture by value so the lambda is self-contained.
             sc_spawn([this, left, right, out]() {
                 sc_core::wait(*left);
                 sc_core::wait(*right);
@@ -215,24 +242,24 @@ void AccumCoordinator::run()
             });
         }
 
-        // Odd survivor: carries forward to the next level as-is.
+        // Odd survivor carries forward unchanged
         if (m % 2 == 1)
             next_evs.push_back(cur_evs[m - 1]);
 
         cur_evs = std::move(next_evs);
     }
 
-    // Wait for the single remaining (root) event — this fires when
-    // the entire reduction tree has completed.
+    // Wait for the root event (entire tree complete)
     wait(*cur_evs[0]);
 
     accum_end_time = sc_time_stamp();
 
     std::cout << "[AccumCoordinator]"
-              << " pairs_done=" << pair_start_times.size()
-              << " vec_calls_total=" << vec_calls_total
-              << " wait_cycles=" << wait_cycles
-              << " mem_cycles=" << mem_cycles
-              << " accum_end=" << accum_end_time
+              << " pairs_done="       << pair_start_times.size()
+              << " vec_calls_total="  << vec_calls_total
+              << " wait_cycles="      << wait_cycles
+              << " stall_cycles="     << stall_cycles
+              << " mem_cycles="       << mem_cycles
+              << " accum_end="        << accum_end_time
               << "\n";
 }

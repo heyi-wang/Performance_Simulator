@@ -11,6 +11,11 @@
 // Pipeline per accelerator type:
 //   issue_begin[i] → do_scalar (∥ accel processes i)
 //                  → issue_end[i] → issue_begin[i+1] → ...
+//
+// Backpressure: when the accelerator queue is full,
+// nb_transport_fw returns TLM_ACCEPTED instead of TLM_UPDATED.
+// issue_begin then blocks on admit_ev until the accelerator
+// sends a deferred END_REQ backward to grant the slot.
 // ============================================================
 struct Worker : sc_module
 {
@@ -27,33 +32,53 @@ struct Worker : sc_module
     uint64_t scalar_cycles;
 
     uint64_t compute_cycles   = 0;
-    uint64_t wait_cycles      = 0;
+    uint64_t wait_cycles      = 0;   // queue-wait + backpressure stall combined
+    uint64_t stall_cycles     = 0;   // backpressure stall only (subset of wait_cycles)
     uint64_t mem_cycles_accum = 0;
     uint64_t mat_calls        = 0;
     uint64_t vec_calls        = 0;
     uint64_t elapsed_cycles   = 0;   // set at end of run(); used for GFLOPS reporting
-    uint64_t mat_elapsed_cycles = 0; // cycles until end of mat phase; set before mat_done_ev
+    uint64_t mat_elapsed_cycles = 0; // cycles until mat+quant complete; set before mat_done_ev
 
-    // Fired when the matrix-multiply phase of run() completes.
-    // AccumCoordinator waits on this to start the accumulation stage.
-    sc_event  mat_done_ev;
+    // Fired after both mat tiles AND quantization vec tiles finish.
+    // AccumCoordinator waits on this to start tree-reduction accumulation.
+    sc_event mat_done_ev;
 
-    uint64_t A_bytes = 0;
-    uint64_t B_bytes = 0;
-    uint64_t C_bytes = 0;
+    uint64_t A_bytes      = 0;   // mat-request read bytes (A tile)
+    uint64_t B_bytes      = 0;   // mat-request read bytes (B tile)
+    uint64_t C_bytes      = 0;   // mat-request write bytes (C tile)
+    uint64_t vec_rd_bytes = 0;   // vec-request read bytes  (0 → uses A+B)
+    uint64_t vec_wr_bytes = 0;   // vec-request write bytes (0 → uses C)
 
-    std::unordered_map<tlm_generic_payload *, sc_event *> done_map;
+    // ----------------------------------------------------------
+    // DoneEntry — per-request synchronisation state.
+    //   ev:       notified when accelerator sends BEGIN_RESP.
+    //   admit_ev: notified when accelerator sends deferred END_REQ
+    //             (backpressure: queue slot granted after stall).
+    //   fired:    set true by peq_thread before notifying ev, so
+    //             issue_end can skip wait() if response already
+    //             arrived before issue_end is called.
+    // ----------------------------------------------------------
+    struct DoneEntry
+    {
+        sc_event *ev       = nullptr;
+        sc_event *admit_ev = nullptr;
+        bool      fired    = false;
+    };
+
+    std::unordered_map<tlm_generic_payload *, DoneEntry *> done_map;
 
     // Handle for an in-flight accelerator request.
     // Returned by issue_begin(); must be finalized with issue_end().
     struct PendingReq
     {
-        tlm_generic_payload *gp       = nullptr;
-        ReqExt              *req_ext  = nullptr;
-        TxnExt              *tx_ext   = nullptr;
-        sc_event            *done_ev  = nullptr;
-        uint64_t             svc_cycles = 0;
-        bool                 sync_done  = false;
+        tlm_generic_payload *gp           = nullptr;
+        ReqExt              *req_ext      = nullptr;
+        TxnExt              *tx_ext       = nullptr;
+        DoneEntry           *done_entry   = nullptr;
+        uint64_t             svc_cycles   = 0;
+        uint64_t             stall_cycles = 0;   // backpressure stall for this request
+        bool                 sync_done    = false;
     };
 
     SC_HAS_PROCESS(Worker);
@@ -67,7 +92,9 @@ struct Worker : sc_module
            uint64_t scalar_cycles_,
            uint64_t A_bytes_,
            uint64_t B_bytes_,
-           uint64_t C_bytes_);
+           uint64_t C_bytes_,
+           uint64_t vec_rd_ = 0,
+           uint64_t vec_wr_ = 0);
 
     tlm_sync_enum nb_transport_bw(tlm_generic_payload &gp,
                                   tlm_phase &phase,
@@ -76,8 +103,13 @@ struct Worker : sc_module
     void peq_thread();
     void do_scalar(uint64_t cyc);
 
+    // issue_begin with explicit rd/wr bytes (used for vec/quant requests)
+    PendingReq issue_begin(uint64_t addr, uint64_t svc_cycles, uint64_t rd, uint64_t wr);
+
+    // Convenience overload: uses A_bytes+B_bytes and C_bytes (mat requests)
     PendingReq issue_begin(uint64_t addr, uint64_t svc_cycles);
-    void       issue_end(PendingReq &p);
+
+    void issue_end(PendingReq &p);
 
     void run();
 };
