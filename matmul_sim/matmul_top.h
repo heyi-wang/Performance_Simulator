@@ -2,7 +2,7 @@
 
 #include "../src/memory.h"
 #include "../src/interconnect.h"
-#include "../src/accelerator.h"
+#include "../src/accelerator_pool.h"
 #include "../src/worker.h"
 #include "accum_coordinator.h"
 #include "matmul_config.h"
@@ -24,14 +24,16 @@
 // ============================================================
 struct MatmulTop : sc_module
 {
-    AcceleratorTLM    mat_acc;
-    AcceleratorTLM    vec_acc;
-    Interconnect      noc;
-    Memory            memory;
+    MatmulConfig    cfg;
+    AcceleratorPool mat_acc;
+    AcceleratorPool vec_acc;
+    Interconnect    noc;
+    Memory          memory;
 
     std::vector<Worker *> workers;
     AccumCoordinator     *coordinator = nullptr;
 
-    SC_CTOR(MatmulTop);
+    SC_HAS_PROCESS(MatmulTop);
+    MatmulTop(sc_module_name nm, const MatmulConfig &cfg_);
     ~MatmulTop() override;
 };

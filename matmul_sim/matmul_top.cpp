@@ -1,10 +1,10 @@
 #include "matmul_top.h"
-#include <algorithm>
 
-MatmulTop::MatmulTop(sc_module_name nm)
+MatmulTop::MatmulTop(sc_module_name nm, const MatmulConfig &cfg_)
     : sc_module(nm),
-      mat_acc("mat_acc", MAT_ACC_QUEUE_CAP),
-      vec_acc("vec_acc", VEC_ACC_QUEUE_CAP),
+      cfg(cfg_),
+      mat_acc("mat_acc", cfg.mat_accel_count, cfg.mat_acc_queue_cap()),
+      vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap()),
       noc("noc"),
       memory("memory")
 {
@@ -13,53 +13,51 @@ MatmulTop::MatmulTop(sc_module_name nm)
     noc.to_vec.bind(vec_acc.tgt);
     noc.to_mem.bind(memory.tgt);
 
-    // Accelerators reach memory through the interconnect
-    mat_acc.to_mem.bind(noc.tgt);
-    vec_acc.to_mem.bind(noc.tgt);
+    // Each physical accelerator instance reaches memory through the interconnect.
+    for (auto &unit : mat_acc.units)
+        unit->to_mem.bind(noc.tgt);
+    for (auto &unit : vec_acc.units)
+        unit->to_mem.bind(noc.tgt);
 
     // -------------------------------------------------------
     // Worker configuration (K-split):
-    //   Phase 1 (mat): GEMM_ACCESS_MAT tiles for this thread's K-slice
-    //   Phase 2 (quant): GEMM_QUANT_VEC_CALLS tiles to quantize
-    //                    the partial result fp32 → fp16
-    //   mat_done_ev fires after BOTH phases complete so the
-    //   AccumCoordinator starts only on fully quantized data.
+    //   Workers only execute matmul for their K-slice.
+    //   Quantization is deferred until the coordinator finishes
+    //   the high-precision reduction tree.
     // -------------------------------------------------------
-    for (int i = 0; i < NUM_THREADS; i++)
+    for (int i = 0; i < cfg.thread_count; i++)
     {
-        uint64_t k_begin = (uint64_t)i * GEMM_K_PER_THREAD;
-        uint64_t k_end   = std::min<uint64_t>(GEMM_K, k_begin + GEMM_K_PER_THREAD);
-        uint64_t local_k = (k_begin < GEMM_K) ? (k_end - k_begin) : 0;
-        uint64_t local_tile_k = (local_k > 0) ? ceil_div_u64(local_k, MATMUL_K) : 0;
-        uint64_t local_access_mat = GEMM_TILE_M * local_tile_k * GEMM_TILE_N;
-
         auto *w = new Worker(sc_gen_unique_name("worker"),
                              i,
-                             local_access_mat,       // mat tiles for this worker's K-slice
-                             GEMM_QUANT_VEC_CALLS,   // quant tiles after mat
+                             cfg.local_access_mat_for_thread(i), // mat tiles for this worker's K-slice
+                             0, // final quantization is deferred to the coordinator
                              MATMUL_ACC_CYCLE,
                              VECTOR_ACC_CYCLE,
                              SCALAR_OVERHEAD,
-                             GEMM_A_BYTES,            // mat rd (A tile)
-                             GEMM_B_BYTES,            // mat rd (B tile)
-                             GEMM_C_BYTES,            // mat wr (C tile)
-                             GEMM_QUANT_RD_BYTES,     // vec rd (fp32 partial)
-                             GEMM_QUANT_WR_BYTES);    // vec wr (fp16 quantized)
+                             MatmulConfig::gemm_a_bytes,        // mat rd (A tile)
+                             MatmulConfig::gemm_b_bytes,        // mat rd (B tile)
+                             MatmulConfig::gemm_c_bytes,        // mat wr (C tile)
+                             0,
+                             0);
         workers.push_back(w);
         w->init.bind(noc.tgt);
     }
 
     // -------------------------------------------------------
     // AccumCoordinator — event-driven tree-reduction phase.
-    // Starts as soon as any pair of quantized partial results
+    // Starts as soon as any pair of partial results
     // is available (does not wait for all workers).
     // -------------------------------------------------------
     coordinator = new AccumCoordinator("accum_coord",
                                        VECTOR_ACC_CYCLE,
-                                       GEMM_ACCUM_VEC_CALLS,
+                                       MatmulConfig::gemm_accum_vec_calls(),
+                                       MatmulConfig::gemm_quant_vec_calls(),
+                                       static_cast<uint64_t>(cfg.vec_accel_count),
                                        SCALAR_OVERHEAD,
-                                       GEMM_ACCUM_RD_BYTES,
-                                       GEMM_ACCUM_WR_BYTES);
+                                       MatmulConfig::gemm_accum_rd_bytes,
+                                       MatmulConfig::gemm_accum_wr_bytes,
+                                       MatmulConfig::gemm_quant_rd_bytes,
+                                       MatmulConfig::gemm_quant_wr_bytes);
 
     coordinator->workers = workers;
     coordinator->init.bind(noc.tgt);

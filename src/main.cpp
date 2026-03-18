@@ -13,14 +13,18 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     // Accelerator and memory utilization
     // -------------------------------------------------------
     std::cout << "\n=== Accelerator stats ===\n";
-    std::cout << "mat_acc: reqs="          << top.mat_acc.req_count
-              << " busy_cycles="           << top.mat_acc.busy_cycles
-              << " queue_wait_cycles="     << top.mat_acc.queue_wait_cycles
+    std::cout << "mat_acc pool (" << top.mat_acc.instance_count() << " units):"
+              << " reqs="                << top.mat_acc.req_count_total()
+              << " busy_cycles="         << top.mat_acc.busy_cycles_total()
+              << " occupied_cycles="     << top.mat_acc.occupied_cycles_total()
+              << " queue_wait_cycles="   << top.mat_acc.queue_wait_cycles_total()
               << "\n";
 
-    std::cout << "vec_acc: reqs="          << top.vec_acc.req_count
-              << " busy_cycles="           << top.vec_acc.busy_cycles
-              << " queue_wait_cycles="     << top.vec_acc.queue_wait_cycles
+    std::cout << "vec_acc pool (" << top.vec_acc.instance_count() << " units):"
+              << " reqs="                << top.vec_acc.req_count_total()
+              << " busy_cycles="         << top.vec_acc.busy_cycles_total()
+              << " occupied_cycles="     << top.vec_acc.occupied_cycles_total()
+              << " queue_wait_cycles="   << top.vec_acc.queue_wait_cycles_total()
               << "\n";
 
     std::cout << "memory : reqs="          << top.memory.reqs
@@ -45,8 +49,8 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     double gflops      = total_flops / static_cast<double>(max_elapsed);
 
     // mat_acc utilization = busy / (busy + queue_wait)
-    double mat_busy    = static_cast<double>(top.mat_acc.busy_cycles);
-    double mat_total   = mat_busy + static_cast<double>(top.mat_acc.queue_wait_cycles);
+    double mat_busy    = static_cast<double>(top.mat_acc.busy_cycles_total());
+    double mat_total   = mat_busy + static_cast<double>(top.mat_acc.queue_wait_cycles_total());
     double mat_util    = (mat_total > 0) ? mat_busy / mat_total * 100.0 : 0.0;
 
     // Memory bandwidth used:
@@ -66,11 +70,13 @@ int sc_main(int /*argc*/, char * /*argv*/[])
               << ", " << CONV_H_OUT << ", " << CONV_W_OUT << "]\n";
     std::cout << "Total MACs     : " << CONV_TOTAL_MACS << "\n";
     std::cout << "Threads        : " << NUM_THREADS << "\n";
+    std::cout << "Mat accels     : " << MAT_ACCEL_COUNT_CFG << "\n";
+    std::cout << "Vec accels     : " << VEC_ACCEL_COUNT_CFG << "\n";
     std::cout << "Max elapsed    : " << max_elapsed << " cycles\n";
     std::cout << "Throughput     : " << gflops << " GFLOPS  (at 1 GHz)\n";
     std::cout << "mat_acc util   : " << mat_util << "%"
-              << "  (busy=" << top.mat_acc.busy_cycles
-              << "  stall=" << top.mat_acc.queue_wait_cycles << ")\n";
+              << "  (busy=" << top.mat_acc.busy_cycles_total()
+              << "  stall=" << top.mat_acc.queue_wait_cycles_total() << ")\n";
     std::cout << "Mem BW avg use : " << mem_bw_used << " bytes/cycle\n";
 
     if (mat_util < 50.0)

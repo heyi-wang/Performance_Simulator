@@ -7,17 +7,25 @@ SC_HAS_PROCESS(AccumCoordinator);
 AccumCoordinator::AccumCoordinator(sc_module_name name,
                                    uint64_t vec_svc_cycles_,
                                    uint64_t accum_vec_calls_,
+                                   uint64_t final_quant_calls_,
+                                   uint64_t max_inflight_vec_reqs_,
                                    uint64_t scalar_cycles_,
                                    uint64_t accum_rd_bytes_,
-                                   uint64_t accum_wr_bytes_)
+                                   uint64_t accum_wr_bytes_,
+                                   uint64_t quant_rd_bytes_,
+                                   uint64_t quant_wr_bytes_)
     : sc_module(name),
       init("init"),
       peq("peq"),
       vec_svc_cycles(vec_svc_cycles_),
       accum_vec_calls(accum_vec_calls_),
+      final_quant_calls(final_quant_calls_),
+      max_inflight_vec_reqs(std::max<uint64_t>(max_inflight_vec_reqs_, 1)),
       scalar_cycles(scalar_cycles_),
       accum_rd_bytes(accum_rd_bytes_),
-      accum_wr_bytes(accum_wr_bytes_)
+      accum_wr_bytes(accum_wr_bytes_),
+      quant_rd_bytes(quant_rd_bytes_),
+      quant_wr_bytes(quant_wr_bytes_)
 {
     init.register_nb_transport_bw(this, &AccumCoordinator::nb_transport_bw);
     SC_THREAD(peq_thread);
@@ -80,7 +88,9 @@ void AccumCoordinator::peq_thread()
     }
 }
 
-AccumCoordinator::PendingReq AccumCoordinator::issue_begin(uint64_t addr)
+AccumCoordinator::PendingReq AccumCoordinator::issue_begin(uint64_t addr,
+                                                           uint64_t rd_bytes,
+                                                           uint64_t wr_bytes)
 {
     PendingReq p;
 
@@ -92,7 +102,7 @@ AccumCoordinator::PendingReq AccumCoordinator::issue_begin(uint64_t addr)
     gp->set_streaming_width(0);
     gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
 
-    auto *req = new ReqExt(-1, vec_svc_cycles, accum_rd_bytes, accum_wr_bytes);
+    auto *req = new ReqExt(-1, vec_svc_cycles, rd_bytes, wr_bytes);
     auto *tx  = new TxnExt();
     tx->src_worker = -1;
 
@@ -135,6 +145,81 @@ void AccumCoordinator::do_scalar(uint64_t cyc)
     wait(cyc * CYCLE);
 }
 
+void AccumCoordinator::issue_vec_stream(uint64_t call_count,
+                                        uint64_t rd_bytes,
+                                        uint64_t wr_bytes,
+                                        uint64_t &stage_call_counter)
+{
+    if (call_count == 0)
+        return;
+
+    std::deque<PendingReq> inflight;
+    uint64_t issued = 0;
+    uint64_t window = std::max<uint64_t>(max_inflight_vec_reqs, 1);
+
+    auto issue_one = [&]() {
+        inflight.push_back(issue_begin(Interconnect::ADDR_VEC, rd_bytes, wr_bytes));
+        ++vec_calls_total;
+        ++stage_call_counter;
+        ++issued;
+    };
+
+    while (issued < call_count && inflight.size() < window)
+        issue_one();
+
+    while (!inflight.empty())
+    {
+        if (issued < call_count)
+            do_scalar(scalar_cycles);
+
+        while (issued < call_count && inflight.size() < window)
+            issue_one();
+
+        bool has_completed = false;
+        for (auto &pending : inflight)
+        {
+            if (pending.sync_done || (pending.done_entry && pending.done_entry->fired))
+            {
+                has_completed = true;
+                break;
+            }
+        }
+
+        if (!has_completed)
+        {
+            sc_event_or_list wait_list;
+            for (auto &pending : inflight)
+            {
+                if (!pending.sync_done && pending.done_entry && !pending.done_entry->fired)
+                    wait_list |= *pending.done_entry->ev;
+            }
+            wait(wait_list);
+        }
+
+        bool retired_one = false;
+        for (auto it = inflight.begin(); it != inflight.end();)
+        {
+            if (it->sync_done || (it->done_entry && it->done_entry->fired))
+            {
+                issue_end(*it);
+                it = inflight.erase(it);
+                retired_one = true;
+                break;
+            }
+            else
+            {
+                ++it;
+            }
+        }
+
+        if (!retired_one && !inflight.empty())
+        {
+            issue_end(inflight.front());
+            inflight.pop_front();
+        }
+    }
+}
+
 void AccumCoordinator::issue_end(PendingReq &p)
 {
     if (!p.sync_done && !p.done_entry->fired)
@@ -170,8 +255,9 @@ void AccumCoordinator::issue_end(PendingReq &p)
 }
 
 // ----------------------------------------------------------
-// run_one_pair: issue accum_vec_calls sequential vec_acc
-// requests for one pairwise accumulation.  Records timing.
+// run_one_pair: issue accum_vec_calls with a pipelined in-flight
+// vec request window so one reduction thread can occupy multiple
+// vec accelerators concurrently. Records timing.
 // ----------------------------------------------------------
 void AccumCoordinator::run_one_pair(size_t pair_id,
                                     sc_time left_ready,
@@ -179,20 +265,10 @@ void AccumCoordinator::run_one_pair(size_t pair_id,
 {
     sc_time t0 = sc_time_stamp();
 
-    if (accum_vec_calls > 0)
-    {
-        auto pending = issue_begin(Interconnect::ADDR_VEC);
-        vec_calls_total++;
-
-        for (uint64_t i = 1; i < accum_vec_calls; i++)
-        {
-            do_scalar(scalar_cycles);
-            issue_end(pending);
-            pending = issue_begin(Interconnect::ADDR_VEC);
-            vec_calls_total++;
-        }
-        issue_end(pending);
-    }
+    issue_vec_stream(accum_vec_calls,
+                     accum_rd_bytes,
+                     accum_wr_bytes,
+                     accum_vec_calls_total);
 
     sc_time t1 = sc_time_stamp();
 
@@ -202,6 +278,14 @@ void AccumCoordinator::run_one_pair(size_t pair_id,
     pair_left_ready_times[pair_id] = left_ready;
     pair_right_ready_times[pair_id] = right_ready;
     stats_mutex.unlock();
+}
+
+void AccumCoordinator::run_final_quant()
+{
+    issue_vec_stream(final_quant_calls,
+                     quant_rd_bytes,
+                     quant_wr_bytes,
+                     final_quant_calls_total);
 }
 
 // ----------------------------------------------------------
@@ -223,7 +307,8 @@ void AccumCoordinator::run()
     if (n == 1)
     {
         wait(workers[0]->mat_done_ev);
-        accum_end_time = workers[0]->mat_done_time;
+        run_final_quant();
+        accum_end_time = sc_time_stamp();
         return;
     }
 
@@ -313,6 +398,7 @@ void AccumCoordinator::run()
     // Wait for the root event (entire tree complete)
     wait(*cur_nodes[0].ev);
 
+    run_final_quant();
     accum_end_time = sc_time_stamp();
 
     std::cout << "[AccumCoordinator]"

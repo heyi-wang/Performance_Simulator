@@ -2,8 +2,8 @@
 
 Top::Top(sc_module_name nm)
     : sc_module(nm),
-      mat_acc("mat_acc", NUM_THREADS),
-      vec_acc("vec_acc", NUM_THREADS),
+      mat_acc("mat_acc", MAT_ACCEL_COUNT_CFG, NUM_THREADS),
+      vec_acc("vec_acc", VEC_ACCEL_COUNT_CFG, NUM_THREADS),
       noc("noc"),
       memory("memory")
 {
@@ -12,9 +12,11 @@ Top::Top(sc_module_name nm)
     noc.to_vec.bind(vec_acc.tgt);
     noc.to_mem.bind(memory.tgt);
 
-    // Accelerators reach memory through the interconnect
-    mat_acc.to_mem.bind(noc.tgt);
-    vec_acc.to_mem.bind(noc.tgt);
+    // Each physical accelerator instance reaches memory through the interconnect.
+    for (auto &unit : mat_acc.units)
+        unit->to_mem.bind(noc.tgt);
+    for (auto &unit : vec_acc.units)
+        unit->to_mem.bind(noc.tgt);
 
     // Derive per-worker workload from config parameters
     uint64_t tile_M = ceil_div_u64(A_M, MATMUL_M);

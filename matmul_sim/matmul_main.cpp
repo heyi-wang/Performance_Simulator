@@ -1,8 +1,11 @@
 #include "matmul_top.h"
 #include "matmul_config.h"
-#include <iostream>
-#include <iomanip>
+
 #include <algorithm>
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+#include <string>
 
 // ============================================================
 // Verification helpers
@@ -17,17 +20,74 @@ static bool check(bool cond, const char *desc)
     return cond;
 }
 
+static bool parse_args(int argc, char *argv[], int &thread_count)
+{
+    thread_count = NUM_THREADS;
+
+    for (int i = 1; i < argc; i++)
+    {
+        std::string arg = argv[i];
+        if (arg == "--threads")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for --threads\n";
+                return false;
+            }
+
+            std::string value = argv[++i];
+            try
+            {
+                size_t pos = 0;
+                int parsed = std::stoi(value, &pos);
+                if (pos != value.size() || parsed < 1)
+                {
+                    std::cerr << "Invalid --threads value: " << value << "\n";
+                    return false;
+                }
+                thread_count = parsed;
+            }
+            catch (const std::exception &)
+            {
+                std::cerr << "Invalid --threads value: " << value << "\n";
+                return false;
+            }
+        }
+        else if (arg == "--help" || arg == "-h")
+        {
+            std::cout << "Usage: " << argv[0] << " [--threads N]\n";
+            std::cout << "  --threads N   Runtime worker count for the K-split GEMM simulator\n";
+            return false;
+        }
+        else
+        {
+            std::cerr << "Unknown argument: " << arg << "\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // ============================================================
 // sc_main
 // ============================================================
-int sc_main(int /*argc*/, char * /*argv*/[])
+int sc_main(int argc, char *argv[])
 {
-    MatmulTop top("top");
+    int thread_count = NUM_THREADS;
+    if (!parse_args(argc, argv, thread_count))
+        return (argc > 1) ? 1 : 0;
+
+    MatmulConfig cfg(thread_count);
+    MatmulTop top("top", cfg);
 
     std::cout << "=== K-split GEMM Performance Simulator ===\n";
-    std::cout << "Threads          : " << NUM_THREADS           << "\n";
-    std::cout << "GEMM shape       : [" << GEMM_M << " x " << GEMM_K << " x " << GEMM_N << "]\n";
-    std::cout << "K per thread     : " << GEMM_K_PER_THREAD     << "\n";
+    std::cout << "Threads          : " << cfg.thread_count << "\n";
+    std::cout << "Mat accels       : " << cfg.mat_accel_count << "\n";
+    std::cout << "Vec accels       : " << cfg.vec_accel_count << "\n";
+    std::cout << "GEMM shape       : [" << MatmulConfig::gemm_m << " x "
+              << MatmulConfig::gemm_k << " x " << MatmulConfig::gemm_n << "]\n";
+    std::cout << "K per thread     : " << cfg.gemm_k_per_thread() << "\n";
     uint64_t min_mat_tiles = UINT64_MAX;
     uint64_t max_mat_tiles = 0;
     uint64_t total_mat_tiles = 0;
@@ -41,12 +101,16 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     if (min_mat_tiles != max_mat_tiles)
         std::cout << " .. " << max_mat_tiles;
     std::cout << "  (total=" << total_mat_tiles << ")\n";
-    std::cout << "Quant tiles/w    : " << GEMM_QUANT_VEC_CALLS  << " vec_acc calls (int32→int8)\n";
-    std::cout << "Accum tiles/pair : " << GEMM_ACCUM_VEC_CALLS  << " vec_acc calls per pair\n";
-    std::cout << "mat_acc queue    : " << MAT_ACC_QUEUE_CAP      << " slots\n";
-    std::cout << "vec_acc queue    : " << VEC_ACC_QUEUE_CAP      << " slots";
-    if (VEC_ACC_QUEUE_CAP < (size_t)NUM_THREADS)
-        std::cout << "  (< NUM_THREADS → backpressure expected during quant)";
+    std::cout << "Final quant      : " << MatmulConfig::gemm_quant_vec_calls()
+              << " vec_acc calls (int32→int8, once after reduction)\n";
+    std::cout << "Accum tiles/pair : " << MatmulConfig::gemm_accum_vec_calls()
+              << " vec_acc calls per pair\n";
+    std::cout << "mat_acc queue    : " << cfg.mat_acc_queue_cap()
+              << " shared slots across " << cfg.mat_accel_count << " units\n";
+    std::cout << "vec_acc queue    : " << cfg.vec_acc_queue_cap()
+              << " shared slots across " << cfg.vec_accel_count << " units";
+    if (cfg.vec_acc_queue_cap() < static_cast<size_t>(cfg.thread_count))
+        std::cout << "  (< NUM_THREADS → backpressure expected during reduction/final quant)";
     std::cout << "\n\n";
 
     sc_start();
@@ -54,21 +118,54 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     // -------------------------------------------------------
     // Raw accelerator & memory stats
     // -------------------------------------------------------
+    uint64_t mat_req_total = top.mat_acc.req_count_total();
+    uint64_t mat_busy_total = top.mat_acc.busy_cycles_total();
+    uint64_t mat_occupied_total = top.mat_acc.occupied_cycles_total();
+    uint64_t mat_qwait_total = top.mat_acc.queue_wait_cycles_total();
+    uint64_t vec_req_total = top.vec_acc.req_count_total();
+    uint64_t vec_busy_total = top.vec_acc.busy_cycles_total();
+    uint64_t vec_occupied_total = top.vec_acc.occupied_cycles_total();
+    uint64_t vec_qwait_total = top.vec_acc.queue_wait_cycles_total();
+
     std::cout << "\n=== Accelerator stats ===\n";
-    std::cout << "mat_acc : reqs="         << top.mat_acc.req_count
-              << "  busy_cycles="          << top.mat_acc.busy_cycles
-              << "  occupied_cycles="      << top.mat_acc.occupied_cycles
-              << "  queue_wait_cycles="    << top.mat_acc.queue_wait_cycles
+    std::cout << "mat_acc pool : units="    << top.mat_acc.instance_count()
+              << "  reqs="                  << mat_req_total
+              << "  busy_cycles="           << mat_busy_total
+              << "  occupied_cycles="       << mat_occupied_total
+              << "  shared_qwait_cycles="   << mat_qwait_total
               << "\n";
-    std::cout << "vec_acc : reqs="         << top.vec_acc.req_count
-              << "  busy_cycles="          << top.vec_acc.busy_cycles
-              << "  occupied_cycles="      << top.vec_acc.occupied_cycles
-              << "  queue_wait_cycles="    << top.vec_acc.queue_wait_cycles
+    std::cout << "vec_acc pool : units="    << top.vec_acc.instance_count()
+              << "  reqs="                  << vec_req_total
+              << "  busy_cycles="           << vec_busy_total
+              << "  occupied_cycles="       << vec_occupied_total
+              << "  shared_qwait_cycles="   << vec_qwait_total
               << "\n";
     std::cout << "memory  : reqs="         << top.memory.reqs
               << "  busy_cycles="          << top.memory.busy_cycles
               << "  queue_wait_cycles="    << top.memory.qwait_cycles
               << "\n";
+    std::cout << "  Note: pool qwait is shared-queue waiting before dispatch; "
+                 "per-unit qwait is not reported because units are dispatched only when free.\n";
+
+    std::cout << "\n=== Accelerator instances ===\n";
+    for (size_t i = 0; i < top.mat_acc.units.size(); ++i)
+    {
+        const auto &unit = top.mat_acc.units[i];
+        std::cout << "  mat[" << i << "]"
+                  << " reqs=" << unit->req_count
+                  << " busy=" << unit->busy_cycles
+                  << " occupied=" << unit->occupied_cycles
+                  << "\n";
+    }
+    for (size_t i = 0; i < top.vec_acc.units.size(); ++i)
+    {
+        const auto &unit = top.vec_acc.units[i];
+        std::cout << "  vec[" << i << "]"
+                  << " reqs=" << unit->req_count
+                  << " busy=" << unit->busy_cycles
+                  << " occupied=" << unit->occupied_cycles
+                  << "\n";
+    }
 
     // -------------------------------------------------------
     // Per-worker breakdown
@@ -81,7 +178,7 @@ int sc_main(int /*argc*/, char * /*argv*/[])
                   << " vec_calls="  << w->vec_calls
                   << " compute="    << w->compute_cycles
                   << " wait="       << w->wait_cycles
-                  << " stall="      << w->stall_cycles
+                  << " mat_stall="  << w->stall_cycles
                   << " mem="        << w->mem_cycles_accum
                   << " elapsed="    << w->mat_elapsed_cycles
                   << "\n";
@@ -89,49 +186,53 @@ int sc_main(int /*argc*/, char * /*argv*/[])
 
     // -------------------------------------------------------
     // Wall-clock timing
-    // mat_elapsed_cycles now represents mat + quant combined
-    // (the time until the quantized partial result is ready).
+    // mat_elapsed_cycles now represents the worker matmul phase only.
     // -------------------------------------------------------
     uint64_t max_mat_elapsed = 0;
     for (const auto *w : top.workers)
         max_mat_elapsed = std::max(max_mat_elapsed, w->mat_elapsed_cycles);
 
     uint64_t total_elapsed =
-        (uint64_t)(top.coordinator->accum_end_time / CYCLE);
+        static_cast<uint64_t>(top.coordinator->accum_end_time / CYCLE);
 
     uint64_t accum_overhead =
         (total_elapsed > max_mat_elapsed) ? (total_elapsed - max_mat_elapsed) : 0;
 
     // GFLOPS: 2 FLOPs per MAC, CYCLE = 1 ns → 1 GHz clock
-    double total_macs  = static_cast<double>(GEMM_M) * GEMM_K * GEMM_N;
+    double total_macs =
+        static_cast<double>(MatmulConfig::gemm_m) * MatmulConfig::gemm_k * MatmulConfig::gemm_n;
     double total_flops = total_macs * 2.0;
-    double gflops      = (total_elapsed > 0)
-                         ? total_flops / static_cast<double>(total_elapsed)
-                         : 0.0;
+    double gflops = (total_elapsed > 0)
+                        ? total_flops / static_cast<double>(total_elapsed)
+                        : 0.0;
 
     // Accelerator occupancy
-    double mat_busy     = static_cast<double>(top.mat_acc.busy_cycles);
-    double mat_occupied = static_cast<double>(top.mat_acc.occupied_cycles);
-    double mat_occ      = (total_elapsed > 0)
-                          ? mat_occupied / static_cast<double>(total_elapsed) * 100.0
-                          : 0.0;
-    double mat_compute_util = (total_elapsed > 0)
-                              ? mat_busy / static_cast<double>(total_elapsed) * 100.0
+    double mat_busy     = static_cast<double>(mat_busy_total);
+    double mat_occupied = static_cast<double>(mat_occupied_total);
+    double mat_capacity = static_cast<double>(total_elapsed) *
+                          static_cast<double>(top.mat_acc.instance_count());
+    double mat_occ      = (mat_capacity > 0.0)
+                              ? mat_occupied / mat_capacity * 100.0
                               : 0.0;
+    double mat_compute_util = (mat_capacity > 0.0)
+                                  ? mat_busy / mat_capacity * 100.0
+                                  : 0.0;
 
-    double vec_busy     = static_cast<double>(top.vec_acc.busy_cycles);
-    double vec_occupied = static_cast<double>(top.vec_acc.occupied_cycles);
-    double vec_occ      = (total_elapsed > 0)
-                          ? vec_occupied / static_cast<double>(total_elapsed) * 100.0
-                          : 0.0;
-    double vec_compute_util = (total_elapsed > 0)
-                              ? vec_busy / static_cast<double>(total_elapsed) * 100.0
+    double vec_busy     = static_cast<double>(vec_busy_total);
+    double vec_occupied = static_cast<double>(vec_occupied_total);
+    double vec_capacity = static_cast<double>(total_elapsed) *
+                          static_cast<double>(top.vec_acc.instance_count());
+    double vec_occ      = (vec_capacity > 0.0)
+                              ? vec_occupied / vec_capacity * 100.0
                               : 0.0;
+    double vec_compute_util = (vec_capacity > 0.0)
+                                  ? vec_busy / vec_capacity * 100.0
+                                  : 0.0;
 
     double mem_bw = (total_elapsed > 0)
-                    ? static_cast<double>(top.memory.busy_cycles) * 32.0
-                      / static_cast<double>(total_elapsed)
-                    : 0.0;
+                        ? static_cast<double>(top.memory.busy_cycles) * 32.0
+                              / static_cast<double>(total_elapsed)
+                        : 0.0;
 
     // Total backpressure stall across all workers
     uint64_t total_worker_stall = 0;
@@ -140,13 +241,14 @@ int sc_main(int /*argc*/, char * /*argv*/[])
 
     std::cout << "\n=== Performance summary ===\n";
     std::cout << std::fixed << std::setprecision(2);
-    std::cout << "GEMM               : [" << GEMM_M << " x " << GEMM_K << " x " << GEMM_N << "]\n";
-    std::cout << "Threads            : " << NUM_THREADS << "\n";
-    std::cout << "Total MACs         : " << (uint64_t)total_macs << "\n";
-    std::cout << "Mat+quant phase    : " << max_mat_elapsed
+    std::cout << "GEMM               : [" << MatmulConfig::gemm_m << " x "
+              << MatmulConfig::gemm_k << " x " << MatmulConfig::gemm_n << "]\n";
+    std::cout << "Threads            : " << cfg.thread_count << "\n";
+    std::cout << "Total MACs         : " << static_cast<uint64_t>(total_macs) << "\n";
+    std::cout << "Mat phase          : " << max_mat_elapsed
               << " cycles  (critical-path worker)\n";
     std::cout << "Accum overhead     : " << accum_overhead
-              << " cycles  (beyond mat+quant critical path)\n";
+              << " cycles  (beyond worker mat critical path)\n";
     std::cout << "Total elapsed      : " << total_elapsed << " cycles\n";
     std::cout << "Throughput         : " << gflops << " GFLOPS  (at 1 GHz)\n";
     std::cout << "mat_acc occupancy  : " << mat_occ << "%\n";
@@ -154,12 +256,12 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     std::cout << "vec_acc occupancy  : " << vec_occ << "%\n";
     std::cout << "vec_acc compute    : " << vec_compute_util << "%\n";
     std::cout << "Mem BW avg         : " << mem_bw << " bytes/cycle\n";
-    std::cout << "Worker stall total : " << total_worker_stall
-              << " cycles  (backpressure on vec_acc)\n";
-    std::cout << "Coord  stall total : " << top.coordinator->stall_cycles
-              << " cycles  (backpressure on vec_acc)\n";
+    std::cout << "Worker mat stall   : " << total_worker_stall
+              << " cycles  (worker-side backpressure while issuing mat requests)\n";
+    std::cout << "Coord  vec stall   : " << top.coordinator->stall_cycles
+              << " cycles  (coordinator-side backpressure while issuing reduction/final-quant vec requests)\n";
     std::cout << "Coord  compute     : " << top.coordinator->compute_cycles
-              << " cycles  (scalar overhead during accum)\n";
+              << " cycles  (scalar overhead during reduction/final quant scheduling)\n";
 
     // Per-pair timing breakdown
     const auto &pst = top.coordinator->pair_start_times;
@@ -178,7 +280,8 @@ int sc_main(int /*argc*/, char * /*argv*/[])
         }
         sc_time earliest = pst[0];
         for (const auto &t : pst)
-            if (t < earliest) earliest = t;
+            if (t < earliest)
+                earliest = t;
         sc_time latest_mat = max_mat_elapsed * CYCLE;
         if (earliest < latest_mat)
             std::cout << "  ** Early-start: first pair began at " << earliest
@@ -193,25 +296,26 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     std::cout << "\n=== Verification ===\n";
     bool all_pass = true;
 
-    // Test 1: single thread → no accumulation
-    if (NUM_THREADS == 1)
+    // Test 1: single thread → no accumulation calls
+    if (cfg.thread_count == 1)
     {
-        all_pass &= check(top.coordinator->vec_calls_total == 0,
-                          "Single thread: no accum vec_acc calls");
+        all_pass &= check(top.coordinator->accum_vec_calls_total == 0,
+                          "Single thread: no accumulation vec_acc calls");
     }
 
     // Test 2: two threads → exactly 1 pairwise accumulation
-    if (NUM_THREADS == 2)
+    if (cfg.thread_count == 2)
     {
         all_pass &= check(pst.size() == 1,
                           "Two threads: exactly 1 pairwise accumulation");
     }
 
-    // Test 3: single thread result time matches worker completion
-    if (NUM_THREADS == 1)
+    // Test 3: single thread still performs one final quantization pass
+    if (cfg.thread_count == 1)
     {
-        all_pass &= check(top.coordinator->accum_end_time == top.workers[0]->mat_done_time,
-                          "Single thread: final result time matches worker mat+quant completion");
+        all_pass &= check(top.coordinator->final_quant_calls_total ==
+                              MatmulConfig::gemm_quant_vec_calls(),
+                          "Single thread: final quantization still runs once");
     }
 
     // Test 4: each pair starts only after both inputs are ready
@@ -230,17 +334,18 @@ int sc_main(int /*argc*/, char * /*argv*/[])
     }
 
     // Test 5: total pairwise accumulations = T-1 (binary tree property)
-    if (NUM_THREADS > 1)
+    if (cfg.thread_count > 1)
     {
-        all_pass &= check(pst.size() == (size_t)(NUM_THREADS - 1),
+        all_pass &= check(pst.size() == static_cast<size_t>(cfg.thread_count - 1),
                           "Total pairs = T-1 (complete binary reduction tree)");
     }
 
-    // Test 6: total vec_acc calls = quant + accum
+    // Test 6: total vec_acc calls = final quant + accum
     {
-        uint64_t expected_quant = (uint64_t)NUM_THREADS * GEMM_QUANT_VEC_CALLS;
-        uint64_t expected_accum = (uint64_t)(NUM_THREADS > 1 ? NUM_THREADS - 1 : 0)
-                                  * GEMM_ACCUM_VEC_CALLS;
+        uint64_t expected_quant = MatmulConfig::gemm_quant_vec_calls();
+        uint64_t expected_accum =
+            static_cast<uint64_t>(cfg.thread_count > 1 ? cfg.thread_count - 1 : 0) *
+            MatmulConfig::gemm_accum_vec_calls();
         uint64_t expected_total = expected_quant + expected_accum;
 
         uint64_t actual_worker_vec = 0;
@@ -249,51 +354,90 @@ int sc_main(int /*argc*/, char * /*argv*/[])
         uint64_t actual_total = actual_worker_vec + top.coordinator->vec_calls_total;
 
         all_pass &= check(actual_total == expected_total,
-                          "Total vec_acc calls = T*QUANT + (T-1)*ACCUM");
+                          "Total vec_acc calls = FINAL_QUANT + (T-1)*ACCUM");
     }
 
-    // Test 7: final result is ready after mat+quant critical path
+    // Test 7: final result is ready after the worker mat critical path
     {
         all_pass &= check(top.coordinator->accum_end_time >= max_mat_elapsed * CYCLE,
-                          "Final result ready after mat+quant critical path");
+                          "Final result ready after worker mat critical path");
     }
 
-    // Test 8: coordinator scalar overhead matches pipelined accumulation model
+    // Test 8: coordinator scalar overhead matches accumulation + final quant model
     {
+        auto expected_stage_compute = [&](uint64_t call_count) -> uint64_t {
+            if (call_count == 0)
+                return 0;
+            uint64_t window = std::min<uint64_t>(call_count,
+                                                 static_cast<uint64_t>(cfg.vec_accel_count));
+            return (call_count >= window) ? (call_count - window + 1) * SCALAR_OVERHEAD : 0;
+        };
+
         uint64_t expected_coord_compute = 0;
-        if (NUM_THREADS > 1 && GEMM_ACCUM_VEC_CALLS > 0)
+        if (cfg.thread_count > 1)
+        {
             expected_coord_compute =
-                (uint64_t)(NUM_THREADS - 1) * (GEMM_ACCUM_VEC_CALLS - 1) * SCALAR_OVERHEAD;
+                static_cast<uint64_t>(cfg.thread_count - 1) *
+                expected_stage_compute(MatmulConfig::gemm_accum_vec_calls());
+        }
+        expected_coord_compute +=
+            expected_stage_compute(MatmulConfig::gemm_quant_vec_calls());
 
         all_pass &= check(top.coordinator->compute_cycles == expected_coord_compute,
-                          "Coordinator compute cycles match pipelined scalar-overhead model");
+                          "Coordinator compute cycles match reduction-plus-final-quant model");
     }
 
     // Test 9: occupancy is time-based and bounded by elapsed time
     {
-        bool occ_ok = top.mat_acc.occupied_cycles <= total_elapsed &&
-                      top.vec_acc.occupied_cycles <= total_elapsed;
+        bool occ_ok = true;
+        for (const auto &unit : top.mat_acc.units)
+            occ_ok &= unit->occupied_cycles <= total_elapsed;
+        for (const auto &unit : top.vec_acc.units)
+            occ_ok &= unit->occupied_cycles <= total_elapsed;
         all_pass &= check(occ_ok,
                           "Accelerator occupancy is bounded by total elapsed time");
     }
 
-    // Test 10: accumulation traffic consumes quantized inputs
+    // Test 10: accumulation stays high precision until final quantization
     {
         bool precision_ok =
-            GEMM_ACCUM_RD_BYTES == 2 * VECTOR_ACC_CAP * GEMM_QUANT_OUT_ELEM_BYTES &&
-            GEMM_ACCUM_WR_BYTES == VECTOR_ACC_CAP * GEMM_ACCUM_OUT_ELEM_BYTES;
+            MatmulConfig::gemm_accum_rd_bytes ==
+                2 * VECTOR_ACC_CAP * MatmulConfig::gemm_quant_in_elem_bytes &&
+            MatmulConfig::gemm_accum_wr_bytes ==
+                VECTOR_ACC_CAP * MatmulConfig::gemm_accum_out_elem_bytes;
         all_pass &= check(precision_ok,
-                          "Accumulation traffic matches quantized precision configuration");
+                          "Accumulation traffic matches high-precision reduction configuration");
     }
 
-    // Test 11: backpressure triggers when VEC_ACC_QUEUE_CAP < NUM_THREADS
-    if (VEC_ACC_QUEUE_CAP < (size_t)NUM_THREADS && NUM_THREADS > 1)
+    // Test 11: backpressure triggers when vec_acc queue is tighter than worker count
+    if (cfg.vec_acc_queue_cap() < static_cast<size_t>(cfg.thread_count) &&
+        cfg.thread_count > 1 &&
+        cfg.vec_accel_count == 1)
     {
         all_pass &= check(total_worker_stall > 0,
                           "Backpressure triggered (stall > 0) with tight vec_acc queue");
     }
 
+    // Test 12: multiple accelerator instances are used when configured
+    if (cfg.mat_accel_count > 1 && cfg.thread_count > 1 && mat_req_total > 0)
+    {
+        size_t active_units = 0;
+        for (const auto &unit : top.mat_acc.units)
+            active_units += (unit->req_count > 0) ? 1 : 0;
+        all_pass &= check(active_units >= 2,
+                          "Multiple mat accelerators receive work when enabled");
+    }
+
+    if (cfg.vec_accel_count > 1 && cfg.thread_count > 2 && vec_req_total > 0)
+    {
+        size_t active_units = 0;
+        for (const auto &unit : top.vec_acc.units)
+            active_units += (unit->req_count > 0) ? 1 : 0;
+        all_pass &= check(active_units >= 2,
+                          "Multiple vec accelerators receive work when enabled");
+    }
+
     std::cout << (all_pass ? "\nAll checks passed.\n" : "\nSome checks FAILED.\n");
 
-    return 0;
+    return all_pass ? 0 : 2;
 }

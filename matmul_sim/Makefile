@@ -2,6 +2,7 @@ CXX      := g++
 CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unused-parameter \
             -DSC_INCLUDE_DYNAMIC_PROCESSES \
             -MMD -MP
+EXTRA_CXXFLAGS ?=
 INCLUDES := -I/usr/include -I.. -I.
 LDFLAGS  := -L/usr/lib/x86_64-linux-gnu -Wl,-rpath,/usr/lib/x86_64-linux-gnu
 LIBS     := -lsystemc -lpthread
@@ -33,11 +34,11 @@ $(TARGET): $(OBJS) | $(BUILDDIR)
 
 # Compile matmul_sim/*.cpp
 $(BUILDDIR)/%.o: %.cpp | $(BUILDDIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(INCLUDES) -c -o $@ $<
 
 # Compile src/*.cpp (prefixed with src_ to avoid name collisions)
 $(BUILDDIR)/src_%.o: ../src/%.cpp | $(BUILDDIR)
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -c -o $@ $<
+	$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(INCLUDES) -c -o $@ $<
 
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)

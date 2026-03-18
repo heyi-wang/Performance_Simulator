@@ -34,7 +34,20 @@ static const uint64_t CONV_TOTAL_MACS =
 // Each thread handles an equal slice of output spatial positions
 //   (N × H_out × W_out) / NUM_THREADS rows
 // ============================================================
-static const int NUM_THREADS = 4;
+static const int NUM_THREADS = 32;
+
+// Number of physical accelerator instances per class.
+// Requests still enter through one shared queue per class.
+#ifndef MAT_ACCEL_COUNT
+#define MAT_ACCEL_COUNT 2
+#endif
+
+#ifndef VEC_ACCEL_COUNT
+#define VEC_ACCEL_COUNT 4
+#endif
+
+static const int MAT_ACCEL_COUNT_CFG = MAT_ACCEL_COUNT;
+static const int VEC_ACCEL_COUNT_CFG = VEC_ACCEL_COUNT;
 
 // ============================================================
 // GEMM mapping via im2col

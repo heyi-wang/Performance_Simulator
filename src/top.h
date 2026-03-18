@@ -2,7 +2,7 @@
 
 #include "memory.h"
 #include "interconnect.h"
-#include "accelerator.h"
+#include "accelerator_pool.h"
 #include "worker.h"
 #include "config.h"
 #include <vector>
@@ -12,10 +12,10 @@
 // ============================================================
 struct Top : sc_module
 {
-    AcceleratorTLM mat_acc;
-    AcceleratorTLM vec_acc;
-    Interconnect   noc;
-    Memory         memory;
+    AcceleratorPool mat_acc;
+    AcceleratorPool vec_acc;
+    Interconnect    noc;
+    Memory          memory;
 
     std::vector<Worker *> workers;
 

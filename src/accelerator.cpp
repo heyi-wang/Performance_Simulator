@@ -126,7 +126,7 @@ void AcceleratorTLM::service_thread()
         uint64_t qwait  = (uint64_t)((t_start - e.enqueue_time) / CYCLE);
 
         if (ext)
-            ext->accel_qwait_cycles = qwait;
+            ext->accel_qwait_cycles += qwait;
         queue_wait_cycles += qwait;
         req_count         += 1;
 

@@ -2,6 +2,10 @@
 #include "config.h"
 #include "src/common.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
 // ============================================================
 // K-split GEMM configuration
 //
@@ -14,74 +18,103 @@
 //   Final result = sum of all partial results  (K-split accumulation)
 // ============================================================
 
-// Full output matrix dimensions (M is NOT divided across threads for K-split).
-static const uint64_t GEMM_M = CONV_N * CONV_H_OUT * CONV_W_OUT;
-static const uint64_t GEMM_K = A_K;   // = CONV_C_IN * CONV_KH * CONV_KW
-static const uint64_t GEMM_N = B_N;   // = CONV_C_OUT
+struct MatmulConfig
+{
+    int thread_count = NUM_THREADS;
+    int mat_accel_count = MAT_ACCEL_COUNT_CFG;
+    int vec_accel_count = VEC_ACCEL_COUNT_CFG;
 
-// K sliced per thread (ceiling division so last thread may get less work)
-static const uint64_t GEMM_K_PER_THREAD = ceil_div_u64(GEMM_K, (uint64_t)NUM_THREADS);
+    // Full output matrix dimensions (M is NOT divided across threads for K-split).
+    static constexpr uint64_t gemm_m = CONV_N * CONV_H_OUT * CONV_W_OUT;
+    static constexpr uint64_t gemm_k = A_K;   // = CONV_C_IN * CONV_KH * CONV_KW
+    static constexpr uint64_t gemm_n = B_N;   // = CONV_C_OUT
 
-// Number of accelerator tiles each thread issues for its K-slice
-static const uint64_t GEMM_TILE_M = ceil_div_u64(GEMM_M,             MATMUL_M);
-static const uint64_t GEMM_TILE_K = ceil_div_u64(GEMM_K_PER_THREAD,  MATMUL_K);
-static const uint64_t GEMM_TILE_N = ceil_div_u64(GEMM_N,             MATMUL_N);
-static const uint64_t GEMM_ACCESS_MAT = GEMM_TILE_M * GEMM_TILE_K * GEMM_TILE_N;
+    // Number of accelerator tiles along M and N are independent of thread count.
+    // Memory traffic per tile (bytes)
+    static constexpr uint64_t gemm_a_bytes = MATMUL_M * MATMUL_K * sizeof(int8_t);
+    static constexpr uint64_t gemm_b_bytes = MATMUL_K * MATMUL_N * sizeof(int8_t);
+    static constexpr uint64_t gemm_c_bytes = MATMUL_M * MATMUL_N * sizeof(int32_t);
 
-// Memory traffic per tile (bytes)
-static const uint64_t GEMM_A_BYTES = MATMUL_M * MATMUL_K * sizeof(int8_t);
-static const uint64_t GEMM_B_BYTES = MATMUL_K * MATMUL_N * sizeof(int8_t);
-static const uint64_t GEMM_C_BYTES = MATMUL_M * MATMUL_N * sizeof(int32_t);
+    // Reduction and final quantization traffic are per full output matrix.
+    // Every worker owns a full [M x N] partial, but only the coordinator
+    // quantizes once after the final reduction result is ready.
+    static constexpr uint64_t gemm_partial_elements = gemm_m * gemm_n;
+    static constexpr uint64_t gemm_quant_in_elem_bytes =
+        static_cast<uint64_t>(sizeof(int32_t));
+    static constexpr uint64_t gemm_quant_out_elem_bytes =
+        static_cast<uint64_t>(sizeof(uint8_t));
+    static constexpr uint64_t gemm_accum_in_elem_bytes = gemm_quant_in_elem_bytes;
+    static constexpr uint64_t gemm_accum_out_elem_bytes = gemm_quant_in_elem_bytes;
 
-// ============================================================
-// Accumulation phase (tree reduction)
-//
-// Each pairwise accumulation sums two partial [GEMM_M x GEMM_N]
-// matrices element-wise using the VectorAccelerator.
-//
-//   Number of vec_acc calls per pairwise accumulation
-//     = ceil(GEMM_M * GEMM_N / VECTOR_ACC_CAP)
-//   Memory per accumulation: read 2 partials, write 1 result
-// ============================================================
-static const uint64_t GEMM_PARTIAL_ELEMENTS = GEMM_M * GEMM_N;
-static const uint64_t GEMM_ACCUM_VEC_CALLS  = ceil_div_u64(GEMM_PARTIAL_ELEMENTS, VECTOR_ACC_CAP);
-static const uint64_t GEMM_QUANT_IN_ELEM_BYTES =
-    (uint64_t)sizeof(int32_t);
-static const uint64_t GEMM_QUANT_OUT_ELEM_BYTES =
-    (uint64_t)sizeof(uint8_t);
-static const uint64_t GEMM_ACCUM_IN_ELEM_BYTES  = GEMM_QUANT_OUT_ELEM_BYTES;
-static const uint64_t GEMM_ACCUM_OUT_ELEM_BYTES = GEMM_QUANT_OUT_ELEM_BYTES;
+    static constexpr uint64_t gemm_accum_rd_bytes =
+        2 * VECTOR_ACC_CAP * gemm_accum_in_elem_bytes;
+    static constexpr uint64_t gemm_accum_wr_bytes =
+        VECTOR_ACC_CAP * gemm_accum_out_elem_bytes;
+    static constexpr uint64_t gemm_quant_rd_bytes =
+        VECTOR_ACC_CAP * gemm_quant_in_elem_bytes;
+    static constexpr uint64_t gemm_quant_wr_bytes =
+        VECTOR_ACC_CAP * gemm_quant_out_elem_bytes;
 
-// Read 2 partial matrices + write 1 result per vec_acc call
-static const uint64_t GEMM_ACCUM_RD_BYTES =
-    2 * VECTOR_ACC_CAP * GEMM_ACCUM_IN_ELEM_BYTES;
-static const uint64_t GEMM_ACCUM_WR_BYTES =
-    VECTOR_ACC_CAP * GEMM_ACCUM_OUT_ELEM_BYTES;
+    explicit MatmulConfig(int threads = NUM_THREADS,
+                          int mat_accels = MAT_ACCEL_COUNT_CFG,
+                          int vec_accels = VEC_ACCEL_COUNT_CFG)
+        : thread_count(std::max(threads, 1)),
+          mat_accel_count(std::max(mat_accels, 1)),
+          vec_accel_count(std::max(vec_accels, 1))
+    {
+    }
 
-// ============================================================
-// Per-worker output quantization
-//
-// After completing all mat tiles, each worker issues
-// GEMM_QUANT_VEC_CALLS vec_acc requests to quantize its
-// partial result [GEMM_M x GEMM_N] from fp32 → fp16.
-// Only after quantization does it fire mat_done_ev so the
-// AccumCoordinator can begin tree-reduction accumulation.
-// ============================================================
-static const uint64_t GEMM_QUANT_VEC_CALLS =
-    ceil_div_u64(GEMM_PARTIAL_ELEMENTS, VECTOR_ACC_CAP);
-static const uint64_t GEMM_QUANT_RD_BYTES =
-    VECTOR_ACC_CAP * GEMM_QUANT_IN_ELEM_BYTES;       // read fp32 partial result
-static const uint64_t GEMM_QUANT_WR_BYTES =
-    VECTOR_ACC_CAP * GEMM_QUANT_OUT_ELEM_BYTES;      // write fp16 quantized result
+    static uint64_t gemm_tile_m()
+    {
+        return ceil_div_u64(gemm_m, MATMUL_M);
+    }
 
-// ============================================================
-// Configurable accelerator queue depths
-//
-// Reduce VEC_ACC_QUEUE_CAP below NUM_THREADS to observe
-// backpressure: some workers will stall during quantization.
-// Set to NUM_THREADS for no stalls.
-// ============================================================
-static const size_t MAT_ACC_QUEUE_CAP =
-    static_cast<size_t>(NUM_THREADS);
-static const size_t VEC_ACC_QUEUE_CAP =
-    static_cast<size_t>(NUM_THREADS >= 2 ? NUM_THREADS / 2 : 1);
+    static uint64_t gemm_tile_n()
+    {
+        return ceil_div_u64(gemm_n, MATMUL_N);
+    }
+
+    static uint64_t gemm_accum_vec_calls()
+    {
+        return ceil_div_u64(gemm_partial_elements, VECTOR_ACC_CAP);
+    }
+
+    static uint64_t gemm_quant_vec_calls()
+    {
+        return ceil_div_u64(gemm_partial_elements, VECTOR_ACC_CAP);
+    }
+
+    uint64_t gemm_k_per_thread() const
+    {
+        return ceil_div_u64(gemm_k, static_cast<uint64_t>(thread_count));
+    }
+
+    uint64_t gemm_tile_k() const
+    {
+        return ceil_div_u64(gemm_k_per_thread(), MATMUL_K);
+    }
+
+    uint64_t gemm_access_mat() const
+    {
+        return gemm_tile_m() * gemm_tile_k() * gemm_tile_n();
+    }
+
+    size_t mat_acc_queue_cap() const
+    {
+        return static_cast<size_t>(mat_accel_count + 4);
+    }
+
+    size_t vec_acc_queue_cap() const
+    {
+        return static_cast<size_t>(vec_accel_count + 4);
+    }
+
+    uint64_t local_access_mat_for_thread(int tid) const
+    {
+        uint64_t k_begin = static_cast<uint64_t>(tid) * gemm_k_per_thread();
+        uint64_t k_end = std::min<uint64_t>(gemm_k, k_begin + gemm_k_per_thread());
+        uint64_t local_k = (k_begin < gemm_k) ? (k_end - k_begin) : 0;
+        uint64_t local_tile_k = (local_k > 0) ? ceil_div_u64(local_k, MATMUL_K) : 0;
+        return gemm_tile_m() * local_tile_k * gemm_tile_n();
+    }
+};
