@@ -20,17 +20,26 @@ MatmulTop::MatmulTop(sc_module_name nm, const MatmulConfig &cfg_)
         unit->to_mem.bind(noc.tgt);
 
     // -------------------------------------------------------
+    // Passive shared reduction / quantization state. Existing workers execute
+    // all post-mat work through this object; no additional threads are spawned.
+    coordinator = new AccumCoordinator("accum_coord",
+                                       MatmulConfig::gemm_accum_vec_calls(),
+                                       MatmulConfig::gemm_quant_vec_calls(),
+                                       MatmulConfig::gemm_accum_rd_bytes,
+                                       MatmulConfig::gemm_accum_wr_bytes,
+                                       MatmulConfig::gemm_quant_rd_bytes,
+                                       MatmulConfig::gemm_quant_wr_bytes);
+
     // Worker configuration (K-split):
-    //   Workers only execute matmul for their K-slice.
-    //   Quantization is deferred until the coordinator finishes
-    //   the high-precision reduction tree.
+    //   Workers execute local matmul first, then run reduction and final
+    //   quantization inside the same SC_THREAD via the passive coordinator.
     // -------------------------------------------------------
     for (int i = 0; i < cfg.thread_count; i++)
     {
         auto *w = new Worker(sc_gen_unique_name("worker"),
                              i,
                              cfg.local_access_mat_for_thread(i), // mat tiles for this worker's K-slice
-                             0, // final quantization is deferred to the coordinator
+                             0,
                              MATMUL_ACC_CYCLE,
                              VECTOR_ACC_CYCLE,
                              SCALAR_OVERHEAD,
@@ -38,29 +47,15 @@ MatmulTop::MatmulTop(sc_module_name nm, const MatmulConfig &cfg_)
                              MatmulConfig::gemm_b_bytes,        // mat rd (B tile)
                              MatmulConfig::gemm_c_bytes,        // mat wr (C tile)
                              0,
-                             0);
+                             0,
+                             cfg.mat_acc_queue_cap(),
+                             cfg.vec_acc_queue_cap(),
+                             coordinator);
         workers.push_back(w);
         w->init.bind(noc.tgt);
     }
 
-    // -------------------------------------------------------
-    // AccumCoordinator — event-driven tree-reduction phase.
-    // Starts as soon as any pair of partial results
-    // is available (does not wait for all workers).
-    // -------------------------------------------------------
-    coordinator = new AccumCoordinator("accum_coord",
-                                       VECTOR_ACC_CYCLE,
-                                       MatmulConfig::gemm_accum_vec_calls(),
-                                       MatmulConfig::gemm_quant_vec_calls(),
-                                       static_cast<uint64_t>(cfg.vec_accel_count),
-                                       SCALAR_OVERHEAD,
-                                       MatmulConfig::gemm_accum_rd_bytes,
-                                       MatmulConfig::gemm_accum_wr_bytes,
-                                       MatmulConfig::gemm_quant_rd_bytes,
-                                       MatmulConfig::gemm_quant_wr_bytes);
-
-    coordinator->workers = workers;
-    coordinator->init.bind(noc.tgt);
+    coordinator->configure_workers(workers);
 }
 
 MatmulTop::~MatmulTop()

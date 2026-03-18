@@ -1,9 +1,20 @@
 #pragma once
 
 #include "extensions.h"
+#include <deque>
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm_utils/peq_with_get.h>
 #include <unordered_map>
+
+struct Worker;
+
+// Optional hook for simulator-specific post-matmul work that still runs
+// inside the worker's own SC_THREAD.
+struct WorkerPostProcessor
+{
+    virtual ~WorkerPostProcessor() = default;
+    virtual void run_post_mat(Worker &worker) = 0;
+};
 
 // ============================================================
 // Worker — models one parallel compute thread
@@ -30,6 +41,9 @@ struct Worker : sc_module
     uint64_t mat_cycles;
     uint64_t vec_cycles;
     uint64_t scalar_cycles;
+    uint64_t max_inflight_mat_reqs = 1;
+    uint64_t max_inflight_vec_reqs = 1;
+    WorkerPostProcessor *post_processor = nullptr;
 
     uint64_t compute_cycles   = 0;
     uint64_t wait_cycles      = 0;   // queue-wait + backpressure stall combined
@@ -37,8 +51,11 @@ struct Worker : sc_module
     uint64_t mem_cycles_accum = 0;
     uint64_t mat_calls        = 0;
     uint64_t vec_calls        = 0;
+    uint64_t accum_vec_calls  = 0;
+    uint64_t quant_vec_calls  = 0;
+    uint64_t reduction_pairs  = 0;
     uint64_t elapsed_cycles   = 0;   // set at end of run(); used for GFLOPS reporting
-    uint64_t mat_elapsed_cycles = 0; // cycles until mat+quant complete; set before mat_done_ev
+    uint64_t mat_elapsed_cycles = 0; // cycles until the local mat phase completes
     sc_time  mat_done_time;
 
     // Fired after both mat tiles AND quantization vec tiles finish.
@@ -95,7 +112,10 @@ struct Worker : sc_module
            uint64_t B_bytes_,
            uint64_t C_bytes_,
            uint64_t vec_rd_ = 0,
-           uint64_t vec_wr_ = 0);
+           uint64_t vec_wr_ = 0,
+           uint64_t max_inflight_mat_reqs_ = 1,
+           uint64_t max_inflight_vec_reqs_ = 1,
+           WorkerPostProcessor *post_processor_ = nullptr);
 
     tlm_sync_enum nb_transport_bw(tlm_generic_payload &gp,
                                   tlm_phase &phase,
@@ -111,6 +131,14 @@ struct Worker : sc_module
     PendingReq issue_begin(uint64_t addr, uint64_t svc_cycles);
 
     void issue_end(PendingReq &p);
+    void issue_stream(uint64_t addr,
+                      uint64_t call_count,
+                      uint64_t svc_cycles,
+                      uint64_t rd,
+                      uint64_t wr,
+                      uint64_t &call_counter,
+                      uint64_t *phase_counter = nullptr,
+                      uint64_t max_inflight = 1);
 
     void run();
 };

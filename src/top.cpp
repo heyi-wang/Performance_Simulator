@@ -44,7 +44,11 @@ Top::Top(sc_module_name nm)
                              scalar_cycles,
                              A_bytes,
                              B_bytes,
-                             C_bytes);
+                             C_bytes,
+                             0,
+                             0,
+                             NUM_THREADS,
+                             NUM_THREADS);
         workers.push_back(w);
         w->init.bind(noc.tgt);
     }

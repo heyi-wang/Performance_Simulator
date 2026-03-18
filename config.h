@@ -34,7 +34,7 @@ static const uint64_t CONV_TOTAL_MACS =
 // Each thread handles an equal slice of output spatial positions
 //   (N × H_out × W_out) / NUM_THREADS rows
 // ============================================================
-static const int NUM_THREADS = 32;
+static const int NUM_THREADS = 12;
 
 // Number of physical accelerator instances per class.
 // Requests still enter through one shared queue per class.
@@ -82,4 +82,4 @@ static const uint64_t VECTOR_ACC_CYCLE = 4;
 
 // Scalar overhead cycles per accelerator call
 // (loop bookkeeping, address computation, tile dispatch)
-static const uint64_t SCALAR_OVERHEAD = 8;
+static const uint64_t SCALAR_OVERHEAD = 1000;

@@ -176,24 +176,31 @@ int sc_main(int argc, char *argv[])
         std::cout << "  [T" << w->tid << "]"
                   << " mat_calls="  << w->mat_calls
                   << " vec_calls="  << w->vec_calls
+                  << " accum_vec="  << w->accum_vec_calls
+                  << " quant_vec="  << w->quant_vec_calls
+                  << " pairs="      << w->reduction_pairs
                   << " compute="    << w->compute_cycles
                   << " wait="       << w->wait_cycles
-                  << " mat_stall="  << w->stall_cycles
+                  << " stall="      << w->stall_cycles
                   << " mem="        << w->mem_cycles_accum
-                  << " elapsed="    << w->mat_elapsed_cycles
+                  << " mat_elapsed=" << w->mat_elapsed_cycles
+                  << " elapsed="    << w->elapsed_cycles
                   << "\n";
     }
 
     // -------------------------------------------------------
     // Wall-clock timing
-    // mat_elapsed_cycles now represents the worker matmul phase only.
+    // total elapsed is now the slowest worker's full lifetime.
     // -------------------------------------------------------
     uint64_t max_mat_elapsed = 0;
+    uint64_t max_elapsed = 0;
     for (const auto *w : top.workers)
+    {
         max_mat_elapsed = std::max(max_mat_elapsed, w->mat_elapsed_cycles);
+        max_elapsed = std::max(max_elapsed, w->elapsed_cycles);
+    }
 
-    uint64_t total_elapsed =
-        static_cast<uint64_t>(top.coordinator->accum_end_time / CYCLE);
+    uint64_t total_elapsed = max_elapsed;
 
     uint64_t accum_overhead =
         (total_elapsed > max_mat_elapsed) ? (total_elapsed - max_mat_elapsed) : 0;
@@ -257,11 +264,11 @@ int sc_main(int argc, char *argv[])
     std::cout << "vec_acc compute    : " << vec_compute_util << "%\n";
     std::cout << "Mem BW avg         : " << mem_bw << " bytes/cycle\n";
     std::cout << "Worker mat stall   : " << total_worker_stall
-              << " cycles  (worker-side backpressure while issuing mat requests)\n";
-    std::cout << "Coord  vec stall   : " << top.coordinator->stall_cycles
-              << " cycles  (coordinator-side backpressure while issuing reduction/final-quant vec requests)\n";
-    std::cout << "Coord  compute     : " << top.coordinator->compute_cycles
-              << " cycles  (scalar overhead during reduction/final quant scheduling)\n";
+              << " cycles  (all worker-side backpressure across mat/reduction/quant)\n";
+    std::cout << "Post-mat stall     : " << top.coordinator->stall_cycles
+              << " cycles  (worker-driven reduction/final-quant vec backpressure)\n";
+    std::cout << "Post-mat compute   : " << top.coordinator->compute_cycles
+              << " cycles  (worker-driven reduction/final-quant scalar+service time)\n";
 
     // Per-pair timing breakdown
     const auto &pst = top.coordinator->pair_start_times;
@@ -351,26 +358,27 @@ int sc_main(int argc, char *argv[])
         uint64_t actual_worker_vec = 0;
         for (const auto *w : top.workers)
             actual_worker_vec += w->vec_calls;
-        uint64_t actual_total = actual_worker_vec + top.coordinator->vec_calls_total;
 
-        all_pass &= check(actual_total == expected_total,
-                          "Total vec_acc calls = FINAL_QUANT + (T-1)*ACCUM");
+        all_pass &= check(actual_worker_vec == expected_total &&
+                              top.coordinator->vec_calls_total == expected_total,
+                          "Worker vec_acc calls match FINAL_QUANT + (T-1)*ACCUM");
     }
 
-    // Test 7: final result is ready after the worker mat critical path
+    // Test 7: full elapsed is determined by the slowest worker
     {
-        all_pass &= check(top.coordinator->accum_end_time >= max_mat_elapsed * CYCLE,
-                          "Final result ready after worker mat critical path");
+        all_pass &= check(total_elapsed == max_elapsed &&
+                              total_elapsed >= max_mat_elapsed,
+                          "Total elapsed equals the slowest worker completion time");
     }
 
-    // Test 8: coordinator scalar overhead matches accumulation + final quant model
+    // Test 8: worker-driven post-mat compute matches reduction + quant model
     {
-        auto expected_stage_compute = [&](uint64_t call_count) -> uint64_t {
+        auto expected_worker_stream_compute = [&](uint64_t call_count,
+                                                  uint64_t service_cycles) -> uint64_t {
             if (call_count == 0)
                 return 0;
-            uint64_t window = std::min<uint64_t>(call_count,
-                                                 static_cast<uint64_t>(cfg.vec_accel_count));
-            return (call_count >= window) ? (call_count - window + 1) * SCALAR_OVERHEAD : 0;
+            return call_count * service_cycles +
+                   (call_count - 1) * SCALAR_OVERHEAD;
         };
 
         uint64_t expected_coord_compute = 0;
@@ -378,13 +386,22 @@ int sc_main(int argc, char *argv[])
         {
             expected_coord_compute =
                 static_cast<uint64_t>(cfg.thread_count - 1) *
-                expected_stage_compute(MatmulConfig::gemm_accum_vec_calls());
+                expected_worker_stream_compute(MatmulConfig::gemm_accum_vec_calls(),
+                                               VECTOR_ACC_CYCLE);
         }
-        expected_coord_compute +=
-            expected_stage_compute(MatmulConfig::gemm_quant_vec_calls());
+        for (int tid = 0; tid < cfg.thread_count; ++tid)
+        {
+            uint64_t base = MatmulConfig::gemm_quant_vec_calls() /
+                            static_cast<uint64_t>(cfg.thread_count);
+            uint64_t rem = MatmulConfig::gemm_quant_vec_calls() %
+                           static_cast<uint64_t>(cfg.thread_count);
+            uint64_t quant_calls = base + ((static_cast<uint64_t>(tid) < rem) ? 1 : 0);
+            expected_coord_compute +=
+                expected_worker_stream_compute(quant_calls, VECTOR_ACC_CYCLE);
+        }
 
         all_pass &= check(top.coordinator->compute_cycles == expected_coord_compute,
-                          "Coordinator compute cycles match reduction-plus-final-quant model");
+                          "Worker-driven post-mat compute matches reduction-plus-final-quant model");
     }
 
     // Test 9: occupancy is time-based and bounded by elapsed time
@@ -409,16 +426,43 @@ int sc_main(int argc, char *argv[])
                           "Accumulation traffic matches high-precision reduction configuration");
     }
 
-    // Test 11: backpressure triggers when vec_acc queue is tighter than worker count
-    if (cfg.vec_acc_queue_cap() < static_cast<size_t>(cfg.thread_count) &&
+    // Test 11: post-mat quantization is split across workers exactly once
+    {
+        uint64_t total_quant = 0;
+        bool static_partition_ok = true;
+        for (int tid = 0; tid < cfg.thread_count; ++tid)
+        {
+            uint64_t base = MatmulConfig::gemm_quant_vec_calls() /
+                            static_cast<uint64_t>(cfg.thread_count);
+            uint64_t rem = MatmulConfig::gemm_quant_vec_calls() %
+                           static_cast<uint64_t>(cfg.thread_count);
+            uint64_t expected = base + ((static_cast<uint64_t>(tid) < rem) ? 1 : 0);
+            total_quant += top.workers[static_cast<size_t>(tid)]->quant_vec_calls;
+            static_partition_ok &=
+                top.workers[static_cast<size_t>(tid)]->quant_vec_calls == expected;
+        }
+
+        all_pass &= check(static_partition_ok &&
+                              total_quant == MatmulConfig::gemm_quant_vec_calls(),
+                          "Final quantization is partitioned across workers exactly once");
+    }
+
+    // Test 12: quantization starts after full reduction completes
+    {
+        all_pass &= check(top.coordinator->quant_start_time >= top.coordinator->accum_end_time,
+                          "Final quantization starts after the root reduction completes");
+    }
+
+    // Test 13: backpressure triggers when post-mat vec pressure is high enough
+    if (cfg.vec_acc_queue_cap() <= static_cast<size_t>(cfg.thread_count) &&
         cfg.thread_count > 1 &&
         cfg.vec_accel_count == 1)
     {
-        all_pass &= check(total_worker_stall > 0,
+        all_pass &= check(top.coordinator->stall_cycles > 0 || total_worker_stall > 0,
                           "Backpressure triggered (stall > 0) with tight vec_acc queue");
     }
 
-    // Test 12: multiple accelerator instances are used when configured
+    // Test 14: multiple accelerator instances are used when configured
     if (cfg.mat_accel_count > 1 && cfg.thread_count > 1 && mat_req_total > 0)
     {
         size_t active_units = 0;

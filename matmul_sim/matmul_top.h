@@ -14,13 +14,14 @@
 // Topology (same hardware as Top, different workload):
 //
 //   workers[0..T-1]  ──┐
-//   AccumCoordinator ──┤──► noc ──► mat_acc ──► memory
+//   passive coordinator│
+//          state       ├──► noc ──► mat_acc ──► memory
 //                      │       └──► vec_acc ──► memory
 //                      └── (mat_acc / vec_acc also reach memory via noc)
 //
-// Workers are configured for mat-only (access_vec=0) with
-// K-split tile counts.  The AccumCoordinator issues all
-// VectorAccelerator requests for the accumulation phase.
+// Workers execute local matmul, worker-driven tree reduction,
+// and worker-parallel final quantization. The AccumCoordinator
+// remains as passive shared state and statistics storage.
 // ============================================================
 struct MatmulTop : sc_module
 {

@@ -15,7 +15,10 @@ Worker::Worker(sc_module_name name,
                uint64_t B_bytes_,
                uint64_t C_bytes_,
                uint64_t vec_rd_,
-               uint64_t vec_wr_)
+               uint64_t vec_wr_,
+               uint64_t max_inflight_mat_reqs_,
+               uint64_t max_inflight_vec_reqs_,
+               WorkerPostProcessor *post_processor_)
     : sc_module(name),
       init("init"),
       peq("peq"),
@@ -26,6 +29,9 @@ Worker::Worker(sc_module_name name,
       mat_cycles(mat_cycles_),
       vec_cycles(vec_cycles_),
       scalar_cycles(scalar_cycles_),
+      max_inflight_mat_reqs(std::max<uint64_t>(max_inflight_mat_reqs_, 1)),
+      max_inflight_vec_reqs(std::max<uint64_t>(max_inflight_vec_reqs_, 1)),
+      post_processor(post_processor_),
       A_bytes(A_bytes_),
       B_bytes(B_bytes_),
       C_bytes(C_bytes_),
@@ -193,6 +199,82 @@ void Worker::issue_end(PendingReq &p)
     p.tx_ext  = nullptr;
 }
 
+void Worker::issue_stream(uint64_t addr,
+                          uint64_t call_count,
+                          uint64_t svc_cycles,
+                          uint64_t rd,
+                          uint64_t wr,
+                          uint64_t &call_counter,
+                          uint64_t *phase_counter,
+                          uint64_t max_inflight)
+{
+    if (call_count == 0)
+        return;
+
+    std::deque<PendingReq> inflight;
+    uint64_t issued = 0;
+    uint64_t window = std::max<uint64_t>(max_inflight, 1);
+
+    auto issue_one = [&]() {
+        inflight.push_back(issue_begin(addr, svc_cycles, rd, wr));
+        ++call_counter;
+        if (phase_counter)
+            ++(*phase_counter);
+        ++issued;
+    };
+
+    auto retire_one = [&]() {
+        bool has_completed = false;
+        for (auto &pending : inflight)
+        {
+            if (pending.sync_done || (pending.done_entry && pending.done_entry->fired))
+            {
+                has_completed = true;
+                break;
+            }
+        }
+
+        if (!has_completed)
+        {
+            sc_event_or_list wait_list;
+            for (auto &pending : inflight)
+            {
+                if (!pending.sync_done && pending.done_entry && !pending.done_entry->fired)
+                    wait_list |= *pending.done_entry->ev;
+            }
+            wait(wait_list);
+        }
+
+        for (auto it = inflight.begin(); it != inflight.end(); ++it)
+        {
+            if (it->sync_done || (it->done_entry && it->done_entry->fired))
+            {
+                issue_end(*it);
+                inflight.erase(it);
+                return;
+            }
+        }
+
+        issue_end(inflight.front());
+        inflight.pop_front();
+    };
+
+    issue_one();
+
+    while (issued < call_count)
+    {
+        do_scalar(scalar_cycles);
+
+        while (inflight.size() >= window)
+            retire_one();
+
+        issue_one();
+    }
+
+    while (!inflight.empty())
+        retire_one();
+}
+
 void Worker::run()
 {
     sc_time start = sc_time_stamp();
@@ -202,50 +284,52 @@ void Worker::run()
     // Pipeline: issue → scalar (overlapped) → issue_end → issue...
     // ----------------------------------------------------------
     if (access_mat > 0)
+        issue_stream(Interconnect::ADDR_MAT,
+                     access_mat,
+                     mat_cycles,
+                     A_bytes + B_bytes,
+                     C_bytes,
+                     mat_calls,
+                     nullptr,
+                     max_inflight_mat_reqs);
+
+    if (post_processor)
     {
-        auto pending = issue_begin(Interconnect::ADDR_MAT, mat_cycles);
-        mat_calls++;
-
-        for (uint64_t i = 1; i < access_mat; i++)
-        {
-            do_scalar(scalar_cycles);
-            issue_end(pending);
-            pending = issue_begin(Interconnect::ADDR_MAT, mat_cycles);
-            mat_calls++;
-        }
-        issue_end(pending);
+        // In the matmul simulator, the local mat phase completion is the handoff
+        // point into worker-driven reduction / final quantization.
+        mat_done_time = sc_time_stamp();
+        mat_elapsed_cycles = (uint64_t)((mat_done_time - start) / CYCLE);
+        mat_done_ev.notify(SC_ZERO_TIME);
+        post_processor->run_post_mat(*this);
     }
-
-    // ----------------------------------------------------------
-    // Phase 2: Output quantization (vec accelerator)
-    // Reads fp32 partial result, writes fp16 quantized result.
-    // vec_rd_bytes / vec_wr_bytes are set by the caller;
-    // fall back to mat bytes if not explicitly configured.
-    // ----------------------------------------------------------
-    if (access_vec > 0)
+    else
     {
-        uint64_t vrd = (vec_rd_bytes > 0) ? vec_rd_bytes : (A_bytes + B_bytes);
-        uint64_t vwr = (vec_wr_bytes > 0) ? vec_wr_bytes : C_bytes;
-
-        auto pending = issue_begin(Interconnect::ADDR_VEC, vec_cycles, vrd, vwr);
-        vec_calls++;
-
-        for (uint64_t i = 1; i < access_vec; i++)
+        // ------------------------------------------------------
+        // Phase 2: Output quantization (vec accelerator)
+        // Reads fp32 partial result, writes fp16 quantized result.
+        // vec_rd_bytes / vec_wr_bytes are set by the caller;
+        // fall back to mat bytes if not explicitly configured.
+        // ------------------------------------------------------
+        if (access_vec > 0)
         {
-            do_scalar(scalar_cycles);
-            issue_end(pending);
-            pending = issue_begin(Interconnect::ADDR_VEC, vec_cycles, vrd, vwr);
-            vec_calls++;
+            uint64_t vrd = (vec_rd_bytes > 0) ? vec_rd_bytes : (A_bytes + B_bytes);
+            uint64_t vwr = (vec_wr_bytes > 0) ? vec_wr_bytes : C_bytes;
+            issue_stream(Interconnect::ADDR_VEC,
+                         access_vec,
+                         vec_cycles,
+                         vrd,
+                         vwr,
+                         vec_calls,
+                         nullptr,
+                         max_inflight_vec_reqs);
         }
-        issue_end(pending);
-    }
 
-    // Record mat+quant elapsed and signal AccumCoordinator.
-    // The coordinator waits for this event before starting accumulation,
-    // so it fires only after BOTH mat tiles AND quantization are done.
-    mat_done_time = sc_time_stamp();
-    mat_elapsed_cycles = (uint64_t)((mat_done_time - start) / CYCLE);
-    mat_done_ev.notify(SC_ZERO_TIME);
+        // Preserve the legacy behavior for the base simulator: mat_done marks
+        // completion after both mat and worker-local vector phases.
+        mat_done_time = sc_time_stamp();
+        mat_elapsed_cycles = (uint64_t)((mat_done_time - start) / CYCLE);
+        mat_done_ev.notify(SC_ZERO_TIME);
+    }
 
     sc_time end        = sc_time_stamp();
     elapsed_cycles     = (uint64_t)((end - start) / CYCLE);
@@ -254,6 +338,9 @@ void Worker::run()
     std::cout << "[T" << tid << "]"
               << " mat_calls="  << mat_calls
               << " vec_calls="  << vec_calls
+              << " accum_vec="  << accum_vec_calls
+              << " quant_vec="  << quant_vec_calls
+              << " pairs="      << reduction_pairs
               << " wait="       << wait_cycles
               << " stall="      << stall_cycles
               << " compute="    << compute_cycles

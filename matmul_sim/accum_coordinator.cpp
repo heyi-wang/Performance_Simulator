@@ -1,412 +1,317 @@
 #include "accum_coordinator.h"
 #include "../src/interconnect.h"
+#include <algorithm>
 #include <iostream>
 
-SC_HAS_PROCESS(AccumCoordinator);
-
 AccumCoordinator::AccumCoordinator(sc_module_name name,
-                                   uint64_t vec_svc_cycles_,
                                    uint64_t accum_vec_calls_,
                                    uint64_t final_quant_calls_,
-                                   uint64_t max_inflight_vec_reqs_,
-                                   uint64_t scalar_cycles_,
                                    uint64_t accum_rd_bytes_,
                                    uint64_t accum_wr_bytes_,
                                    uint64_t quant_rd_bytes_,
                                    uint64_t quant_wr_bytes_)
     : sc_module(name),
-      init("init"),
-      peq("peq"),
-      vec_svc_cycles(vec_svc_cycles_),
       accum_vec_calls(accum_vec_calls_),
       final_quant_calls(final_quant_calls_),
-      max_inflight_vec_reqs(std::max<uint64_t>(max_inflight_vec_reqs_, 1)),
-      scalar_cycles(scalar_cycles_),
       accum_rd_bytes(accum_rd_bytes_),
       accum_wr_bytes(accum_wr_bytes_),
       quant_rd_bytes(quant_rd_bytes_),
       quant_wr_bytes(quant_wr_bytes_)
 {
-    init.register_nb_transport_bw(this, &AccumCoordinator::nb_transport_bw);
-    SC_THREAD(peq_thread);
-    SC_THREAD(run);
 }
 
-AccumCoordinator::~AccumCoordinator()
+void AccumCoordinator::configure_workers(const std::vector<Worker *> &workers_)
 {
-    for (auto *ev : tree_events_)
-        delete ev;
-    for (auto *t : tree_ready_times_)
-        delete t;
-    for (auto *ready : tree_ready_flags_)
-        delete ready;
+    workers = workers_;
+    build_reduction_tree();
 }
 
-// ----------------------------------------------------------
-// nb_transport_bw: receive BEGIN_RESP or deferred END_REQ
-//
-//   BEGIN_RESP — request completed; route through PEQ.
-//   END_REQ    — queue slot granted after stall; notify admit_ev.
-// ----------------------------------------------------------
-tlm_sync_enum AccumCoordinator::nb_transport_bw(tlm_generic_payload &gp,
-                                                 tlm_phase &phase,
-                                                 sc_time &delay)
+void AccumCoordinator::build_reduction_tree()
 {
-    if (phase == BEGIN_RESP)
-    {
-        peq.notify(gp, delay);
-        return TLM_ACCEPTED;
-    }
-    if (phase == END_REQ)
-    {
-        auto it = done_map.find(&gp);
-        if (it != done_map.end() && it->second && it->second->admit_ev)
-            it->second->admit_ev->notify(SC_ZERO_TIME);
-        return TLM_ACCEPTED;
-    }
-    return TLM_ACCEPTED;
-}
+    nodes.clear();
+    tasks.clear();
+    pair_start_times.clear();
+    pair_end_times.clear();
+    pair_left_ready_times.clear();
+    pair_right_ready_times.clear();
+    root_task_id = no_task;
+    root_node_id = no_task;
+    reduction_complete = false;
+    accum_end_time = SC_ZERO_TIME;
+    quant_start_time = SC_ZERO_TIME;
+    quant_end_time = SC_ZERO_TIME;
+    vec_calls_total = 0;
+    accum_vec_calls_total = 0;
+    final_quant_calls_total = 0;
+    compute_cycles = 0;
+    wait_cycles = 0;
+    stall_cycles = 0;
+    mem_cycles = 0;
 
-// ----------------------------------------------------------
-// peq_thread: set fired=true BEFORE notifying so issue_end
-// can skip wait() if the response arrived early.
-// ----------------------------------------------------------
-void AccumCoordinator::peq_thread()
-{
-    while (true)
-    {
-        wait(peq.get_event());
-        while (auto *gp = peq.get_next_transaction())
-        {
-            auto it = done_map.find(gp);
-            if (it != done_map.end() && it->second)
-            {
-                it->second->fired = true;
-                it->second->ev->notify(SC_ZERO_TIME);
-            }
-        }
-    }
-}
-
-AccumCoordinator::PendingReq AccumCoordinator::issue_begin(uint64_t addr,
-                                                           uint64_t rd_bytes,
-                                                           uint64_t wr_bytes)
-{
-    PendingReq p;
-
-    auto *gp = new tlm_generic_payload();
-    gp->set_command(TLM_IGNORE_COMMAND);
-    gp->set_address(addr);
-    gp->set_data_ptr(nullptr);
-    gp->set_data_length(0);
-    gp->set_streaming_width(0);
-    gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
-
-    auto *req = new ReqExt(-1, vec_svc_cycles, rd_bytes, wr_bytes);
-    auto *tx  = new TxnExt();
-    tx->src_worker = -1;
-
-    gp->set_extension(req);
-    gp->set_extension(tx);
-
-    p.gp         = gp;
-    p.req_ext    = req;
-    p.tx_ext     = tx;
-    p.done_entry = new DoneEntry();
-    p.done_entry->ev       = new sc_event();
-    p.done_entry->admit_ev = new sc_event();
-    p.done_entry->fired    = false;
-    done_map[gp] = p.done_entry;
-
-    tlm_phase phase = BEGIN_REQ;
-    sc_time   delay = SC_ZERO_TIME;
-    auto status = init->nb_transport_fw(*gp, phase, delay);
-
-    if (status == TLM_ACCEPTED)
-    {
-        // Queue full: stall until the accelerator grants a slot.
-        sc_time t_stall_start = sc_time_stamp();
-        wait(*p.done_entry->admit_ev);
-        p.stall_cycles = (uint64_t)((sc_time_stamp() - t_stall_start) / CYCLE);
-    }
-    else if (status == TLM_COMPLETED)
-    {
-        done_map.erase(gp);
-        p.sync_done = true;
-    }
-    // TLM_UPDATED: slot admitted immediately, no stall.
-
-    return p;
-}
-
-void AccumCoordinator::do_scalar(uint64_t cyc)
-{
-    compute_cycles += cyc;
-    wait(cyc * CYCLE);
-}
-
-void AccumCoordinator::issue_vec_stream(uint64_t call_count,
-                                        uint64_t rd_bytes,
-                                        uint64_t wr_bytes,
-                                        uint64_t &stage_call_counter)
-{
-    if (call_count == 0)
-        return;
-
-    std::deque<PendingReq> inflight;
-    uint64_t issued = 0;
-    uint64_t window = std::max<uint64_t>(max_inflight_vec_reqs, 1);
-
-    auto issue_one = [&]() {
-        inflight.push_back(issue_begin(Interconnect::ADDR_VEC, rd_bytes, wr_bytes));
-        ++vec_calls_total;
-        ++stage_call_counter;
-        ++issued;
-    };
-
-    while (issued < call_count && inflight.size() < window)
-        issue_one();
-
-    while (!inflight.empty())
-    {
-        if (issued < call_count)
-            do_scalar(scalar_cycles);
-
-        while (issued < call_count && inflight.size() < window)
-            issue_one();
-
-        bool has_completed = false;
-        for (auto &pending : inflight)
-        {
-            if (pending.sync_done || (pending.done_entry && pending.done_entry->fired))
-            {
-                has_completed = true;
-                break;
-            }
-        }
-
-        if (!has_completed)
-        {
-            sc_event_or_list wait_list;
-            for (auto &pending : inflight)
-            {
-                if (!pending.sync_done && pending.done_entry && !pending.done_entry->fired)
-                    wait_list |= *pending.done_entry->ev;
-            }
-            wait(wait_list);
-        }
-
-        bool retired_one = false;
-        for (auto it = inflight.begin(); it != inflight.end();)
-        {
-            if (it->sync_done || (it->done_entry && it->done_entry->fired))
-            {
-                issue_end(*it);
-                it = inflight.erase(it);
-                retired_one = true;
-                break;
-            }
-            else
-            {
-                ++it;
-            }
-        }
-
-        if (!retired_one && !inflight.empty())
-        {
-            issue_end(inflight.front());
-            inflight.pop_front();
-        }
-    }
-}
-
-void AccumCoordinator::issue_end(PendingReq &p)
-{
-    if (!p.sync_done && !p.done_entry->fired)
-        wait(*p.done_entry->ev);
-
-    done_map.erase(p.gp);
-    delete p.done_entry->ev;
-    delete p.done_entry->admit_ev;
-    delete p.done_entry;
-    p.done_entry = nullptr;
-
-    ReqExt *ext = nullptr;
-    p.gp->get_extension(ext);
-
-    uint64_t qwait = ext ? ext->accel_qwait_cycles : 0;
-    wait_cycles  += qwait + p.stall_cycles;
-    stall_cycles += p.stall_cycles;
-    mem_cycles   += ext ? ext->mem_cycles : 0;
-
-    tlm_phase end_phase = END_RESP;
-    sc_time   end_delay = SC_ZERO_TIME;
-    init->nb_transport_fw(*p.gp, end_phase, end_delay);
-
-    p.gp->clear_extension(p.req_ext);
-    p.gp->clear_extension(p.tx_ext);
-    delete p.req_ext;
-    delete p.tx_ext;
-    delete p.gp;
-
-    p.gp      = nullptr;
-    p.req_ext = nullptr;
-    p.tx_ext  = nullptr;
-}
-
-// ----------------------------------------------------------
-// run_one_pair: issue accum_vec_calls with a pipelined in-flight
-// vec request window so one reduction thread can occupy multiple
-// vec accelerators concurrently. Records timing.
-// ----------------------------------------------------------
-void AccumCoordinator::run_one_pair(size_t pair_id,
-                                    sc_time left_ready,
-                                    sc_time right_ready)
-{
-    sc_time t0 = sc_time_stamp();
-
-    issue_vec_stream(accum_vec_calls,
-                     accum_rd_bytes,
-                     accum_wr_bytes,
-                     accum_vec_calls_total);
-
-    sc_time t1 = sc_time_stamp();
-
-    stats_mutex.lock();
-    pair_start_times[pair_id] = t0;
-    pair_end_times[pair_id] = t1;
-    pair_left_ready_times[pair_id] = left_ready;
-    pair_right_ready_times[pair_id] = right_ready;
-    stats_mutex.unlock();
-}
-
-void AccumCoordinator::run_final_quant()
-{
-    issue_vec_stream(final_quant_calls,
-                     quant_rd_bytes,
-                     quant_wr_bytes,
-                     final_quant_calls_total);
-}
-
-// ----------------------------------------------------------
-// run() — build the event-driven reduction tree.
-//
-// For each internal node, an independent SC_THREAD is spawned
-// that waits for its two inputs then immediately accumulates
-// without any global barrier.  Accumulation begins as soon as
-// any pair of quantized partial results is available.
-// ----------------------------------------------------------
-void AccumCoordinator::run()
-{
-    int n = (int)workers.size();
+    size_t n = workers.size();
     if (n == 0)
-    {
-        accum_end_time = sc_time_stamp();
         return;
-    }
-    if (n == 1)
+
+    nodes.resize(n);
+    std::vector<size_t> cur_nodes;
+    cur_nodes.reserve(n);
+    for (size_t i = 0; i < n; ++i)
+        cur_nodes.push_back(i);
+
+    while (cur_nodes.size() > 1)
     {
-        wait(workers[0]->mat_done_ev);
-        run_final_quant();
-        accum_end_time = sc_time_stamp();
-        return;
-    }
+        std::vector<size_t> next_nodes;
+        next_nodes.reserve((cur_nodes.size() + 1) / 2);
 
-    // Create proxy leaf events: one per worker.
-    // A lightweight spawned thread waits on worker->mat_done_ev
-    // (which fires after mat+quant) then fires the proxy.
-    struct ReadyNode
-    {
-        sc_event *ev = nullptr;
-        sc_time  *ready_time = nullptr;
-        bool     *ready = nullptr;
-    };
-
-    size_t total_pairs = (size_t)(n - 1);
-    pair_start_times.assign(total_pairs, SC_ZERO_TIME);
-    pair_end_times.assign(total_pairs, SC_ZERO_TIME);
-    pair_left_ready_times.assign(total_pairs, SC_ZERO_TIME);
-    pair_right_ready_times.assign(total_pairs, SC_ZERO_TIME);
-
-    std::vector<ReadyNode> cur_nodes;
-    for (int i = 0; i < n; i++)
-    {
-        auto *ev = new sc_event();
-        auto *ready_time = new sc_time(SC_ZERO_TIME);
-        auto *ready = new bool(false);
-        tree_events_.push_back(ev);
-        tree_ready_times_.push_back(ready_time);
-        tree_ready_flags_.push_back(ready);
-        cur_nodes.push_back({ev, ready_time, ready});
-
-        Worker *w = workers[i];
-        sc_spawn([w, ev, ready_time, ready]() {
-            sc_core::wait(w->mat_done_ev);
-            *ready_time = w->mat_done_time;
-            *ready = true;
-            ev->notify(SC_ZERO_TIME);
-        });
-    }
-
-    // Build the reduction tree level by level.
-    // Each pair spawns a thread that waits for both inputs
-    // then immediately calls run_one_pair().
-    size_t pair_id = 0;
-    while ((int)cur_nodes.size() > 1)
-    {
-        int m     = (int)cur_nodes.size();
-        int pairs = m / 2;
-
-        std::vector<ReadyNode> next_nodes;
-        next_nodes.reserve((m + 1) / 2);
-
-        for (int i = 0; i < pairs; i++)
+        size_t pairs = cur_nodes.size() / 2;
+        for (size_t i = 0; i < pairs; ++i)
         {
-            ReadyNode left  = cur_nodes[2 * i];
-            ReadyNode right = cur_nodes[2 * i + 1];
+            size_t left = cur_nodes[2 * i];
+            size_t right = cur_nodes[2 * i + 1];
+            size_t out = nodes.size();
+            nodes.push_back(NodeState{});
 
-            auto *out = new sc_event();
-            auto *ready_time = new sc_time(SC_ZERO_TIME);
-            auto *ready = new bool(false);
-            tree_events_.push_back(out);
-            tree_ready_times_.push_back(ready_time);
-            tree_ready_flags_.push_back(ready);
-            next_nodes.push_back({out, ready_time, ready});
-
-            size_t this_pair = pair_id++;
-            sc_spawn([this, left, right, out, ready_time, ready, this_pair]() {
-                if (!*left.ready)
-                    sc_core::wait(*left.ev);
-                if (!*right.ready)
-                    sc_core::wait(*right.ev);
-                sc_time left_ready = *left.ready_time;
-                sc_time right_ready = *right.ready_time;
-                run_one_pair(this_pair, left_ready, right_ready);
-                *ready_time = sc_time_stamp();
-                *ready = true;
-                out->notify(SC_ZERO_TIME);
-            });
+            size_t task_id = tasks.size();
+            tasks.push_back({left, right, out, false, false, false});
+            nodes[left].parent_task = task_id;
+            nodes[right].parent_task = task_id;
+            next_nodes.push_back(out);
         }
 
-        // Odd survivor carries forward unchanged
-        if (m % 2 == 1)
-            next_nodes.push_back(cur_nodes[m - 1]);
+        if (cur_nodes.size() % 2 == 1)
+            next_nodes.push_back(cur_nodes.back());
 
         cur_nodes = std::move(next_nodes);
     }
 
-    // Wait for the root event (entire tree complete)
-    wait(*cur_nodes[0].ev);
+    root_node_id = cur_nodes.front();
+    if (!tasks.empty())
+        root_task_id = tasks.size() - 1;
 
-    run_final_quant();
-    accum_end_time = sc_time_stamp();
+    pair_start_times.assign(tasks.size(), SC_ZERO_TIME);
+    pair_end_times.assign(tasks.size(), SC_ZERO_TIME);
+    pair_left_ready_times.assign(tasks.size(), SC_ZERO_TIME);
+    pair_right_ready_times.assign(tasks.size(), SC_ZERO_TIME);
 
-    std::cout << "[AccumCoordinator]"
-              << " pairs_done="       << pair_start_times.size()
-              << " vec_calls_total="  << vec_calls_total
-              << " wait_cycles="      << wait_cycles
-              << " stall_cycles="     << stall_cycles
-              << " mem_cycles="       << mem_cycles
-              << " accum_end="        << accum_end_time
-              << "\n";
+    ready_task_fifo =
+        std::make_unique<sc_fifo<int>>(sc_gen_unique_name("ready_task_fifo"),
+                                       static_cast<int>(tasks.size() + workers.size() + 1));
+}
+
+void AccumCoordinator::maybe_enqueue_task_locked(size_t task_id)
+{
+    if (task_id == no_task || task_id >= tasks.size())
+        return;
+
+    auto &task = tasks[task_id];
+    if (task.done || task.claimed || task.queued)
+        return;
+    if (!nodes[task.left].ready || !nodes[task.right].ready)
+        return;
+
+    task.queued = true;
+    ready_task_fifo->nb_write(static_cast<int>(task_id));
+}
+
+void AccumCoordinator::mark_leaf_ready(size_t leaf_id, sc_time ready_time)
+{
+    state_mutex.lock();
+
+    if (leaf_id < nodes.size())
+    {
+        nodes[leaf_id].ready = true;
+        nodes[leaf_id].ready_time = ready_time;
+
+        if (tasks.empty() && leaf_id == root_node_id && !reduction_complete)
+        {
+            reduction_complete = true;
+            accum_end_time = ready_time;
+            for (size_t i = 0; i < workers.size(); ++i)
+                ready_task_fifo->nb_write(-1);
+        }
+        else
+        {
+            maybe_enqueue_task_locked(nodes[leaf_id].parent_task);
+        }
+    }
+
+    state_mutex.unlock();
+}
+
+bool AccumCoordinator::claim_task(size_t task_id,
+                                  sc_time &left_ready,
+                                  sc_time &right_ready)
+{
+    state_mutex.lock();
+
+    bool ok = false;
+    if (task_id < tasks.size())
+    {
+        auto &task = tasks[task_id];
+        if (!task.done && !task.claimed && task.queued &&
+            nodes[task.left].ready && nodes[task.right].ready)
+        {
+            task.claimed = true;
+            task.queued = false;
+            left_ready = nodes[task.left].ready_time;
+            right_ready = nodes[task.right].ready_time;
+            ok = true;
+        }
+    }
+
+    state_mutex.unlock();
+    return ok;
+}
+
+void AccumCoordinator::finish_task(size_t task_id,
+                                   sc_time start_time,
+                                   sc_time end_time,
+                                   sc_time left_ready,
+                                   sc_time right_ready)
+{
+    stats_mutex.lock();
+    pair_start_times[task_id] = start_time;
+    pair_end_times[task_id] = end_time;
+    pair_left_ready_times[task_id] = left_ready;
+    pair_right_ready_times[task_id] = right_ready;
+    stats_mutex.unlock();
+
+    state_mutex.lock();
+
+    auto &task = tasks[task_id];
+    task.done = true;
+    nodes[task.out].ready = true;
+    nodes[task.out].ready_time = end_time;
+
+    if (task_id == root_task_id && !reduction_complete)
+    {
+        reduction_complete = true;
+        accum_end_time = end_time;
+        for (size_t i = 0; i < workers.size(); ++i)
+            ready_task_fifo->nb_write(-1);
+    }
+    else
+    {
+        maybe_enqueue_task_locked(nodes[task.out].parent_task);
+    }
+
+    state_mutex.unlock();
+}
+
+AccumCoordinator::WorkerSnapshot
+AccumCoordinator::snapshot_worker(const Worker &worker) const
+{
+    WorkerSnapshot s;
+    s.compute = worker.compute_cycles;
+    s.wait = worker.wait_cycles;
+    s.stall = worker.stall_cycles;
+    s.mem = worker.mem_cycles_accum;
+    s.vec_calls = worker.vec_calls;
+    s.accum_vec_calls = worker.accum_vec_calls;
+    s.quant_vec_calls = worker.quant_vec_calls;
+    return s;
+}
+
+void AccumCoordinator::accumulate_worker_delta(const WorkerSnapshot &before,
+                                               const WorkerSnapshot &after)
+{
+    stats_mutex.lock();
+    compute_cycles += (after.compute - before.compute);
+    wait_cycles += (after.wait - before.wait);
+    stall_cycles += (after.stall - before.stall);
+    mem_cycles += (after.mem - before.mem);
+    vec_calls_total += (after.vec_calls - before.vec_calls);
+    accum_vec_calls_total += (after.accum_vec_calls - before.accum_vec_calls);
+    final_quant_calls_total += (after.quant_vec_calls - before.quant_vec_calls);
+    stats_mutex.unlock();
+}
+
+void AccumCoordinator::run_one_pair(Worker &worker,
+                                    size_t task_id,
+                                    sc_time left_ready,
+                                    sc_time right_ready)
+{
+    (void)left_ready;
+    (void)right_ready;
+
+    WorkerSnapshot before = snapshot_worker(worker);
+    sc_time start_time = sc_time_stamp();
+
+    worker.issue_stream(Interconnect::ADDR_VEC,
+                        accum_vec_calls,
+                        worker.vec_cycles,
+                        accum_rd_bytes,
+                        accum_wr_bytes,
+                        worker.vec_calls,
+                        &worker.accum_vec_calls,
+                        worker.max_inflight_vec_reqs);
+    worker.reduction_pairs++;
+
+    sc_time end_time = sc_time_stamp();
+    WorkerSnapshot after = snapshot_worker(worker);
+
+    accumulate_worker_delta(before, after);
+    finish_task(task_id, start_time, end_time, left_ready, right_ready);
+}
+
+uint64_t AccumCoordinator::quant_calls_for_worker(int tid) const
+{
+    uint64_t total = final_quant_calls;
+    uint64_t workers_count = static_cast<uint64_t>(std::max<size_t>(workers.size(), 1));
+    uint64_t base = total / workers_count;
+    uint64_t rem = total % workers_count;
+    uint64_t idx = static_cast<uint64_t>(std::max(tid, 0));
+    return base + ((idx < rem) ? 1 : 0);
+}
+
+void AccumCoordinator::run_final_quant(Worker &worker)
+{
+    uint64_t quant_calls = quant_calls_for_worker(worker.tid);
+    if (quant_calls == 0)
+        return;
+
+    stats_mutex.lock();
+    if (quant_start_time == SC_ZERO_TIME)
+        quant_start_time = sc_time_stamp();
+    stats_mutex.unlock();
+
+    WorkerSnapshot before = snapshot_worker(worker);
+    worker.issue_stream(Interconnect::ADDR_VEC,
+                        quant_calls,
+                        worker.vec_cycles,
+                        quant_rd_bytes,
+                        quant_wr_bytes,
+                        worker.vec_calls,
+                        &worker.quant_vec_calls,
+                        worker.max_inflight_vec_reqs);
+    WorkerSnapshot after = snapshot_worker(worker);
+
+    accumulate_worker_delta(before, after);
+
+    stats_mutex.lock();
+    if (sc_time_stamp() > quant_end_time)
+        quant_end_time = sc_time_stamp();
+    stats_mutex.unlock();
+}
+
+void AccumCoordinator::run_post_mat(Worker &worker)
+{
+    mark_leaf_ready(static_cast<size_t>(worker.tid), worker.mat_done_time);
+
+    while (true)
+    {
+        int item = ready_task_fifo->read();
+        if (item < 0)
+            break;
+
+        size_t task_id = static_cast<size_t>(item);
+        sc_time left_ready = SC_ZERO_TIME;
+        sc_time right_ready = SC_ZERO_TIME;
+        if (!claim_task(task_id, left_ready, right_ready))
+            continue;
+
+        run_one_pair(worker, task_id, left_ready, right_ready);
+    }
+
+    run_final_quant(worker);
 }
