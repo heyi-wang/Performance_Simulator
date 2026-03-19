@@ -21,8 +21,8 @@
 struct MatmulConfig
 {
     int thread_count = NUM_THREADS;
-    int mat_accel_count = MAT_ACCEL_COUNT_CFG;
-    int vec_accel_count = VEC_ACCEL_COUNT_CFG;
+    int mat_accel_count = MAT_ACCEL_COUNT;
+    int vec_accel_count = VEC_ACCEL_COUNT;
 
     // Full output matrix dimensions (M is NOT divided across threads for K-split).
     static constexpr uint64_t gemm_m = CONV_N * CONV_H_OUT * CONV_W_OUT;
@@ -56,8 +56,8 @@ struct MatmulConfig
         VECTOR_ACC_CAP * gemm_quant_out_elem_bytes;
 
     explicit MatmulConfig(int threads = NUM_THREADS,
-                          int mat_accels = MAT_ACCEL_COUNT_CFG,
-                          int vec_accels = VEC_ACCEL_COUNT_CFG)
+                          int mat_accels = MAT_ACCEL_COUNT,
+                          int vec_accels = VEC_ACCEL_COUNT)
         : thread_count(std::max(threads, 1)),
           mat_accel_count(std::max(mat_accels, 1)),
           vec_accel_count(std::max(vec_accels, 1))
@@ -101,12 +101,12 @@ struct MatmulConfig
 
     size_t mat_acc_queue_cap() const
     {
-        return static_cast<size_t>(mat_accel_count + 4);
+        return static_cast<size_t>(mat_accel_count * 4);
     }
 
     size_t vec_acc_queue_cap() const
     {
-        return static_cast<size_t>(vec_accel_count + 4);
+        return static_cast<size_t>(vec_accel_count * 4);
     }
 
     uint64_t local_access_mat_for_thread(int tid) const

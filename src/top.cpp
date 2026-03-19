@@ -2,10 +2,10 @@
 
 Top::Top(sc_module_name nm)
     : sc_module(nm),
-      mat_acc("mat_acc", MAT_ACCEL_COUNT_CFG, NUM_THREADS),
-      vec_acc("vec_acc", VEC_ACCEL_COUNT_CFG, NUM_THREADS),
+      mat_acc("mat_acc", MAT_ACCEL_COUNT, NUM_THREADS),
+      vec_acc("vec_acc", VEC_ACCEL_COUNT, NUM_THREADS),
       noc("noc"),
-      memory("memory")
+      memory("memory", 1, 128, MEMORY_PARALLEL_SLOTS_CFG)
 {
     // Bind accelerators and memory to the interconnect
     noc.to_mat.bind(mat_acc.tgt);

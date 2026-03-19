@@ -6,7 +6,7 @@ MatmulTop::MatmulTop(sc_module_name nm, const MatmulConfig &cfg_)
       mat_acc("mat_acc", cfg.mat_accel_count, cfg.mat_acc_queue_cap()),
       vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap()),
       noc("noc"),
-      memory("memory")
+      memory("memory", 1, 128, MEMORY_PARALLEL_SLOTS_CFG)
 {
     // Bind accelerators and memory to the interconnect
     noc.to_mat.bind(mat_acc.tgt);

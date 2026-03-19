@@ -10,9 +10,9 @@
 // ============================================================
 static const uint64_t CONV_N      = 1;
 static const uint64_t CONV_C_IN   = 64;
-static const uint64_t CONV_H_IN   = 56;
-static const uint64_t CONV_W_IN   = 56;
-static const uint64_t CONV_C_OUT  = 64;
+static const uint64_t CONV_H_IN   = 128;
+static const uint64_t CONV_W_IN   = 128;
+static const uint64_t CONV_C_OUT  = 512;
 static const uint64_t CONV_KH     = 3;
 static const uint64_t CONV_KW     = 3;
 static const uint64_t CONV_STRIDE = 1;
@@ -34,20 +34,24 @@ static const uint64_t CONV_TOTAL_MACS =
 // Each thread handles an equal slice of output spatial positions
 //   (N × H_out × W_out) / NUM_THREADS rows
 // ============================================================
-static const int NUM_THREADS = 12;
+static const int NUM_THREADS = 16;
 
 // Number of physical accelerator instances per class.
 // Requests still enter through one shared queue per class.
 #ifndef MAT_ACCEL_COUNT
-#define MAT_ACCEL_COUNT 2
+#define MAT_ACCEL_COUNT 4
 #endif
 
 #ifndef VEC_ACCEL_COUNT
 #define VEC_ACCEL_COUNT 4
 #endif
 
-static const int MAT_ACCEL_COUNT_CFG = MAT_ACCEL_COUNT;
-static const int VEC_ACCEL_COUNT_CFG = VEC_ACCEL_COUNT;
+
+#ifndef MEMORY_PARALLEL_SLOTS
+#define MEMORY_PARALLEL_SLOTS (MAT_ACCEL_COUNT + VEC_ACCEL_COUNT)
+#endif
+
+static const int MEMORY_PARALLEL_SLOTS_CFG = MEMORY_PARALLEL_SLOTS;
 
 // ============================================================
 // GEMM mapping via im2col
@@ -73,13 +77,13 @@ static const uint64_t MATMUL_N = 8;
 
 // Cycles to complete one M×K×N tile (= M*K*N MACs / mac_units_per_cycle)
 // Example: 8×8×8 = 512 MACs, 64 MAC units → 8 cycles
-static const uint64_t MATMUL_ACC_CYCLE = 8;
+static const uint64_t MATMUL_ACC_CYCLE = 1;
 
 // Vector accelerator (bias add + activation, e.g. ReLU):
 //   processes VECTOR_ACC_CAP elements per call in VECTOR_ACC_CYCLE cycles
-static const uint64_t VECTOR_ACC_CAP   = 8;
-static const uint64_t VECTOR_ACC_CYCLE = 4;
+static const uint64_t VECTOR_ACC_CAP   = 64;
+static const uint64_t VECTOR_ACC_CYCLE = 1;
 
 // Scalar overhead cycles per accelerator call
 // (loop bookkeeping, address computation, tile dispatch)
-static const uint64_t SCALAR_OVERHEAD = 1000;
+static const uint64_t SCALAR_OVERHEAD = 16;
