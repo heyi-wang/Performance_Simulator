@@ -6,25 +6,33 @@ INCLUDES := -I/usr/include -I.. -I../src -I.
 LDFLAGS  := -L/usr/lib/x86_64-linux-gnu -Wl,-rpath,/usr/lib/x86_64-linux-gnu
 LIBS     := -lsystemc -lpthread
 
-TARGET   := build/layer_norm_sim
 BUILDDIR := build
 
-# src/ modules required by layer_norm_sim (excludes src/main.cpp and src/worker.cpp)
-SRC_OBJS := $(BUILDDIR)/src_memory.o       \
-            $(BUILDDIR)/src_accelerator.o  \
-            $(BUILDDIR)/src_accelerator_pool.o \
+# src/ modules shared by all kernel simulators
+SRC_OBJS := $(BUILDDIR)/src_memory.o            \
+            $(BUILDDIR)/src_accelerator.o        \
+            $(BUILDDIR)/src_accelerator_pool.o   \
             $(BUILDDIR)/src_interconnect.o
 
-KERNEL_OBJS := $(BUILDDIR)/layer_norm_sim.o
+# ── Targets ────────────────────────────────────────────────
+TARGET_LN := $(BUILDDIR)/layer_norm_sim
+TARGET_DW := $(BUILDDIR)/dw_conv2d_sim
 
-OBJS := $(KERNEL_OBJS) $(SRC_OBJS)
-DEPS := $(OBJS:.o=.d)
+OBJS_LN := $(BUILDDIR)/layer_norm_sim.o $(SRC_OBJS)
+OBJS_DW := $(BUILDDIR)/dw_conv2d_sim.o  $(SRC_OBJS)
 
-.PHONY: all run clean
+DEPS := $(BUILDDIR)/layer_norm_sim.d  \
+        $(BUILDDIR)/dw_conv2d_sim.d   \
+        $(SRC_OBJS:.o=.d)
 
-all: $(TARGET)
+.PHONY: all run run_ln run_dw clean
 
-$(TARGET): $(OBJS) | $(BUILDDIR)
+all: $(TARGET_LN) $(TARGET_DW)
+
+$(TARGET_LN): $(OBJS_LN) | $(BUILDDIR)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+$(TARGET_DW): $(OBJS_DW) | $(BUILDDIR)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 # Compile kernel/*.cpp
@@ -38,8 +46,13 @@ $(BUILDDIR)/src_%.o: ../src/%.cpp | $(BUILDDIR)
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-run: $(TARGET)
-	./$(TARGET)
+run: run_dw
+
+run_ln: $(TARGET_LN)
+	./$(TARGET_LN)
+
+run_dw: $(TARGET_DW)
+	./$(TARGET_DW)
 
 clean:
 	rm -rf $(BUILDDIR)
