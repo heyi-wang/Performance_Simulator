@@ -15,24 +15,30 @@ SRC_OBJS := $(BUILDDIR)/src_memory.o            \
             $(BUILDDIR)/src_interconnect.o
 
 # ── Targets ────────────────────────────────────────────────
-TARGET_LN := $(BUILDDIR)/layer_norm_sim
-TARGET_DW := $(BUILDDIR)/dw_conv2d_sim
+TARGET_LN   := $(BUILDDIR)/layer_norm_sim
+TARGET_DW   := $(BUILDDIR)/dw_conv2d_sim
+TARGET_POOL := $(BUILDDIR)/pooling_sim
 
-OBJS_LN := $(BUILDDIR)/layer_norm_sim.o $(SRC_OBJS)
-OBJS_DW := $(BUILDDIR)/dw_conv2d_sim.o  $(SRC_OBJS)
+OBJS_LN   := $(BUILDDIR)/layer_norm_sim.o $(SRC_OBJS)
+OBJS_DW   := $(BUILDDIR)/dw_conv2d_sim.o  $(SRC_OBJS)
+OBJS_POOL := $(BUILDDIR)/pooling_sim.o    $(SRC_OBJS)
 
 DEPS := $(BUILDDIR)/layer_norm_sim.d  \
         $(BUILDDIR)/dw_conv2d_sim.d   \
+        $(BUILDDIR)/pooling_sim.d     \
         $(SRC_OBJS:.o=.d)
 
-.PHONY: all run run_ln run_dw clean
+.PHONY: all run run_ln run_dw run_pool clean
 
-all: $(TARGET_LN) $(TARGET_DW)
+all: $(TARGET_LN) $(TARGET_DW) $(TARGET_POOL)
 
 $(TARGET_LN): $(OBJS_LN) | $(BUILDDIR)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 $(TARGET_DW): $(OBJS_DW) | $(BUILDDIR)
+	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+
+$(TARGET_POOL): $(OBJS_POOL) | $(BUILDDIR)
 	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
 
 # Compile kernel/*.cpp
@@ -46,13 +52,16 @@ $(BUILDDIR)/src_%.o: ../src/%.cpp | $(BUILDDIR)
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-run: run_dw
+run: run_pool
 
 run_ln: $(TARGET_LN)
 	./$(TARGET_LN)
 
 run_dw: $(TARGET_DW)
 	./$(TARGET_DW)
+
+run_pool: $(TARGET_POOL)
+	./$(TARGET_POOL)
 
 clean:
 	rm -rf $(BUILDDIR)
