@@ -1,6 +1,6 @@
 #pragma once
-#include "config.h"
-#include "src/common.h"
+#include "hardware_config.h"
+#include "common.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -20,14 +20,25 @@
 
 struct MatmulConfig
 {
-    int thread_count = NUM_THREADS;
+    static constexpr int default_thread_count = 16;
+
+    int thread_count = default_thread_count;
     int mat_accel_count = MAT_ACCEL_COUNT;
     int vec_accel_count = VEC_ACCEL_COUNT;
 
+    // Default workload mirrors the previous root conv-style GEMM mapping.
+    static constexpr uint64_t workload_n = 1;
+    static constexpr uint64_t workload_h = 128;
+    static constexpr uint64_t workload_w = 128;
+    static constexpr uint64_t workload_c_in = 64;
+    static constexpr uint64_t workload_kh = 3;
+    static constexpr uint64_t workload_kw = 3;
+    static constexpr uint64_t workload_c_out = 512;
+
     // Full output matrix dimensions (M is NOT divided across threads for K-split).
-    static constexpr uint64_t gemm_m = CONV_N * CONV_H_OUT * CONV_W_OUT;
-    static constexpr uint64_t gemm_k = A_K;   // = CONV_C_IN * CONV_KH * CONV_KW
-    static constexpr uint64_t gemm_n = B_N;   // = CONV_C_OUT
+    static constexpr uint64_t gemm_m = workload_n * workload_h * workload_w;
+    static constexpr uint64_t gemm_k = workload_c_in * workload_kh * workload_kw;
+    static constexpr uint64_t gemm_n = workload_c_out;
 
     // Number of accelerator tiles along M and N are independent of thread count.
     // Memory traffic per tile (bytes)
@@ -55,7 +66,7 @@ struct MatmulConfig
     static constexpr uint64_t gemm_quant_wr_bytes =
         VECTOR_ACC_CAP * gemm_quant_out_elem_bytes;
 
-    explicit MatmulConfig(int threads = NUM_THREADS,
+    explicit MatmulConfig(int threads = default_thread_count,
                           int mat_accels = MAT_ACCEL_COUNT,
                           int vec_accels = VEC_ACCEL_COUNT)
         : thread_count(std::max(threads, 1)),
@@ -101,12 +112,14 @@ struct MatmulConfig
 
     size_t mat_acc_queue_cap() const
     {
-        return static_cast<size_t>(mat_accel_count * 4);
+        return std::max(HW_ACC_QUEUE_DEPTH,
+                        static_cast<size_t>(mat_accel_count * 4));
     }
 
     size_t vec_acc_queue_cap() const
     {
-        return static_cast<size_t>(vec_accel_count * 4);
+        return std::max(HW_ACC_QUEUE_DEPTH,
+                        static_cast<size_t>(vec_accel_count * 4));
     }
 
     uint64_t local_access_mat_for_thread(int tid) const

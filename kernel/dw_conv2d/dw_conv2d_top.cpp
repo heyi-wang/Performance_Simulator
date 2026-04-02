@@ -19,6 +19,8 @@
 // Communication and synchronisation are consistent with layer_norm_sim.cpp:
 //   nb_transport_fw/bw, TLM_UPDATED/TLM_ACCEPTED, admit_ev back-pressure.
 
+#include "dw_conv2d_top.h"
+
 #include <systemc>
 #include <tlm>
 #include <tlm_utils/simple_initiator_socket.h>
@@ -31,14 +33,8 @@
 #include <algorithm>
 #include <unordered_map>
 
-#include "../src/common.h"
-#include "../src/extensions.h"
-#include "../src/accelerator.h"
-#include "../src/accelerator_pool.h"
-#include "../src/interconnect.h"
-#include "../src/memory.h"
-
-#include "dw_conv2d_config.h"
+#include "common.h"
+#include "extensions.h"
 
 using namespace sc_core;
 using namespace tlm;
@@ -429,60 +425,93 @@ struct DwConvWorker : sc_module
 // mat_acc is created only to satisfy the noc.to_mat binding.
 // No worker ever sends to ADDR_MAT.
 // ============================================================
-struct DwConvTop : sc_module
+DwConvTop::DwConvTop(sc_module_name name)
+    : sc_module(name),
+      mat_acc("mat_acc", DW_ACC_QUEUE_DEPTH),
+      vec_acc("vec_acc",
+              static_cast<size_t>(DW_VEC_ACC_INSTANCES),
+              DW_ACC_QUEUE_DEPTH),
+      noc("noc"),
+      memory("memory",
+             DW_MEM_BASE_LAT,
+             DW_MEM_BW,
+             static_cast<uint64_t>(DW_VEC_ACC_INSTANCES))
 {
-    AcceleratorTLM  mat_acc;   // dummy: bound to satisfy noc.to_mat
-    AcceleratorPool vec_acc;   // actual: pool of DW_VEC_ACC_INSTANCES units
-    Interconnect    noc;
-    Memory          memory;
+    noc.to_mat.bind(mat_acc.tgt);
+    noc.to_vec.bind(vec_acc.tgt);
+    noc.to_mem.bind(memory.tgt);
 
-    std::vector<DwConvWorker *> workers;
+    mat_acc.to_mem.bind(noc.tgt);
+    for (auto &unit : vec_acc.units)
+        unit->to_mem.bind(noc.tgt);
 
-    SC_HAS_PROCESS(DwConvTop);
-
-    DwConvTop(sc_module_name name)
-        : sc_module(name),
-          mat_acc("mat_acc", DW_ACC_QUEUE_DEPTH),
-          vec_acc("vec_acc",
-                  (size_t)DW_VEC_ACC_INSTANCES,
-                  DW_ACC_QUEUE_DEPTH),
-          noc("noc"),
-          memory("memory",
-                 DW_MEM_BASE_LAT,
-                 DW_MEM_BW,
-                 (uint64_t)DW_VEC_ACC_INSTANCES)
+    for (int i = 0; i < DW_NUM_WORKERS; ++i)
     {
-        // Bind accelerators and memory to the interconnect.
-        noc.to_mat.bind(mat_acc.tgt);
-        noc.to_vec.bind(vec_acc.tgt);
-        noc.to_mem.bind(memory.tgt);
+        auto *w = new DwConvWorker(sc_gen_unique_name("dw_worker"),
+                                   i,
+                                   DW_NUM_WORKERS);
+        workers.push_back(w);
+        w->init.bind(noc.tgt);
+    }
+}
 
-        // Accelerators reach memory through the interconnect.
-        mat_acc.to_mem.bind(noc.tgt);
-        for (auto &unit : vec_acc.units)
-            unit->to_mem.bind(noc.tgt);
+DwConvTop::~DwConvTop()
+{
+    for (auto *w : workers)
+        delete w;
+}
 
-        // Create and connect workers.
-        for (int i = 0; i < DW_NUM_WORKERS; ++i)
-        {
-            auto *w = new DwConvWorker(
-                          sc_gen_unique_name("dw_worker"),
-                          i, DW_NUM_WORKERS);
-            workers.push_back(w);
-            w->init.bind(noc.tgt);
-        }
+DwConvSimulationStats DwConvTop::collect_stats() const
+{
+    DwConvSimulationStats stats;
+    const int strips_per_row =
+        static_cast<int>(ceil_div_u64(static_cast<uint64_t>(DW_OUT_W), DW_VEC_ACC_CAP));
+    const uint64_t calls_per_chan =
+        static_cast<uint64_t>(DW_OUT_H) * static_cast<uint64_t>(strips_per_row);
+
+    for (const auto *w : workers)
+    {
+        stats.max_elapsed_cycles =
+            std::max(stats.max_elapsed_cycles, w->elapsed_cycles);
+        stats.total_vec_calls += w->vec_calls;
+        stats.total_rd_bytes += w->total_rd_bytes;
+        stats.total_wr_bytes += w->total_wr_bytes;
+        stats.total_wait_cycles += w->total_wait_cycles;
+        stats.total_mem_cycles += w->total_mem_cycles;
     }
 
-    ~DwConvTop() override
-    {
-        for (auto *w : workers)
-            delete w;
-    }
-};
+    stats.expected_vec_calls = static_cast<uint64_t>(DW_C) * calls_per_chan;
+    stats.vec_acc_reqs = vec_acc.req_count_total();
+    stats.vec_acc_busy_cycles = vec_acc.busy_cycles_total();
+    stats.vec_acc_occupied_cycles = vec_acc.occupied_cycles_total();
+    stats.vec_acc_queue_wait_cycles = vec_acc.queue_wait_cycles_total();
+    stats.memory_reqs = memory.reqs;
+    stats.memory_busy_cycles = memory.busy_cycles;
+    stats.memory_queue_wait_cycles = memory.qwait_cycles;
 
-// ============================================================
-// sc_main — run simulation and print three-section report.
-// ============================================================
+    const double sim_cycles = static_cast<double>(sc_time_stamp() / CYCLE);
+    const double vec_capacity =
+        sim_cycles * static_cast<double>(vec_acc.instance_count());
+    stats.vec_util = (vec_capacity > 0.0)
+        ? static_cast<double>(vec_acc.busy_cycles_total()) / vec_capacity * 100.0
+        : 0.0;
+    stats.vec_occupancy = (vec_capacity > 0.0)
+        ? static_cast<double>(vec_acc.occupied_cycles_total()) / vec_capacity * 100.0
+        : 0.0;
+    stats.mem_bw = (sim_cycles > 0.0)
+        ? static_cast<double>(memory.busy_cycles) *
+              static_cast<double>(DW_MEM_BW) / sim_cycles
+        : 0.0;
+    stats.verification_passed =
+        (stats.total_vec_calls == stats.expected_vec_calls);
+    return stats;
+}
+
+#ifndef KERNEL_STANDALONE_MAIN
+#define KERNEL_STANDALONE_MAIN 1
+#endif
+
+#if KERNEL_STANDALONE_MAIN
 int sc_main(int argc, char *argv[])
 {
     (void)argc;
@@ -659,3 +688,4 @@ int sc_main(int argc, char *argv[])
     std::cout << (pass ? "\nAll checks passed.\n" : "\nSome checks FAILED.\n");
     return pass ? 0 : 2;
 }
+#endif

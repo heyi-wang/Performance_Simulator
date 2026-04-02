@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "../config.h"
+#include "hardware_config.h"
 
 // ============================================================
 // Hardware and tensor configuration for the DwConv2d
@@ -25,18 +25,18 @@ static const uint64_t DW_OUTPUT_ELEM_BYTES = 4;   // int32 accumulator output
 // Input tensor: [C, H, W], channels-first layout.
 // Depth-wise conv applies one kernel per channel (C_in == C_out).
 // ------------------------------------------------------------
-static const int DW_C = static_cast<int>(CONV_C_IN);   // number of channels
-static const int DW_H = static_cast<int>(CONV_H_IN);   // input spatial height
-static const int DW_W = static_cast<int>(CONV_W_IN);   // input spatial width
+static const int DW_C = 64;   // number of channels
+static const int DW_H = 128;  // input spatial height
+static const int DW_W = 128;  // input spatial width
 
 // ------------------------------------------------------------
 // Convolution kernel geometry (parameterised).
 // Default: 3×3 with symmetric padding and stride 1.
 // ------------------------------------------------------------
-static const int DW_KH     = static_cast<int>(CONV_KH);     // kernel height
-static const int DW_KW     = static_cast<int>(CONV_KW);     // kernel width
-static const int DW_PAD    = static_cast<int>(CONV_PAD);    // symmetric zero-padding
-static const int DW_STRIDE = static_cast<int>(CONV_STRIDE); // stride
+static const int DW_KH     = 3; // kernel height
+static const int DW_KW     = 3; // kernel width
+static const int DW_PAD    = 1; // symmetric zero-padding
+static const int DW_STRIDE = 1; // stride
 
 // Output spatial dimensions (derived).
 static const int DW_OUT_H =
@@ -71,8 +71,8 @@ static const uint64_t DW_SCALAR_OVERHEAD = SCALAR_OVERHEAD;   // cycles per disp
 // Shared memory subsystem.
 // Latency model: cycles = DW_MEM_BASE_LAT + ceil(bytes / DW_MEM_BW)
 // ------------------------------------------------------------
-static const uint64_t DW_MEM_BASE_LAT = 1;    // fixed base latency (cycles)
-static const uint64_t DW_MEM_BW       = 256;   // bandwidth: bytes per cycle
+static const uint64_t DW_MEM_BASE_LAT = HW_MEMORY_BASE_LAT;          // fixed base latency (cycles)
+static const uint64_t DW_MEM_BW       = HW_DW_MEMORY_BYTES_PER_CYCLE; // bandwidth: bytes per cycle
 
 // ------------------------------------------------------------
 // Accelerator queue depth.
@@ -80,4 +80,4 @@ static const uint64_t DW_MEM_BW       = 256;   // bandwidth: bytes per cycle
 // serviced).  Workers stall (back-pressure) when this limit is
 // reached.
 // ------------------------------------------------------------
-static const size_t DW_ACC_QUEUE_DEPTH = 32;
+static const size_t DW_ACC_QUEUE_DEPTH = HW_ACC_QUEUE_DEPTH;

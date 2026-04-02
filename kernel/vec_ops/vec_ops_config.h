@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "../config.h"
+#include "hardware_config.h"
 
 // ============================================================
 // Hardware and tensor configuration for the Vector Operations
@@ -76,13 +76,13 @@ static const uint64_t VOP_SCALAR_OVERHEAD = SCALAR_OVERHEAD;
 // Shared memory subsystem.
 // Latency model: cycles = VOP_MEM_BASE_LAT + ceil(bytes / VOP_MEM_BW)
 // ------------------------------------------------------------
-static const uint64_t VOP_MEM_BASE_LAT = 1;
-static const uint64_t VOP_MEM_BW       = 64;
+static const uint64_t VOP_MEM_BASE_LAT = HW_MEMORY_BASE_LAT;
+static const uint64_t VOP_MEM_BW       = HW_MEMORY_BYTES_PER_CYCLE;
 
 // ------------------------------------------------------------
 // Accelerator queue depth.
 // ------------------------------------------------------------
-static const size_t VOP_ACC_QUEUE_DEPTH = 32;
+static const size_t VOP_ACC_QUEUE_DEPTH = HW_ACC_QUEUE_DEPTH;
 
 // ============================================================
 // RVV stripmining shape per operation.

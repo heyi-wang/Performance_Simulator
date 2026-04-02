@@ -1,12 +1,41 @@
 #pragma once
 
-#include "../src/memory.h"
-#include "../src/interconnect.h"
-#include "../src/accelerator_pool.h"
-#include "../src/worker.h"
+#include "memory.h"
+#include "interconnect.h"
+#include "accelerator_pool.h"
+#include "worker.h"
 #include "accum_coordinator.h"
 #include "matmul_config.h"
+#include <iosfwd>
 #include <vector>
+
+struct MatmulSimulationStats
+{
+    uint64_t total_elapsed = 0;
+    uint64_t max_mat_elapsed = 0;
+    uint64_t accum_overhead = 0;
+    uint64_t total_macs = 0;
+    uint64_t mat_req_total = 0;
+    uint64_t vec_req_total = 0;
+    uint64_t mat_busy_total = 0;
+    uint64_t mat_occupied_total = 0;
+    uint64_t mat_qwait_total = 0;
+    uint64_t vec_busy_total = 0;
+    uint64_t vec_occupied_total = 0;
+    uint64_t vec_qwait_total = 0;
+    uint64_t memory_reqs = 0;
+    uint64_t memory_busy_cycles = 0;
+    uint64_t memory_queue_wait_cycles = 0;
+    uint64_t total_worker_stall = 0;
+    uint64_t coordinator_stall = 0;
+    uint64_t coordinator_compute = 0;
+    double gflops = 0.0;
+    double mat_occupancy = 0.0;
+    double mat_compute_util = 0.0;
+    double vec_occupancy = 0.0;
+    double vec_compute_util = 0.0;
+    double mem_bw = 0.0;
+};
 
 // ============================================================
 // MatmulTop — top-level module for the K-split GEMM simulator.
@@ -37,4 +66,7 @@ struct MatmulTop : sc_module
     SC_HAS_PROCESS(MatmulTop);
     MatmulTop(sc_module_name nm, const MatmulConfig &cfg_);
     ~MatmulTop() override;
+
+    MatmulSimulationStats collect_stats() const;
+    void print_report(std::ostream &os) const;
 };

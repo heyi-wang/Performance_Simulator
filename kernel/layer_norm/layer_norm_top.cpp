@@ -11,6 +11,8 @@
 // Communication and synchronisation are consistent with nafnet_sim.cpp:
 //   nb_transport_fw/bw, TLM_UPDATED/TLM_ACCEPTED, admit_ev back-pressure.
 
+#include "layer_norm_top.h"
+
 #include <systemc>
 #include <tlm>
 #include <tlm_utils/simple_initiator_socket.h>
@@ -23,14 +25,8 @@
 #include <algorithm>
 #include <unordered_map>
 
-#include "../src/common.h"
-#include "../src/extensions.h"
-#include "../src/accelerator.h"
-#include "../src/accelerator_pool.h"
-#include "../src/interconnect.h"
-#include "../src/memory.h"
-
-#include "layer_norm_config.h"
+#include "common.h"
+#include "extensions.h"
 
 using namespace sc_core;
 using namespace tlm;
@@ -54,21 +50,6 @@ struct LayerNormExt : tlm_extension<LayerNormExt>
     {
         *this = static_cast<const LayerNormExt &>(other);
     }
-};
-
-// ============================================================
-// LnStepStats — per-step cycle and traffic accumulator.
-// Array index: 0=Step1, 1=Step2, 2=Step3, 3=Step4.
-// ============================================================
-struct LnStepStats
-{
-    uint64_t vec_reqs      = 0;  // number of vec_acc requests issued
-    uint64_t accel_cycles  = 0;  // sum of service cycles requested
-    uint64_t scalar_cycles = 0;  // CPU cycles (Step 3 only)
-    uint64_t wait_cycles   = 0;  // queue-wait + back-pressure stall
-    uint64_t mem_cycles    = 0;  // memory service cycles
-    uint64_t rd_bytes      = 0;  // memory bytes read
-    uint64_t wr_bytes      = 0;  // memory bytes written
 };
 
 // ============================================================
@@ -443,60 +424,96 @@ struct LayerNormWorker : sc_module
 // mat_acc is created only to satisfy the noc.to_mat binding
 // requirement.  No worker ever sends to ADDR_MAT.
 // ============================================================
-struct LayerNormTop : sc_module
+LayerNormTop::LayerNormTop(sc_module_name name)
+    : sc_module(name),
+      mat_acc("mat_acc", LN_ACC_QUEUE_DEPTH),
+      vec_acc("vec_acc",
+              static_cast<size_t>(LN_VEC_ACC_INSTANCES),
+              LN_ACC_QUEUE_DEPTH),
+      noc("noc"),
+      memory("memory",
+             LN_MEM_BASE_LAT,
+             LN_MEM_BW,
+             static_cast<uint64_t>(LN_VEC_ACC_INSTANCES))
 {
-    AcceleratorTLM  mat_acc;   // dummy: bound to satisfy noc.to_mat
-    AcceleratorPool vec_acc;   // actual: pool of LN_VEC_ACC_INSTANCES units
-    Interconnect    noc;
-    Memory          memory;
+    noc.to_mat.bind(mat_acc.tgt);
+    noc.to_vec.bind(vec_acc.tgt);
+    noc.to_mem.bind(memory.tgt);
 
-    std::vector<LayerNormWorker *> workers;
+    mat_acc.to_mem.bind(noc.tgt);
+    for (auto &unit : vec_acc.units)
+        unit->to_mem.bind(noc.tgt);
 
-    SC_HAS_PROCESS(LayerNormTop);
-
-    LayerNormTop(sc_module_name name)
-        : sc_module(name),
-          mat_acc("mat_acc", LN_ACC_QUEUE_DEPTH),
-          vec_acc("vec_acc",
-                  (size_t)LN_VEC_ACC_INSTANCES,
-                  LN_ACC_QUEUE_DEPTH),
-          noc("noc"),
-          memory("memory",
-                 LN_MEM_BASE_LAT,
-                 LN_MEM_BW,
-                 (uint64_t)LN_VEC_ACC_INSTANCES)
+    for (int i = 0; i < LN_NUM_WORKERS; ++i)
     {
-        // Bind accelerators and memory to the interconnect.
-        noc.to_mat.bind(mat_acc.tgt);
-        noc.to_vec.bind(vec_acc.tgt);
-        noc.to_mem.bind(memory.tgt);
+        auto *w = new LayerNormWorker(sc_gen_unique_name("ln_worker"),
+                                      i,
+                                      LN_NUM_WORKERS);
+        workers.push_back(w);
+        w->init.bind(noc.tgt);
+    }
+}
 
-        // Accelerators reach memory through the interconnect.
-        mat_acc.to_mem.bind(noc.tgt);
-        for (auto &unit : vec_acc.units)
-            unit->to_mem.bind(noc.tgt);
+LayerNormTop::~LayerNormTop()
+{
+    for (auto *w : workers)
+        delete w;
+}
 
-        // Create and connect workers.
-        for (int i = 0; i < LN_NUM_WORKERS; ++i)
+LayerNormSimulationStats LayerNormTop::collect_stats() const
+{
+    LayerNormSimulationStats stats;
+
+    for (const auto *w : workers)
+    {
+        for (int s = 0; s < 4; ++s)
         {
-            auto *w = new LayerNormWorker(
-                          sc_gen_unique_name("ln_worker"),
-                          i, LN_NUM_WORKERS);
-            workers.push_back(w);
-            w->init.bind(noc.tgt);
+            stats.steps[s].vec_reqs += w->step_stats[s].vec_reqs;
+            stats.steps[s].accel_cycles += w->step_stats[s].accel_cycles;
+            stats.steps[s].scalar_cycles += w->step_stats[s].scalar_cycles;
+            stats.steps[s].wait_cycles += w->step_stats[s].wait_cycles;
+            stats.steps[s].mem_cycles += w->step_stats[s].mem_cycles;
+            stats.steps[s].rd_bytes += w->step_stats[s].rd_bytes;
+            stats.steps[s].wr_bytes += w->step_stats[s].wr_bytes;
         }
+
+        stats.max_elapsed_cycles =
+            std::max(stats.max_elapsed_cycles, w->elapsed_cycles);
     }
 
-    ~LayerNormTop() override
+    for (int s = 0; s < 4; ++s)
     {
-        for (auto *w : workers)
-            delete w;
+        stats.total_vec_reqs += stats.steps[s].vec_reqs;
+        stats.total_rd_bytes += stats.steps[s].rd_bytes;
+        stats.total_wr_bytes += stats.steps[s].wr_bytes;
     }
-};
 
-// ============================================================
-// sc_main — run simulation and print three-section report.
-// ============================================================
+    const int spatial = LN_H * LN_W;
+    const int n_tiles =
+        static_cast<int>(ceil_div_u64(static_cast<uint64_t>(spatial), LN_VEC_ACC_CAP));
+    stats.expected_vec_reqs = static_cast<uint64_t>(LN_C) * 3 * static_cast<uint64_t>(n_tiles);
+    stats.vec_acc_reqs = vec_acc.req_count_total();
+    stats.vec_acc_busy_cycles = vec_acc.busy_cycles_total();
+    stats.vec_acc_queue_wait_cycles = vec_acc.queue_wait_cycles_total();
+    stats.memory_reqs = memory.reqs;
+    stats.memory_busy_cycles = memory.busy_cycles;
+    stats.memory_queue_wait_cycles = memory.qwait_cycles;
+
+    const double sim_cycles = static_cast<double>(sc_time_stamp() / CYCLE);
+    const double vec_capacity =
+        sim_cycles * static_cast<double>(vec_acc.instance_count());
+    stats.vec_util = (vec_capacity > 0.0)
+        ? static_cast<double>(vec_acc.busy_cycles_total()) / vec_capacity * 100.0
+        : 0.0;
+    stats.verification_passed = (stats.total_vec_reqs == stats.expected_vec_reqs);
+    return stats;
+}
+
+#ifndef KERNEL_STANDALONE_MAIN
+#define KERNEL_STANDALONE_MAIN 1
+#endif
+
+#if KERNEL_STANDALONE_MAIN
 int sc_main(int argc, char *argv[])
 {
     (void)argc;
@@ -671,3 +688,4 @@ int sc_main(int argc, char *argv[])
 
     return 0;
 }
+#endif

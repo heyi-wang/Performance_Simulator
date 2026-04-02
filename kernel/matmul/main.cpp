@@ -22,7 +22,7 @@ static bool check(bool cond, const char *desc)
 
 static bool parse_args(int argc, char *argv[], int &thread_count)
 {
-    thread_count = NUM_THREADS;
+    thread_count = MatmulConfig::default_thread_count;
 
     for (int i = 1; i < argc; i++)
     {
@@ -74,7 +74,7 @@ static bool parse_args(int argc, char *argv[], int &thread_count)
 // ============================================================
 int sc_main(int argc, char *argv[])
 {
-    int thread_count = NUM_THREADS;
+    int thread_count = MatmulConfig::default_thread_count;
     if (!parse_args(argc, argv, thread_count))
         return (argc > 1) ? 1 : 0;
 
@@ -110,7 +110,7 @@ int sc_main(int argc, char *argv[])
     std::cout << "vec_acc queue    : " << cfg.vec_acc_queue_cap()
               << " shared slots across " << cfg.vec_accel_count << " units";
     if (cfg.vec_acc_queue_cap() < static_cast<size_t>(cfg.thread_count))
-        std::cout << "  (< NUM_THREADS → backpressure expected during reduction/final quant)";
+        std::cout << "  (< active thread count → backpressure expected during reduction/final quant)";
     std::cout << "\n\n";
 
     sc_start();
@@ -237,7 +237,8 @@ int sc_main(int argc, char *argv[])
                                   : 0.0;
 
     double mem_bw = (total_elapsed > 0)
-                        ? static_cast<double>(top.memory.busy_cycles) * 32.0
+                        ? static_cast<double>(top.memory.busy_cycles) *
+                              static_cast<double>(HW_MATMUL_MEMORY_BYTES_PER_CYCLE)
                               / static_cast<double>(total_elapsed)
                         : 0.0;
 

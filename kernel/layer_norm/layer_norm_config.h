@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "config.h"
+#include "hardware_config.h"
 // ============================================================
 // Hardware and tensor configuration for the LayerNorm2d
 // TLM performance simulator (int16, NAFNet).
@@ -50,12 +50,12 @@ static const uint64_t LN_STEP3_CYCLES = 16;   // approx cycles for isqrt + divid
 // Shared memory subsystem.
 // Latency model: cycles = LN_MEM_BASE_LAT + ceil(bytes / LN_MEM_BW)
 // ------------------------------------------------------------
-static const uint64_t LN_MEM_BASE_LAT = 1;   // fixed base latency (cycles)
-static const uint64_t LN_MEM_BW       = 64;   // bandwidth: bytes per cycle
+static const uint64_t LN_MEM_BASE_LAT = HW_MEMORY_BASE_LAT;      // fixed base latency (cycles)
+static const uint64_t LN_MEM_BW       = HW_MEMORY_BYTES_PER_CYCLE; // bandwidth: bytes per cycle
 
 // ------------------------------------------------------------
 // Accelerator queue depth.
 // Maximum number of admitted requests (including the one being
 // serviced).  Workers stall when this limit is reached.
 // ------------------------------------------------------------
-static const size_t LN_ACC_QUEUE_DEPTH = 32;
+static const size_t LN_ACC_QUEUE_DEPTH = HW_ACC_QUEUE_DEPTH;

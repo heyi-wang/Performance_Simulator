@@ -1,5 +1,5 @@
 #include "accum_coordinator.h"
-#include "../src/interconnect.h"
+#include "interconnect.h"
 #include <algorithm>
 #include <iostream>
 

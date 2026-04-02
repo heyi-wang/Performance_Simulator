@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "../config.h"
+#include "hardware_config.h"
 
 // ============================================================
 // Hardware and tensor configuration for the Global Average
@@ -69,8 +69,8 @@ static const uint64_t POOL_DIVIDE_CYCLES = 4;   // approx cycles for integer div
 // Shared memory subsystem.
 // Latency model: cycles = POOL_MEM_BASE_LAT + ceil(bytes / POOL_MEM_BW)
 // ------------------------------------------------------------
-static const uint64_t POOL_MEM_BASE_LAT = 1;    // fixed base latency (cycles)
-static const uint64_t POOL_MEM_BW       = 64;   // bandwidth: bytes per cycle
+static const uint64_t POOL_MEM_BASE_LAT = HW_MEMORY_BASE_LAT;      // fixed base latency (cycles)
+static const uint64_t POOL_MEM_BW       = HW_MEMORY_BYTES_PER_CYCLE; // bandwidth: bytes per cycle
 
 // ------------------------------------------------------------
 // Accelerator queue depth.
@@ -78,4 +78,4 @@ static const uint64_t POOL_MEM_BW       = 64;   // bandwidth: bytes per cycle
 // serviced).  Workers stall (back-pressure) when this limit is
 // reached.
 // ------------------------------------------------------------
-static const size_t POOL_ACC_QUEUE_DEPTH = 32;
+static const size_t POOL_ACC_QUEUE_DEPTH = HW_ACC_QUEUE_DEPTH;

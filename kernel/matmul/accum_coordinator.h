@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../src/worker.h"
+#include "worker.h"
 #include <deque>
 #include <limits>
 #include <memory>

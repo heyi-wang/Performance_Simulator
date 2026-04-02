@@ -1,33 +1,37 @@
-// vec_ops_sim.cpp
-// SystemC TLM-2.0 performance simulator for element-wise vector operations
-// in NAFNet, as defined in kernel/vector_ops.h.
+// pooling_sim.cpp
+// SystemC TLM-2.0 performance simulator for Global Average Pooling in NAFNet.
 //
-// Supported operations (selected via VOP_SELECTED_OP in vec_ops_config.h):
-//   ELEMWISE_ADD        mf_elemwise_add_i8        rd = 2*vl*elem  wr = vl*elem
-//   ELEMWISE_MUL        mf_elemwise_mul_i8        rd = 2*vl*elem  wr = vl*elem
-//   SCALAR_MUL          mf_elemwise_mul_scalar_i8  rd = vl*elem   wr = vl*elem
-//   QUANTIZE_I32_TO_I8  mf_quantize_i32_to_i8     rd = vl*4      wr = vl*1
-//   DEQUANTIZE_I8_TO_I32 mf_dequantize_i8_to_i32  rd = vl*1      wr = vl*4
-//   BIAS_ADD_I32        mf_bias_add_i32           rd = vl*4      wr = vl*4
+// Maps mf_global_avgpool_i16 (kernel/pooling.h) to the shared src/ hardware.
 //
-// All operations share the same RVV stripmining loop structure:
-//   for each channel c in [0, C):
-//     for each tile t in [0, n_tiles):
-//       vl = min(VEC_ACC_CAP, spatial - t * VEC_ACC_CAP)
-//       load input(s), compute, store output
+// Algorithm (from pooling.h, int16 path):
+//   for c in [0, C):
+//     total_sum = 0
+//     for tile in [0, n_tiles):     // n_tiles = ceil(H*W / VEC_ACC_CAP)
+//       vl = min(VEC_ACC_CAP, spatial - tile*VEC_ACC_CAP)
+//       vle16(p, vl)                // unit-stride vector load: vl int16 elements
+//       vwmul + vredsum              // widen to int32, reduce-sum
+//       total_sum += scalar extract
+//     output[c] = total_sum / spatial   // scalar divide + scalar store
 //
 // Memory traffic model
 // --------------------
-// READ  per tile : vop_rd_bytes(op, vl)  — depends on operation type
-// WRITE per tile : vop_wr_bytes(op, vl)  — depends on operation type
+// READ  per tile : vl * POOL_INPUT_ELEM_BYTES
+//   Mirrors the single vle16_v_i16m4 load per RVV iteration.
+//   All spatial elements of the channel are read exactly once.
 //
-// Unlike pooling_sim, all read AND write traffic flows through vec_acc.
-// There is no scalar post-processing step and no direct memory writes.
+// WRITE per channel : POOL_OUTPUT_ELEM_BYTES (4 bytes, one int32)
+//   The final "output[c] = total_sum / spatial" is a scalar store
+//   that happens after all tiles. It is modelled as:
+//     (a) a scalar CPU stall of POOL_DIVIDE_CYCLES for the integer divide, and
+//     (b) a direct memory write request that bypasses vec_acc and
+//         contributes to memory timing and bandwidth statistics.
 //
 // Workers are partitioned by channel: worker tid owns [c_start, c_end).
-// Communication and synchronisation are consistent with pooling_sim.cpp:
+// Communication and synchronisation are consistent with dw_conv2d_sim.cpp:
 //   nb_transport_fw/bw, TLM_UPDATED/TLM_ACCEPTED, admit_ev back-pressure,
 //   fire-then-drain per-channel pattern.
+
+#include "pooling_top.h"
 
 #include <systemc>
 #include <tlm>
@@ -41,72 +45,73 @@
 #include <algorithm>
 #include <unordered_map>
 
-#include "../src/common.h"
-#include "../src/extensions.h"
-#include "../src/accelerator.h"
-#include "../src/accelerator_pool.h"
-#include "../src/interconnect.h"
-#include "../src/memory.h"
-
-#include "vec_ops_config.h"
+#include "common.h"
+#include "extensions.h"
 
 using namespace sc_core;
 using namespace tlm;
 
 // ============================================================
-// VecOpsExt — TLM extension carrying vector-op request metadata.
+// PoolExt — TLM extension carrying GAP request metadata.
 // Attached alongside ReqExt and TxnExt on each transaction.
 // AcceleratorTLM / Interconnect / Memory do not inspect this.
 // ============================================================
-struct VecOpsExt : tlm_extension<VecOpsExt>
+struct PoolExt : tlm_extension<PoolExt>
 {
-    VopType op_type   = VOP_SELECTED_OP;
-    int     channel_id = -1;
-    int     tile_idx   =  0;
+    int channel_id = -1;  // channel this tile belongs to
+    int tile_idx   =  0;  // tile index within the channel
 
     tlm_extension_base *clone() const override
     {
-        return new VecOpsExt(*this);
+        return new PoolExt(*this);
     }
 
     void copy_from(const tlm_extension_base &other) override
     {
-        *this = static_cast<const VecOpsExt &>(other);
+        *this = static_cast<const PoolExt &>(other);
     }
 };
 
 // ============================================================
-// VecOpsWorker — per-thread task generator.
+// PoolWorker — per-thread task generator.
 //
 // Channel assignment:
-//   c_start = (tid   * VOP_C) / n_workers
-//   c_end   = ((tid+1) * VOP_C) / n_workers
+//   c_start = (tid   * POOL_C) / n_workers
+//   c_end   = ((tid+1) * POOL_C) / n_workers
 //
 // For every assigned channel the worker:
-//   1. Fire phase  — issues all n_tiles vec_acc requests, each
-//      carrying rd and wr bytes according to the selected op.
+//   1. Fire phase  — issues all n_tiles reduction requests in order,
+//      interleaving a scalar dispatch overhead between submissions.
 //   2. Drain phase — collects all responses for the channel.
-//
-// No scalar post-processing (unlike pooling_sim which has a
-// divide + direct memory write step).
+//   3. Scalar step — stalls POOL_DIVIDE_CYCLES for the integer divide
+//      then issues a direct memory write of POOL_OUTPUT_ELEM_BYTES.
 // ============================================================
-struct VecOpsWorker : sc_module
+struct PoolWorker : sc_module
 {
-    tlm_utils::simple_initiator_socket<VecOpsWorker> init;
+    tlm_utils::simple_initiator_socket<PoolWorker>   init;
     tlm_utils::peq_with_get<tlm_generic_payload>     peq;
 
     int tid;
     int n_workers;
 
     // Statistics
-    uint64_t vec_calls           = 0;
-    uint64_t total_scalar_cycles = 0;
-    uint64_t total_wait_cycles   = 0;
-    uint64_t total_mem_cycles    = 0;
-    uint64_t total_rd_bytes      = 0;
-    uint64_t total_wr_bytes      = 0;
-    uint64_t elapsed_cycles      = 0;
+    uint64_t vec_calls             = 0;   // total vec_acc requests issued
+    uint64_t total_scalar_cycles   = 0;   // dispatch scalar overhead
+    uint64_t total_divide_cycles   = 0;   // integer divide stall (one per channel)
+    uint64_t total_wait_cycles     = 0;   // queue-wait + back-pressure stall
+    uint64_t total_mem_cycles      = 0;   // memory service cycles
+    uint64_t total_rd_bytes        = 0;   // total input bytes read via vec_acc
+    uint64_t total_wr_bytes        = 0;   // total output bytes written (scalar)
+    uint64_t elapsed_cycles        = 0;   // wall-clock cycles start→finish
 
+    // ----------------------------------------------------------
+    // Per-request synchronisation bookkeeping.
+    //   ev:       notified when AcceleratorTLM sends BEGIN_RESP.
+    //   admit_ev: notified when AcceleratorTLM sends deferred
+    //             END_REQ (back-pressure: queue slot granted).
+    //   fired:    set true before notifying ev so issue_end can
+    //             skip wait() if the response already arrived.
+    // ----------------------------------------------------------
     struct DoneEntry
     {
         sc_event *ev       = nullptr;
@@ -116,30 +121,31 @@ struct VecOpsWorker : sc_module
 
     std::unordered_map<tlm_generic_payload *, DoneEntry *> done_map;
 
+    // Handle returned by issue_begin; consumed by issue_end.
     struct PendingReq
     {
-        tlm_generic_payload *gp         = nullptr;
-        ReqExt              *req_ext    = nullptr;
-        TxnExt              *tx_ext     = nullptr;
-        VecOpsExt           *vop_ext    = nullptr;
-        DoneEntry           *done_entry = nullptr;
-        uint64_t             svc_cyc    = 0;
+        tlm_generic_payload *gp           = nullptr;
+        ReqExt              *req_ext      = nullptr;
+        TxnExt              *tx_ext       = nullptr;
+        PoolExt             *pool_ext     = nullptr;
+        DoneEntry           *done_entry   = nullptr;
+        uint64_t             svc_cyc      = 0;
         uint64_t             stall_cycles = 0;
-        sc_time              submit_time = SC_ZERO_TIME;
-        bool                 direct_mem = false;
-        bool                 sync_done  = false;
+        bool                 sync_done    = false;
+        bool                 direct_mem   = false;
+        sc_time              submit_time  = SC_ZERO_TIME;
     };
 
-    SC_HAS_PROCESS(VecOpsWorker);
+    SC_HAS_PROCESS(PoolWorker);
 
-    VecOpsWorker(sc_module_name name, int tid_, int n_workers_)
+    PoolWorker(sc_module_name name, int tid_, int n_workers_)
         : sc_module(name),
           init("init"),
           peq("peq"),
           tid(tid_),
           n_workers(n_workers_)
     {
-        init.register_nb_transport_bw(this, &VecOpsWorker::nb_transport_bw);
+        init.register_nb_transport_bw(this, &PoolWorker::nb_transport_bw);
         SC_THREAD(peq_thread);
         SC_THREAD(run);
     }
@@ -158,6 +164,7 @@ struct VecOpsWorker : sc_module
         }
         if (phase == END_REQ)
         {
+            // Deferred admission: queue was full; accelerator grants a slot.
             auto it = done_map.find(&gp);
             if (it != done_map.end() && it->second && it->second->admit_ev)
                 it->second->admit_ev->notify(SC_ZERO_TIME);
@@ -168,6 +175,8 @@ struct VecOpsWorker : sc_module
 
     // ----------------------------------------------------------
     // peq_thread: wake up done events when responses arrive.
+    // Sets fired=true before notifying so issue_end can detect
+    // a response that arrived before wait() was called.
     // ----------------------------------------------------------
     void peq_thread()
     {
@@ -186,6 +195,9 @@ struct VecOpsWorker : sc_module
         }
     }
 
+    // ----------------------------------------------------------
+    // do_scalar: model per-tile scalar dispatch overhead.
+    // ----------------------------------------------------------
     void do_scalar(uint64_t cyc)
     {
         total_scalar_cycles += cyc;
@@ -194,6 +206,8 @@ struct VecOpsWorker : sc_module
 
     // ----------------------------------------------------------
     // issue_begin: fire one non-blocking vec_acc request.
+    // Blocks only when the accelerator queue is full (TLM_ACCEPTED),
+    // waiting on admit_ev until a slot is granted.
     // ----------------------------------------------------------
     PendingReq issue_begin(uint64_t addr,
                            uint64_t svc_cyc,
@@ -213,23 +227,22 @@ struct VecOpsWorker : sc_module
         gp->set_streaming_width(0);
         gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
 
-        auto *req = new ReqExt(tid, svc_cyc, rd, wr);
-        auto *tx  = new TxnExt();
+        auto *req  = new ReqExt(tid, svc_cyc, rd, wr);
+        auto *tx   = new TxnExt();
         tx->src_worker = tid;
 
-        auto *vop = new VecOpsExt();
-        vop->op_type    = VOP_SELECTED_OP;
-        vop->channel_id = channel_id;
-        vop->tile_idx   = tile_idx;
+        auto *pool = new PoolExt();
+        pool->channel_id = channel_id;
+        pool->tile_idx   = tile_idx;
 
         gp->set_extension(req);
         gp->set_extension(tx);
-        gp->set_extension(vop);
+        gp->set_extension(pool);
 
         p.gp         = gp;
         p.req_ext    = req;
         p.tx_ext     = tx;
-        p.vop_ext    = vop;
+        p.pool_ext   = pool;
         p.done_entry = new DoneEntry();
         p.done_entry->ev       = new sc_event();
         p.done_entry->admit_ev = new sc_event();
@@ -243,6 +256,7 @@ struct VecOpsWorker : sc_module
 
         if (status == TLM_ACCEPTED)
         {
+            // Queue was full: stall until accelerator grants a slot.
             sc_time t_stall_start = sc_time_stamp();
             wait(*p.done_entry->admit_ev);
             p.stall_cycles =
@@ -257,17 +271,17 @@ struct VecOpsWorker : sc_module
     }
 
     // ----------------------------------------------------------
-    // issue_mem_read: fire one direct memory read request.
-    // Used for scalar-side accesses that happen outside the vector
-    // stripmining loop, such as mf_bias_add_i32 loading bias[c].
+    // issue_mem_write: fire one direct memory write request.
+    // Used for the final scalar output[c] store so it contributes
+    // to memory timing without occupying vec_acc.
     // ----------------------------------------------------------
-    PendingReq issue_mem_read(uint64_t bytes, int channel_id)
+    PendingReq issue_mem_write(uint64_t bytes, int channel_id)
     {
         PendingReq p;
         p.direct_mem = true;
 
         auto *gp = new tlm_generic_payload();
-        gp->set_command(TLM_READ_COMMAND);
+        gp->set_command(TLM_WRITE_COMMAND);
         gp->set_address(Interconnect::ADDR_MEM);
         gp->set_data_ptr(nullptr);
         gp->set_data_length((unsigned)bytes);
@@ -277,17 +291,16 @@ struct VecOpsWorker : sc_module
         auto *tx = new TxnExt();
         tx->src_worker = tid;
 
-        auto *vop = new VecOpsExt();
-        vop->op_type    = VOP_SELECTED_OP;
-        vop->channel_id = channel_id;
-        vop->tile_idx   = -1;
+        auto *pool = new PoolExt();
+        pool->channel_id = channel_id;
+        pool->tile_idx   = -1;
 
         gp->set_extension(tx);
-        gp->set_extension(vop);
+        gp->set_extension(pool);
 
         p.gp         = gp;
         p.tx_ext     = tx;
-        p.vop_ext    = vop;
+        p.pool_ext   = pool;
         p.done_entry = new DoneEntry();
         p.done_entry->ev       = new sc_event();
         p.done_entry->admit_ev = new sc_event();
@@ -321,6 +334,7 @@ struct VecOpsWorker : sc_module
         delete p.done_entry;
         p.done_entry = nullptr;
 
+        // Read back timing fields filled in by AcceleratorTLM.
         ReqExt *ext = nullptr;
         p.gp->get_extension(ext);
         uint64_t qwait = ext ? ext->accel_qwait_cycles : 0;
@@ -337,16 +351,18 @@ struct VecOpsWorker : sc_module
             total_mem_cycles  += mec;
         }
 
+        // Acknowledge response back to the interconnect.
         tlm_phase end_phase = END_RESP;
         sc_time   end_delay = SC_ZERO_TIME;
         init->nb_transport_fw(*p.gp, end_phase, end_delay);
 
+        // Release all extensions and the payload.
         p.gp->clear_extension(p.req_ext);
         p.gp->clear_extension(p.tx_ext);
-        p.gp->clear_extension(p.vop_ext);
+        p.gp->clear_extension(p.pool_ext);
         delete p.req_ext;  p.req_ext  = nullptr;
         delete p.tx_ext;   p.tx_ext   = nullptr;
-        delete p.vop_ext;  p.vop_ext  = nullptr;
+        delete p.pool_ext; p.pool_ext = nullptr;
         delete p.gp;       p.gp       = nullptr;
     }
 
@@ -354,60 +370,78 @@ struct VecOpsWorker : sc_module
     // run: main worker thread — process assigned channel slice.
     //
     // For each channel:
-    //   Fire phase : issue all tiles with rd/wr per the selected op
+    //   Fire phase : issue all reduction tiles (rd = vl * input_bytes, wr = 0)
     //   Drain phase: collect all responses
+    //   Scalar step: stall POOL_DIVIDE_CYCLES for integer divide,
+    //                then issue one direct memory write for output[c]
+    //
+    // The scalar store bypasses vec_acc but is still issued through the
+    // Memory module so the final output traffic affects timing and BW.
     // ----------------------------------------------------------
     void run()
     {
         sc_time t_start = sc_time_stamp();
 
-        const int      spatial   = VOP_H * VOP_W;
-        const uint64_t tile_cap  = vop_tile_cap_elems(VOP_SELECTED_OP);
-        const uint64_t extra_rd  = vop_extra_rd_bytes_per_channel(VOP_SELECTED_OP);
-        const int      n_tiles   =
-            (int)ceil_div_u64((uint64_t)spatial, tile_cap);
+        const int      spatial = POOL_H * POOL_W;
+        const int      n_tiles = (int)ceil_div_u64((uint64_t)spatial,
+                                                    POOL_VEC_ACC_CAP);
 
-        int c_start = (tid       * VOP_C) / n_workers;
-        int c_end   = ((tid + 1) * VOP_C) / n_workers;
+        // Channel range for this worker.
+        int c_start = (tid       * POOL_C) / n_workers;
+        int c_end   = ((tid + 1) * POOL_C) / n_workers;
 
         for (int c = c_start; c < c_end; ++c)
         {
-            if (extra_rd != 0)
-            {
-                auto bias_rd = issue_mem_read(extra_rd, c);
-                total_rd_bytes += extra_rd;
-                issue_end(bias_rd);
-            }
-
-            // Fire phase
+            // ------------------------------------------------
+            // Fire phase: issue all reduction tiles.
+            // Each tile reduces vl input elements to a partial
+            // sum that stays in the vector register file.
+            // ------------------------------------------------
             std::vector<PendingReq> pending;
             pending.reserve((size_t)n_tiles);
 
             for (int t = 0; t < n_tiles; ++t)
             {
                 const uint64_t tile_elems =
-                    std::min<uint64_t>(tile_cap,
+                    std::min<uint64_t>(POOL_VEC_ACC_CAP,
                                        (uint64_t)spatial -
-                                       (uint64_t)t * tile_cap);
+                                       (uint64_t)t * POOL_VEC_ACC_CAP);
 
-                uint64_t rd = vop_rd_bytes(VOP_SELECTED_OP, tile_elems);
-                uint64_t wr = vop_wr_bytes(VOP_SELECTED_OP, tile_elems);
+                // READ: vl int16 elements from input[c, tile_start : tile_end]
+                // WRITE: 0 — partial sums are held in vector registers;
+                //        the final int32 output is written in the scalar step.
+                uint64_t rd = tile_elems * POOL_INPUT_ELEM_BYTES;
+                uint64_t wr = 0;
 
                 auto pm = issue_begin(Interconnect::ADDR_VEC,
-                                      VOP_VEC_ACC_CYCLE,
+                                      POOL_VEC_ACC_CYCLE,
                                       rd, wr,
                                       c, t);
                 ++vec_calls;
                 total_rd_bytes += rd;
-                total_wr_bytes += wr;
 
-                do_scalar(VOP_SCALAR_OVERHEAD);
+                do_scalar(POOL_SCALAR_OVERHEAD);
                 pending.push_back(std::move(pm));
             }
 
-            // Drain phase
+            // ------------------------------------------------
+            // Drain phase: collect all responses for this channel.
+            // ------------------------------------------------
             for (auto &pm : pending)
                 issue_end(pm);
+
+            // ------------------------------------------------
+            // Scalar post-processing:
+            //   output[c] = (int32_t)(total_sum / spatial)
+            //
+            // Models the integer divide latency, then routes the
+            // 4-byte scalar store through Memory without using vec_acc.
+            // ------------------------------------------------
+            total_divide_cycles += POOL_DIVIDE_CYCLES;
+            wait(POOL_DIVIDE_CYCLES * CYCLE);
+            auto store_req = issue_mem_write(POOL_OUTPUT_ELEM_BYTES, c);
+            issue_end(store_req);
+            total_wr_bytes += POOL_OUTPUT_ELEM_BYTES;
         }
 
         elapsed_cycles =
@@ -416,140 +450,160 @@ struct VecOpsWorker : sc_module
 };
 
 // ============================================================
-// VecOpsTop — instantiates and wires the full simulator.
+// PoolTop — instantiates and wires the full simulator.
 //
 // Topology:
-//   workers[0..N-1]  --> noc --> vec_acc --> memory
-//                             \-> mat_acc (dummy, never used)
+//   workers[0..N-1]  ──► noc ──► vec_acc ──► memory
+//                             └──► mat_acc (dummy, never used)
+//
+// mat_acc is created only to satisfy the noc.to_mat binding.
+// No worker ever sends to ADDR_MAT.
 // ============================================================
-struct VecOpsTop : sc_module
+PoolTop::PoolTop(sc_module_name name)
+    : sc_module(name),
+      mat_acc("mat_acc", POOL_ACC_QUEUE_DEPTH),
+      vec_acc("vec_acc",
+              static_cast<size_t>(POOL_VEC_ACC_INSTANCES),
+              POOL_ACC_QUEUE_DEPTH),
+      noc("noc"),
+      memory("memory",
+             POOL_MEM_BASE_LAT,
+             POOL_MEM_BW,
+             static_cast<uint64_t>(POOL_VEC_ACC_INSTANCES))
 {
-    AcceleratorTLM  mat_acc;
-    AcceleratorPool vec_acc;
-    Interconnect    noc;
-    Memory          memory;
+    noc.to_mat.bind(mat_acc.tgt);
+    noc.to_vec.bind(vec_acc.tgt);
+    noc.to_mem.bind(memory.tgt);
 
-    std::vector<VecOpsWorker *> workers;
+    mat_acc.to_mem.bind(noc.tgt);
+    for (auto &unit : vec_acc.units)
+        unit->to_mem.bind(noc.tgt);
 
-    SC_HAS_PROCESS(VecOpsTop);
-
-    VecOpsTop(sc_module_name name)
-        : sc_module(name),
-          mat_acc("mat_acc", VOP_ACC_QUEUE_DEPTH),
-          vec_acc("vec_acc",
-                  (size_t)VOP_VEC_ACC_INSTANCES,
-                  VOP_ACC_QUEUE_DEPTH),
-          noc("noc"),
-          memory("memory",
-                 VOP_MEM_BASE_LAT,
-                 VOP_MEM_BW,
-                 (uint64_t)VOP_VEC_ACC_INSTANCES)
+    for (int i = 0; i < POOL_NUM_WORKERS; ++i)
     {
-        noc.to_mat.bind(mat_acc.tgt);
-        noc.to_vec.bind(vec_acc.tgt);
-        noc.to_mem.bind(memory.tgt);
+        auto *w = new PoolWorker(sc_gen_unique_name("pool_worker"),
+                                 i,
+                                 POOL_NUM_WORKERS);
+        workers.push_back(w);
+        w->init.bind(noc.tgt);
+    }
+}
 
-        mat_acc.to_mem.bind(noc.tgt);
-        for (auto &unit : vec_acc.units)
-            unit->to_mem.bind(noc.tgt);
+PoolTop::~PoolTop()
+{
+    for (auto *w : workers)
+        delete w;
+}
 
-        for (int i = 0; i < VOP_NUM_WORKERS; ++i)
-        {
-            auto *w = new VecOpsWorker(
-                          sc_gen_unique_name("vec_ops_worker"),
-                          i, VOP_NUM_WORKERS);
-            workers.push_back(w);
-            w->init.bind(noc.tgt);
-        }
+PoolSimulationStats PoolTop::collect_stats() const
+{
+    PoolSimulationStats stats;
+    const int spatial = POOL_H * POOL_W;
+    const int n_tiles =
+        static_cast<int>(ceil_div_u64(static_cast<uint64_t>(spatial), POOL_VEC_ACC_CAP));
+
+    for (const auto *w : workers)
+    {
+        stats.max_elapsed_cycles =
+            std::max(stats.max_elapsed_cycles, w->elapsed_cycles);
+        stats.total_vec_calls += w->vec_calls;
+        stats.total_rd_bytes += w->total_rd_bytes;
+        stats.total_wr_bytes += w->total_wr_bytes;
+        stats.total_wait_cycles += w->total_wait_cycles;
+        stats.total_mem_cycles += w->total_mem_cycles;
     }
 
-    ~VecOpsTop() override
-    {
-        for (auto *w : workers)
-            delete w;
-    }
-};
+    stats.expected_vec_calls = static_cast<uint64_t>(POOL_C) * static_cast<uint64_t>(n_tiles);
+    stats.expected_rd_bytes =
+        static_cast<uint64_t>(POOL_C) * static_cast<uint64_t>(spatial) *
+        POOL_INPUT_ELEM_BYTES;
+    stats.expected_wr_bytes = static_cast<uint64_t>(POOL_C) * POOL_OUTPUT_ELEM_BYTES;
+    stats.vec_acc_reqs = vec_acc.req_count_total();
+    stats.vec_acc_busy_cycles = vec_acc.busy_cycles_total();
+    stats.vec_acc_occupied_cycles = vec_acc.occupied_cycles_total();
+    stats.vec_acc_queue_wait_cycles = vec_acc.queue_wait_cycles_total();
+    stats.memory_reqs = memory.reqs;
+    stats.memory_busy_cycles = memory.busy_cycles;
+    stats.memory_queue_wait_cycles = memory.qwait_cycles;
 
-// ============================================================
-// sc_main — run simulation and print three-section report.
-// ============================================================
+    const double sim_cycles = static_cast<double>(sc_time_stamp() / CYCLE);
+    const double vec_capacity =
+        sim_cycles * static_cast<double>(vec_acc.instance_count());
+    stats.vec_util = (vec_capacity > 0.0)
+        ? static_cast<double>(vec_acc.busy_cycles_total()) / vec_capacity * 100.0
+        : 0.0;
+    stats.vec_occupancy = (vec_capacity > 0.0)
+        ? static_cast<double>(vec_acc.occupied_cycles_total()) / vec_capacity * 100.0
+        : 0.0;
+    const uint64_t total_mem_bytes = stats.total_rd_bytes + stats.total_wr_bytes;
+    stats.mem_bw = (sim_cycles > 0.0)
+        ? static_cast<double>(total_mem_bytes) / sim_cycles
+        : 0.0;
+    stats.verification_passed =
+        stats.total_vec_calls == stats.expected_vec_calls &&
+        stats.total_rd_bytes == stats.expected_rd_bytes &&
+        stats.total_wr_bytes == stats.expected_wr_bytes;
+    return stats;
+}
+
+#ifndef KERNEL_STANDALONE_MAIN
+#define KERNEL_STANDALONE_MAIN 1
+#endif
+
+#if KERNEL_STANDALONE_MAIN
 int sc_main(int argc, char *argv[])
 {
     (void)argc;
     (void)argv;
 
-    VecOpsTop top("vec_ops_top");
+    PoolTop top("pool_top");
     sc_start();
 
     // ----------------------------------------------------------
     // Derived geometry
     // ----------------------------------------------------------
-    const int      spatial = VOP_H * VOP_W;
-    const uint64_t tile_cap = vop_tile_cap_elems(VOP_SELECTED_OP);
-    const uint64_t extra_rd_per_channel =
-        vop_extra_rd_bytes_per_channel(VOP_SELECTED_OP);
-    const int      n_tiles = (int)ceil_div_u64((uint64_t)spatial,
-                                                tile_cap);
+    const int      spatial  = POOL_H * POOL_W;
+    const int      n_tiles  = (int)ceil_div_u64((uint64_t)spatial,
+                                                 POOL_VEC_ACC_CAP);
     const uint64_t expected_vec_calls =
-        (uint64_t)VOP_C * (uint64_t)n_tiles;
-
-    // Compute expected total rd/wr by summing across all tiles per channel.
-    uint64_t per_chan_rd = 0;
-    uint64_t per_chan_wr = 0;
-    for (int t = 0; t < n_tiles; ++t)
-    {
-        uint64_t vl = std::min<uint64_t>(
-            tile_cap,
-            (uint64_t)spatial - (uint64_t)t * tile_cap);
-        per_chan_rd += vop_rd_bytes(VOP_SELECTED_OP, vl);
-        per_chan_wr += vop_wr_bytes(VOP_SELECTED_OP, vl);
-    }
+        (uint64_t)POOL_C * (uint64_t)n_tiles;
     const uint64_t expected_rd_bytes =
-        (uint64_t)VOP_C * (per_chan_rd + extra_rd_per_channel);
-    const uint64_t expected_wr_bytes = (uint64_t)VOP_C * per_chan_wr;
+        (uint64_t)POOL_C * (uint64_t)spatial * POOL_INPUT_ELEM_BYTES;
+    const uint64_t expected_wr_bytes =
+        (uint64_t)POOL_C * POOL_OUTPUT_ELEM_BYTES;
 
     // ----------------------------------------------------------
     // Section 0: Configuration header
     // ----------------------------------------------------------
     std::cout << "\n";
     std::cout << "==============================================\n";
-    std::cout << "  Vector Operations TLM Performance Simulation\n";
-    std::cout << "  Operation : " << vop_name(VOP_SELECTED_OP) << "\n";
-    std::cout << "  Input     : [C=" << VOP_C
-              << ", H=" << VOP_H
-              << ", W=" << VOP_W << "]"
-              << "  (int" << (VOP_ELEM_BYTES * 8) << ")\n";
-    std::cout << "  Output    : [C=" << VOP_C
-              << ", H=" << VOP_H
-              << ", W=" << VOP_W << "]\n";
+    std::cout << "  Global Average Pooling TLM Performance Simulation\n";
+    std::cout << "  Algorithm : mf_global_avgpool_i"
+              << (POOL_INPUT_ELEM_BYTES * 8) << "\n";
+    std::cout << "  Input     : [C=" << POOL_C
+              << ", H=" << POOL_H
+              << ", W=" << POOL_W << "]"
+              << "  (int" << (POOL_INPUT_ELEM_BYTES * 8) << ")\n";
+    std::cout << "  Output    : [C=" << POOL_C << "]"
+              << "  (int" << (POOL_OUTPUT_ELEM_BYTES * 8) << ")\n";
     std::cout << "  Spatial elements (H*W)   : " << spatial          << "\n";
-    std::cout << "  Base elem bytes          : " << VOP_ELEM_BYTES
-              << "  (change VOP_ELEM_BYTES in vec_ops_config.h to switch)\n";
-    std::cout << "  Workers                  : " << VOP_NUM_WORKERS  << "\n";
-    std::cout << "  vec_acc units            : " << VOP_VEC_ACC_INSTANCES << "\n";
-    std::cout << "  VEC_ACC_CAP              : " << VOP_VEC_ACC_CAP
-              << " e8m4-baseline elements/call,  "
-              << VOP_VEC_ACC_CYCLE << " cycles/call\n";
-    std::cout << "  Active op tile cap       : " << tile_cap
-              << " elements/call\n";
-    std::cout << "  Tiles per channel        : " << n_tiles          << "\n";
-    std::cout << "  Expected vec_acc calls   : " << expected_vec_calls << "\n";
+    std::cout << "  Input elem bytes         : " << POOL_INPUT_ELEM_BYTES
+              << "  (change POOL_INPUT_ELEM_BYTES in pooling_config.h to switch)\n";
+    std::cout << "  Output elem bytes        : " << POOL_OUTPUT_ELEM_BYTES << "\n";
+    std::cout << "  Workers                  : " << POOL_NUM_WORKERS       << "\n";
+    std::cout << "  vec_acc units            : " << POOL_VEC_ACC_INSTANCES  << "\n";
+    std::cout << "  VEC_ACC_CAP              : " << POOL_VEC_ACC_CAP
+              << " elements/call,  " << POOL_VEC_ACC_CYCLE << " cycles/call\n";
+    std::cout << "  Tiles per channel        : " << n_tiles               << "\n";
+    std::cout << "  Expected vec_acc calls   : " << expected_vec_calls    << "\n";
     std::cout << "\n";
-    std::cout << "  Memory traffic model (per tile, vl elements):\n";
-    std::cout << "    READ  = vop_rd_bytes(" << vop_name(VOP_SELECTED_OP)
-              << ", vl)\n";
-    std::cout << "    WRITE = vop_wr_bytes(" << vop_name(VOP_SELECTED_OP)
-              << ", vl)\n";
-    if (extra_rd_per_channel != 0)
-    {
-        std::cout << "    Extra scalar read/channel = "
-                  << extra_rd_per_channel << " bytes\n";
-        std::cout << "    Vector tiles use vec_acc; scalar bias reads go direct to Memory\n";
-    }
-    else
-    {
-        std::cout << "    All traffic routed through vec_acc -> Memory\n";
-    }
+    std::cout << "  Memory traffic model:\n";
+    std::cout << "    READ  per tile    = vl * " << POOL_INPUT_ELEM_BYTES
+              << " bytes  (vle" << (POOL_INPUT_ELEM_BYTES * 8)
+              << " unit-stride load)\n";
+    std::cout << "    WRITE per channel = " << POOL_OUTPUT_ELEM_BYTES
+              << " bytes  (scalar store of output[c], after integer divide)\n";
+    std::cout << "    Write bypasses vec_acc but is routed through Memory\n";
     std::cout << "==============================================\n";
 
     // ----------------------------------------------------------
@@ -561,13 +615,14 @@ int sc_main(int argc, char *argv[])
               << std::setw(14) << "ChanRange"
               << std::setw(10) << "VecCalls"
               << std::setw(14) << "ScalarCyc"
+              << std::setw(14) << "DivideCyc"
               << std::setw(12) << "WaitCyc"
               << std::setw(12) << "MemCyc"
               << std::setw(14) << "RdBytes"
               << std::setw(14) << "WrBytes"
               << std::setw(12) << "ElapsedCyc"
               << "\n";
-    std::cout << std::string(110, '-') << "\n";
+    std::cout << std::string(124, '-') << "\n";
 
     uint64_t max_elapsed    = 0;
     uint64_t total_vec      = 0;
@@ -578,8 +633,8 @@ int sc_main(int argc, char *argv[])
 
     for (const auto *w : top.workers)
     {
-        int c_start = (w->tid       * VOP_C) / VOP_NUM_WORKERS;
-        int c_end   = ((w->tid + 1) * VOP_C) / VOP_NUM_WORKERS;
+        int c_start = (w->tid       * POOL_C) / POOL_NUM_WORKERS;
+        int c_end   = ((w->tid + 1) * POOL_C) / POOL_NUM_WORKERS;
         std::string range = "[" + std::to_string(c_start)
                           + ","  + std::to_string(c_end)  + ")";
         std::cout << std::left
@@ -587,6 +642,7 @@ int sc_main(int argc, char *argv[])
                   << std::setw(14) << range
                   << std::setw(10) << w->vec_calls
                   << std::setw(14) << w->total_scalar_cycles
+                  << std::setw(14) << w->total_divide_cycles
                   << std::setw(12) << w->total_wait_cycles
                   << std::setw(12) << w->total_mem_cycles
                   << std::setw(14) << w->total_rd_bytes
@@ -608,14 +664,14 @@ int sc_main(int argc, char *argv[])
     std::cout << "\n--- Global Summary ---\n";
     std::cout << "Simulation time              : " << sc_time_stamp()     << "\n";
     std::cout << "Max worker elapsed           : " << max_elapsed          << " cycles\n";
-    std::cout << "Workers                      : " << VOP_NUM_WORKERS      << "\n";
-    std::cout << "Channels (C)                 : " << VOP_C                << "\n";
+    std::cout << "Workers                      : " << POOL_NUM_WORKERS     << "\n";
+    std::cout << "Channels (C)                 : " << POOL_C               << "\n";
     std::cout << "Spatial elements (H*W)       : " << spatial              << "\n";
     std::cout << "Vec tiles per channel        : " << n_tiles              << "\n";
     std::cout << "Total vec-acc calls          : " << total_vec
               << "  (expected " << expected_vec_calls << ") "
               << (total_vec == expected_vec_calls ? "[OK]" : "[MISMATCH]") << "\n";
-    std::cout << "Total memory reads           : " << total_rd_all
+    std::cout << "Total memory reads (vec_acc) : " << total_rd_all
               << " bytes"
               << "  (expected " << expected_rd_bytes << ") "
               << (total_rd_all == expected_rd_bytes ? "[OK]" : "[MISMATCH]") << "\n";
@@ -638,6 +694,7 @@ int sc_main(int argc, char *argv[])
               << "  qwait_cyc="             << top.memory.qwait_cycles
               << "\n";
 
+    // Accelerator utilisation: busy cycles / (sim_cycles × num_units)
     double sim_cycles   = static_cast<double>(sc_time_stamp() / CYCLE);
     double vec_capacity = sim_cycles *
                           static_cast<double>(top.vec_acc.instance_count());
@@ -650,6 +707,7 @@ int sc_main(int argc, char *argv[])
               / vec_capacity * 100.0
         : 0.0;
 
+    // Memory bandwidth: modeled bytes transferred / total cycles
     const uint64_t total_mem_bytes = total_rd_all + total_wr_all;
     double mem_bw = (sim_cycles > 0.0)
         ? static_cast<double>(total_mem_bytes) / sim_cycles
@@ -660,6 +718,7 @@ int sc_main(int argc, char *argv[])
     std::cout << "vec_acc occupancy            : " << vec_occ  << "%\n";
     std::cout << "Memory avg BW                : " << mem_bw   << " bytes/cycle\n";
 
+    // Bottleneck hint
     if (vec_util > 80.0)
         std::cout << "Bottleneck hint              : vec_acc is the primary bottleneck.\n";
     else if (top.memory.busy_cycles > top.vec_acc.busy_cycles_total())
@@ -676,16 +735,17 @@ int sc_main(int argc, char *argv[])
     bool ok_wr    = (total_wr_all == expected_wr_bytes);
 
     std::cout << (ok_calls ? "  [PASS]" : "  [FAIL]")
-              << " Total vec-acc calls == C * ceil(H*W/op_tile_cap)"
+              << " Total vec-acc calls == C * ceil(H*W/CAP)"
               << " (" << total_vec << " == " << expected_vec_calls << ")\n";
     std::cout << (ok_rd ? "  [PASS]" : "  [FAIL]")
-              << " Total read bytes"
+              << " Total read bytes == C * H * W * input_bytes"
               << " (" << total_rd_all << " == " << expected_rd_bytes << ")\n";
     std::cout << (ok_wr ? "  [PASS]" : "  [FAIL]")
-              << " Total write bytes"
+              << " Total write bytes == C * output_bytes"
               << " (" << total_wr_all << " == " << expected_wr_bytes << ")\n";
 
     bool pass = ok_calls && ok_rd && ok_wr;
     std::cout << (pass ? "\nAll checks passed.\n" : "\nSome checks FAILED.\n");
     return pass ? 0 : 2;
 }
+#endif
