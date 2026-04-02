@@ -20,7 +20,7 @@
 
 struct MatmulConfig
 {
-    static constexpr int default_thread_count = 16;
+    static constexpr int default_thread_count = 4;
 
     int thread_count = default_thread_count;
     int mat_accel_count = MAT_ACCEL_COUNT;

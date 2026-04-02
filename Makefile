@@ -1,38 +1,27 @@
-CXX      := g++
-CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unused-parameter \
-            -DSC_INCLUDE_DYNAMIC_PROCESSES \
-            -MMD -MP
-EXTRA_CXXFLAGS ?=
-INCLUDES := -I/usr/include -I.
-LDFLAGS  := -L/usr/lib/x86_64-linux-gnu -Wl,-rpath,/usr/lib/x86_64-linux-gnu
-LIBS     := -lsystemc -lpthread
+.PHONY: all kernels kernel-matmul kernel-dwconv kernel-layernorm kernel-pooling kernel-vecops nafnet clean
 
-TARGET  := build/perf_sim
-SRCDIR  := src
-BUILDDIR := build
+all: kernels
 
-SRCS    := $(wildcard $(SRCDIR)/*.cpp)
-OBJS    := $(SRCS:$(SRCDIR)/%.cpp=$(BUILDDIR)/%.o)
-DEPS    := $(OBJS:.o=.d)
+kernels:
+	$(MAKE) -C kernel all
 
-.PHONY: all clean run
+kernel-matmul:
+	$(MAKE) -C kernel matmul
 
-all: $(TARGET)
+kernel-dwconv:
+	$(MAKE) -C kernel dw_conv2d
 
-$(TARGET): $(OBJS) | $(BUILDDIR)
-	$(CXX) $(LDFLAGS) -o $@ $^ $(LIBS)
+kernel-layernorm:
+	$(MAKE) -C kernel layer_norm
 
-$(BUILDDIR)/%.o: $(SRCDIR)/%.cpp | $(BUILDDIR)
-	$(CXX) $(CXXFLAGS) $(EXTRA_CXXFLAGS) $(INCLUDES) -c -o $@ $<
+kernel-pooling:
+	$(MAKE) -C kernel pooling
 
-$(BUILDDIR):
-	mkdir -p $(BUILDDIR)
+kernel-vecops:
+	$(MAKE) -C kernel vec_ops
 
-run: $(TARGET)
-	./$(TARGET)
+nafnet:
+	$(MAKE) -C nafnet all
 
 clean:
-	rm -rf $(BUILDDIR)
-
-# Auto-generated header dependency rules
--include $(DEPS)
+	$(MAKE) -C kernel clean

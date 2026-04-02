@@ -11,7 +11,7 @@
 // ============================================================
 
 #ifndef MAT_ACCEL_COUNT
-#define MAT_ACCEL_COUNT 4
+#define MAT_ACCEL_COUNT 2
 #endif
 
 #ifndef VEC_ACCEL_COUNT
