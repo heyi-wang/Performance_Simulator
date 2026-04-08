@@ -2,6 +2,7 @@
 
 #include "extensions.h"
 #include <deque>
+#include <systemc>
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm_utils/peq_with_get.h>
 #include <unordered_map>
@@ -44,6 +45,8 @@ struct Worker : sc_module
     uint64_t max_inflight_mat_reqs = 1;
     uint64_t max_inflight_vec_reqs = 1;
     WorkerPostProcessor *post_processor = nullptr;
+    sc_event *start_event = nullptr;
+    sc_fifo<int> *completion_fifo = nullptr;
 
     uint64_t compute_cycles   = 0;
     uint64_t wait_cycles      = 0;   // queue-wait + backpressure stall combined
@@ -115,7 +118,9 @@ struct Worker : sc_module
            uint64_t vec_wr_ = 0,
            uint64_t max_inflight_mat_reqs_ = 1,
            uint64_t max_inflight_vec_reqs_ = 1,
-           WorkerPostProcessor *post_processor_ = nullptr);
+           WorkerPostProcessor *post_processor_ = nullptr,
+           sc_event *start_event_ = nullptr,
+           sc_fifo<int> *completion_fifo_ = nullptr);
 
     tlm_sync_enum nb_transport_bw(tlm_generic_payload &gp,
                                   tlm_phase &phase,

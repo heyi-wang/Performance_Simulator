@@ -1,4 +1,5 @@
 #pragma once
+#include "config/hardware_config.h"
 #include <cstdint>
 
 // ============================================================
@@ -36,23 +37,6 @@ static const uint64_t CONV_TOTAL_MACS =
 // ============================================================
 static const int NUM_THREADS = 16;
 
-// Number of physical accelerator instances per class.
-// Requests still enter through one shared queue per class.
-#ifndef MAT_ACCEL_COUNT
-#define MAT_ACCEL_COUNT 4
-#endif
-
-#ifndef VEC_ACCEL_COUNT
-#define VEC_ACCEL_COUNT 4
-#endif
-
-
-#ifndef MEMORY_PARALLEL_SLOTS
-#define MEMORY_PARALLEL_SLOTS (MAT_ACCEL_COUNT + VEC_ACCEL_COUNT)
-#endif
-
-static const int MEMORY_PARALLEL_SLOTS_CFG = MEMORY_PARALLEL_SLOTS;
-
 // ============================================================
 // GEMM mapping via im2col
 //   Convolution rewritten as: A [M_t × K] × B [K × C_out]
@@ -64,26 +48,3 @@ static const uint64_t A_M =
     CONV_N * CONV_H_OUT * CONV_W_OUT / (uint64_t)NUM_THREADS;
 static const uint64_t A_K = CONV_C_IN * CONV_KH * CONV_KW;
 static const uint64_t B_N = CONV_C_OUT;
-
-// ============================================================
-// Hardware accelerator parameters
-// ============================================================
-
-// Matrix accelerator tile dimensions (must divide evenly into A_M, A_K, B_N
-// for best efficiency; ceil-div is applied automatically in top.cpp)
-static const uint64_t MATMUL_M = 8;
-static const uint64_t MATMUL_K = 8;
-static const uint64_t MATMUL_N = 8;
-
-// Cycles to complete one M×K×N tile (= M*K*N MACs / mac_units_per_cycle)
-// Example: 8×8×8 = 512 MACs, 64 MAC units → 8 cycles
-static const uint64_t MATMUL_ACC_CYCLE = 1;
-
-// Vector accelerator (bias add + activation, e.g. ReLU):
-//   processes VECTOR_ACC_CAP elements per call in VECTOR_ACC_CYCLE cycles
-static const uint64_t VECTOR_ACC_CAP   = 64;
-static const uint64_t VECTOR_ACC_CYCLE = 1;
-
-// Scalar overhead cycles per accelerator call
-// (loop bookkeeping, address computation, tile dispatch)
-static const uint64_t SCALAR_OVERHEAD = 16;

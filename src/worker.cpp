@@ -18,7 +18,9 @@ Worker::Worker(sc_module_name name,
                uint64_t vec_wr_,
                uint64_t max_inflight_mat_reqs_,
                uint64_t max_inflight_vec_reqs_,
-               WorkerPostProcessor *post_processor_)
+               WorkerPostProcessor *post_processor_,
+               sc_event *start_event_,
+               sc_fifo<int> *completion_fifo_)
     : sc_module(name),
       init("init"),
       peq("peq"),
@@ -32,6 +34,8 @@ Worker::Worker(sc_module_name name,
       max_inflight_mat_reqs(std::max<uint64_t>(max_inflight_mat_reqs_, 1)),
       max_inflight_vec_reqs(std::max<uint64_t>(max_inflight_vec_reqs_, 1)),
       post_processor(post_processor_),
+      start_event(start_event_),
+      completion_fifo(completion_fifo_),
       A_bytes(A_bytes_),
       B_bytes(B_bytes_),
       C_bytes(C_bytes_),
@@ -277,6 +281,9 @@ void Worker::issue_stream(uint64_t addr,
 
 void Worker::run()
 {
+    if (start_event)
+        wait(*start_event);
+
     sc_time start = sc_time_stamp();
 
     // ----------------------------------------------------------
@@ -333,20 +340,6 @@ void Worker::run()
 
     sc_time end        = sc_time_stamp();
     elapsed_cycles     = (uint64_t)((end - start) / CYCLE);
-    uint64_t total_cycles = compute_cycles + wait_cycles + mem_cycles_accum;
-
-    std::cout << "[T" << tid << "]"
-              << " mat_calls="  << mat_calls
-              << " vec_calls="  << vec_calls
-              << " accum_vec="  << accum_vec_calls
-              << " quant_vec="  << quant_vec_calls
-              << " pairs="      << reduction_pairs
-              << " wait="       << wait_cycles
-              << " stall="      << stall_cycles
-              << " compute="    << compute_cycles
-              << " mem="        << mem_cycles_accum
-              << " total="      << total_cycles
-              << " elapsed="    << elapsed_cycles
-              << " @ sim_time=" << sc_time_stamp()
-              << "\n";
+    if (completion_fifo)
+        completion_fifo->write(tid);
 }
