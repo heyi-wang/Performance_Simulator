@@ -49,8 +49,8 @@ struct Worker : sc_module
     sc_fifo<int> *completion_fifo = nullptr;
 
     uint64_t compute_cycles   = 0;
-    uint64_t wait_cycles      = 0;   // queue-wait + backpressure stall combined
-    uint64_t stall_cycles     = 0;   // backpressure stall only (subset of wait_cycles)
+    uint64_t wait_cycles      = 0;   // accelerator queue wait only
+    uint64_t stall_cycles     = 0;   // worker-side backpressure stall only
     uint64_t mem_cycles_accum = 0;
     uint64_t mat_calls        = 0;
     uint64_t vec_calls        = 0;

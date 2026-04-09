@@ -14,6 +14,7 @@
 
 #include "common.h"
 #include "extensions.h"
+#include "report_formatter.h"
 
 using namespace sc_core;
 using namespace tlm;
@@ -49,6 +50,7 @@ struct LayerNormWorker : sc_module
     uint64_t total_dispatch_cycles = 0;
     uint64_t total_scalar_cycles = 0;
     uint64_t total_wait_cycles = 0;
+    uint64_t total_stall_cycles = 0;
     uint64_t total_mem_cycles = 0;
     uint64_t vec_calls = 0;
     uint64_t elapsed_cycles = 0;
@@ -211,9 +213,10 @@ struct LayerNormWorker : sc_module
         uint64_t qwait = ext ? ext->accel_qwait_cycles : 0;
         uint64_t mec = ext ? ext->mem_cycles : 0;
 
-        s.wait_cycles += qwait + p.stall_cycles;
+        s.wait_cycles += qwait;
         s.mem_cycles += mec;
-        total_wait_cycles += qwait + p.stall_cycles;
+        total_wait_cycles += qwait;
+        total_stall_cycles += p.stall_cycles;
         total_mem_cycles += mec;
 
         tlm_phase end_phase = END_RESP;
@@ -381,6 +384,7 @@ LayerNormSimulationStats LayerNormTop::collect_stats() const
         static_cast<uint64_t>(cfg.channels) * 3 * static_cast<uint64_t>(cfg.tile_count());
     stats.vec_acc_reqs = vec_acc.req_count_total();
     stats.vec_acc_busy_cycles = vec_acc.busy_cycles_total();
+    stats.vec_acc_occupied_cycles = vec_acc.occupied_cycles_total();
     stats.vec_acc_queue_wait_cycles = vec_acc.queue_wait_cycles_total();
     stats.memory_reqs = memory.reqs;
     stats.memory_busy_cycles = memory.busy_cycles;
@@ -392,8 +396,137 @@ LayerNormSimulationStats LayerNormTop::collect_stats() const
     stats.vec_util = (vec_capacity > 0.0)
         ? static_cast<double>(vec_acc.busy_cycles_total()) / vec_capacity * 100.0
         : 0.0;
+    stats.vec_occupancy = (vec_capacity > 0.0)
+        ? static_cast<double>(vec_acc.occupied_cycles_total()) / vec_capacity * 100.0
+        : 0.0;
     stats.verification_passed = (stats.total_vec_reqs == stats.expected_vec_reqs);
     return stats;
+}
+
+std::vector<KernelWorkerInfo> LayerNormTop::collect_worker_info() const
+{
+    std::vector<KernelWorkerInfo> info;
+    info.reserve(workers.size());
+    for (const auto *w : workers)
+    {
+        KernelWorkerInfo wi;
+        wi.tid = w->tid;
+        wi.vec_reqs = w->vec_calls;
+        wi.scalar_cycles = w->total_scalar_cycles;
+        wi.stall_cycles = w->total_stall_cycles;
+        wi.elapsed_cycles = w->elapsed_cycles;
+        wi.mem_cycles = w->total_mem_cycles;
+        for (int s = 0; s < 4; ++s)
+        {
+            wi.rd_bytes += w->step_stats[s].rd_bytes;
+            wi.wr_bytes += w->step_stats[s].wr_bytes;
+        }
+        info.push_back(wi);
+    }
+    return info;
+}
+
+void LayerNormTop::print_report(std::ostream &os) const
+{
+    const LayerNormSimulationStats stats = collect_stats();
+    const std::vector<KernelWorkerInfo> worker_info = collect_worker_info();
+
+    uint64_t total_scalar_cycles = 0;
+    uint64_t total_stall_cycles = 0;
+    uint64_t total_mem_cycles = 0;
+    for (const auto &worker : worker_info)
+    {
+        total_scalar_cycles += worker.scalar_cycles;
+        total_stall_cycles += worker.stall_cycles;
+        total_mem_cycles += worker.mem_cycles;
+    }
+
+    report::print_section_title(os, "Simulation Info");
+    report::print_fields(os, {
+        {"Operation Type", "Layer Normalization"},
+        {"Input Tensor Shape", "[C=" + report::fmt_int(cfg.channels) +
+                               ", H=" + report::fmt_int(cfg.height) +
+                               ", W=" + report::fmt_int(cfg.width) + "]"},
+        {"Input Element Type", "int16"},
+    });
+
+    report::print_section_title(os, "Hardware Configuration");
+    report::print_fields(os, {
+        {"Workers [count]", report::fmt_int(cfg.worker_count)},
+        {"Matrix Accelerators [count]", report::na()},
+        {"Vector Accelerators [count]", report::fmt_int(cfg.vec_acc_instances)},
+        {"Matrix Accelerator Capacity", report::na()},
+        {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(cfg.vec_acc_cap)},
+        {"Accelerator Queue Depth [requests]", report::fmt_u64(cfg.acc_queue_depth)},
+        {"Memory Bandwidth [bytes/cycle]", report::fmt_u64(cfg.memory_bw)},
+        {"Memory Base Latency [cycles]", report::fmt_u64(cfg.memory_base_lat)},
+    });
+
+    report::print_section_title(os, "Worker Summary");
+    report::print_table(os, report::make_worker_summary_table(worker_info));
+
+    report::print_section_title(os, "Accelerator Summary");
+    report::print_table(os, report::make_accelerator_summary_table({
+        {
+            "Matrix Accelerator",
+            "pool-level",
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Vector Accelerator",
+            "pool-level",
+            report::fmt_int(cfg.vec_acc_instances),
+            report::fmt_u64(stats.vec_acc_reqs),
+            report::fmt_u64(stats.vec_acc_queue_wait_cycles),
+            report::fmt_u64(stats.vec_acc_busy_cycles),
+            report::fmt_u64(stats.vec_acc_occupied_cycles),
+            report::fmt_percent(stats.vec_util),
+            report::fmt_percent(stats.vec_occupancy),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Memory",
+            "shared resource",
+            "1",
+            report::fmt_u64(stats.memory_reqs),
+            report::fmt_u64(stats.memory_queue_wait_cycles),
+            report::fmt_u64(stats.memory_busy_cycles),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::fmt_u64(stats.total_rd_bytes),
+            report::fmt_u64(stats.total_wr_bytes),
+        },
+    }));
+
+    report::print_section_title(os, "Overall Summary");
+    report::print_fields(os, {
+        {"Total Elapsed Cycles [cycles]", report::fmt_u64(stats.max_elapsed_cycles)},
+        {"Total Matrix Accelerator Requests [requests]", report::na()},
+        {"Total Vector Accelerator Requests [requests]", report::fmt_u64(stats.total_vec_reqs)},
+        {"Total Memory Requests [requests]", report::fmt_u64(stats.memory_reqs)},
+        {"Total Read Bytes [bytes]", report::fmt_u64(stats.total_rd_bytes)},
+        {"Total Write Bytes [bytes]", report::fmt_u64(stats.total_wr_bytes)},
+        {"Total Stall Cycles [cycles]", report::fmt_u64(total_stall_cycles)},
+        {"Total Memory Cycles [cycles]", report::fmt_u64(total_mem_cycles)},
+        {"Total Scalar Cycles [cycles]", report::fmt_u64(total_scalar_cycles)},
+    });
+
+    report::print_section_title(os, "Verification");
+    report::print_fields(os, {
+        {"Expected Vector Accelerator Requests [requests]", report::fmt_u64(stats.expected_vec_reqs)},
+        {"Actual Vector Accelerator Requests [requests]", report::fmt_u64(stats.total_vec_reqs)},
+        {"Verification Status", stats.verification_passed ? "PASS" : "FAIL"},
+    });
 }
 
 void LayerNormTop::done_monitor()
@@ -417,21 +550,9 @@ int sc_main(int argc, char *argv[])
     LayerNormTop top("ln_top", cfg);
     sc_start();
 
-    const LayerNormSimulationStats stats = top.collect_stats();
+    top.print_report(std::cout);
 
-    std::cout << "\n=== LayerNorm2d TLM Performance Simulation ===\n";
-    std::cout << "Input                  : [C=" << cfg.channels
-              << ", H=" << cfg.height
-              << ", W=" << cfg.width << "] int16\n";
-    std::cout << "Workers                : " << cfg.worker_count << "\n";
-    std::cout << "vec_acc units          : " << cfg.vec_acc_instances << "\n";
-    std::cout << "Total vec reqs         : " << stats.total_vec_reqs
-              << " (expected " << stats.expected_vec_reqs << ")\n";
-    std::cout << "Total read bytes       : " << stats.total_rd_bytes << "\n";
-    std::cout << "Total write bytes      : " << stats.total_wr_bytes << "\n";
-    std::cout << "Elapsed cycles         : " << stats.max_elapsed_cycles << "\n";
-    std::cout << "Verification           : "
-              << (stats.verification_passed ? "PASS" : "FAIL") << "\n";
+    const LayerNormSimulationStats stats = top.collect_stats();
     return stats.verification_passed ? 0 : 2;
 }
 #endif

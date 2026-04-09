@@ -8,6 +8,7 @@
 #include "pooling_config.h"
 
 #include <memory>
+#include <iosfwd>
 #include <systemc>
 #include <vector>
 
@@ -88,5 +89,7 @@ struct PoolTop : sc_module
     ~PoolTop() override;
 
     PoolSimulationStats collect_stats() const;
+    std::vector<KernelWorkerInfo> collect_worker_info() const;
+    void print_report(std::ostream &os) const;
     void done_monitor();
 };

@@ -14,6 +14,7 @@
 
 #include "common.h"
 #include "extensions.h"
+#include "report_formatter.h"
 
 using namespace sc_core;
 using namespace tlm;
@@ -49,6 +50,7 @@ struct DwConvWorker : sc_module
     uint64_t vec_calls = 0;
     uint64_t total_scalar_cycles = 0;
     uint64_t total_wait_cycles = 0;
+    uint64_t total_stall_cycles = 0;
     uint64_t total_mem_cycles = 0;
     uint64_t total_rd_bytes = 0;
     uint64_t total_wr_bytes = 0;
@@ -233,7 +235,8 @@ struct DwConvWorker : sc_module
 
         ReqExt *ext = nullptr;
         p.gp->get_extension(ext);
-        total_wait_cycles += (ext ? ext->accel_qwait_cycles : 0) + p.stall_cycles;
+        total_wait_cycles += (ext ? ext->accel_qwait_cycles : 0);
+        total_stall_cycles += p.stall_cycles;
         total_mem_cycles += ext ? ext->mem_cycles : 0;
 
         tlm_phase end_phase = END_RESP;
@@ -392,6 +395,136 @@ DwConvSimulationStats DwConvTop::collect_stats() const
     return stats;
 }
 
+std::vector<KernelWorkerInfo> DwConvTop::collect_worker_info() const
+{
+    std::vector<KernelWorkerInfo> info;
+    info.reserve(workers.size());
+    for (const auto *w : workers)
+    {
+        KernelWorkerInfo wi;
+        wi.tid = w->tid;
+        wi.vec_reqs = w->vec_calls;
+        wi.scalar_cycles = w->total_scalar_cycles;
+        wi.stall_cycles = w->total_stall_cycles;
+        wi.elapsed_cycles = w->elapsed_cycles;
+        wi.mem_cycles = w->total_mem_cycles;
+        wi.rd_bytes = w->total_rd_bytes;
+        wi.wr_bytes = w->total_wr_bytes;
+        info.push_back(wi);
+    }
+    return info;
+}
+
+void DwConvTop::print_report(std::ostream &os) const
+{
+    const DwConvSimulationStats stats = collect_stats();
+    const std::vector<KernelWorkerInfo> worker_info = collect_worker_info();
+
+    uint64_t total_scalar_cycles = 0;
+    uint64_t total_stall_cycles = 0;
+    uint64_t total_mem_cycles = 0;
+    for (const auto &worker : worker_info)
+    {
+        total_scalar_cycles += worker.scalar_cycles;
+        total_stall_cycles += worker.stall_cycles;
+        total_mem_cycles += worker.mem_cycles;
+    }
+
+    report::print_section_title(os, "Simulation Info");
+    report::print_fields(os, {
+        {"Operation Type", "Depth-wise Convolution"},
+        {"Input Tensor Shape", "[C=" + report::fmt_int(cfg.channels) +
+                               ", H=" + report::fmt_int(cfg.height) +
+                               ", W=" + report::fmt_int(cfg.width) + "]"},
+        {"Kernel Shape", "[" + report::fmt_int(cfg.kernel_h) +
+                         " x " + report::fmt_int(cfg.kernel_w) + "]"},
+        {"Padding", report::fmt_int(cfg.pad)},
+        {"Stride", report::fmt_int(cfg.stride)},
+        {"Output Tensor Shape", "[C=" + report::fmt_int(cfg.channels) +
+                                ", H=" + report::fmt_int(cfg.out_h()) +
+                                ", W=" + report::fmt_int(cfg.out_w()) + "]"},
+    });
+
+    report::print_section_title(os, "Hardware Configuration");
+    report::print_fields(os, {
+        {"Workers [count]", report::fmt_int(cfg.worker_count)},
+        {"Matrix Accelerators [count]", report::na()},
+        {"Vector Accelerators [count]", report::fmt_int(cfg.vec_acc_instances)},
+        {"Matrix Accelerator Capacity", report::na()},
+        {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(cfg.vec_acc_cap)},
+        {"Accelerator Queue Depth [requests]", report::fmt_u64(cfg.acc_queue_depth)},
+        {"Memory Bandwidth [bytes/cycle]", report::fmt_u64(cfg.memory_bw)},
+        {"Memory Base Latency [cycles]", report::fmt_u64(cfg.memory_base_lat)},
+    });
+
+    report::print_section_title(os, "Worker Summary");
+    report::print_table(os, report::make_worker_summary_table(worker_info));
+
+    report::print_section_title(os, "Accelerator Summary");
+    report::print_table(os, report::make_accelerator_summary_table({
+        {
+            "Matrix Accelerator",
+            "pool-level",
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Vector Accelerator",
+            "pool-level",
+            report::fmt_int(cfg.vec_acc_instances),
+            report::fmt_u64(stats.vec_acc_reqs),
+            report::fmt_u64(stats.vec_acc_queue_wait_cycles),
+            report::fmt_u64(stats.vec_acc_busy_cycles),
+            report::fmt_u64(stats.vec_acc_occupied_cycles),
+            report::fmt_percent(stats.vec_util),
+            report::fmt_percent(stats.vec_occupancy),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Memory",
+            "shared resource",
+            "1",
+            report::fmt_u64(stats.memory_reqs),
+            report::fmt_u64(stats.memory_queue_wait_cycles),
+            report::fmt_u64(stats.memory_busy_cycles),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::fmt_u64(stats.total_rd_bytes),
+            report::fmt_u64(stats.total_wr_bytes),
+        },
+    }));
+
+    report::print_section_title(os, "Overall Summary");
+    report::print_fields(os, {
+        {"Total Elapsed Cycles [cycles]", report::fmt_u64(stats.max_elapsed_cycles)},
+        {"Total Matrix Accelerator Requests [requests]", report::na()},
+        {"Total Vector Accelerator Requests [requests]", report::fmt_u64(stats.total_vec_calls)},
+        {"Total Memory Requests [requests]", report::fmt_u64(stats.memory_reqs)},
+        {"Total Read Bytes [bytes]", report::fmt_u64(stats.total_rd_bytes)},
+        {"Total Write Bytes [bytes]", report::fmt_u64(stats.total_wr_bytes)},
+        {"Total Stall Cycles [cycles]", report::fmt_u64(total_stall_cycles)},
+        {"Total Memory Cycles [cycles]", report::fmt_u64(total_mem_cycles)},
+        {"Total Scalar Cycles [cycles]", report::fmt_u64(total_scalar_cycles)},
+        {"Average Memory Bandwidth [bytes/cycle]", report::fmt_rate(stats.mem_bw, "bytes/cycle")},
+    });
+
+    report::print_section_title(os, "Verification");
+    report::print_fields(os, {
+        {"Expected Vector Accelerator Requests [requests]", report::fmt_u64(stats.expected_vec_calls)},
+        {"Actual Vector Accelerator Requests [requests]", report::fmt_u64(stats.total_vec_calls)},
+        {"Verification Status", stats.verification_passed ? "PASS" : "FAIL"},
+    });
+}
+
 void DwConvTop::done_monitor()
 {
     for (int i = 0; i < cfg.worker_count; ++i)
@@ -413,26 +546,9 @@ int sc_main(int argc, char *argv[])
     DwConvTop top("dw_top", cfg);
     sc_start();
 
-    const DwConvSimulationStats stats = top.collect_stats();
+    top.print_report(std::cout);
 
-    std::cout << "\n=== Depth-wise Conv2d TLM Performance Simulation ===\n";
-    std::cout << "Input                  : [C=" << cfg.channels
-              << ", H=" << cfg.height
-              << ", W=" << cfg.width << "]\n";
-    std::cout << "Kernel                 : [" << cfg.kernel_h
-              << " x " << cfg.kernel_w
-              << "], pad=" << cfg.pad
-              << ", stride=" << cfg.stride << "\n";
-    std::cout << "Output                 : [C=" << cfg.channels
-              << ", H=" << cfg.out_h()
-              << ", W=" << cfg.out_w() << "]\n";
-    std::cout << "Total vec reqs         : " << stats.total_vec_calls
-              << " (expected " << stats.expected_vec_calls << ")\n";
-    std::cout << "Total read bytes       : " << stats.total_rd_bytes << "\n";
-    std::cout << "Total write bytes      : " << stats.total_wr_bytes << "\n";
-    std::cout << "Elapsed cycles         : " << stats.max_elapsed_cycles << "\n";
-    std::cout << "Verification           : "
-              << (stats.verification_passed ? "PASS" : "FAIL") << "\n";
+    const DwConvSimulationStats stats = top.collect_stats();
     return stats.verification_passed ? 0 : 2;
 }
 #endif

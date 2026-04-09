@@ -8,28 +8,43 @@
 #include <utility>
 #include <vector>
 
+#include "report_formatter.h"
 #include "nafnet_hw_config.h"
 #include "nafnet_kernel_bridge.h"
 #include "nafnet_layers.h"
 
 using namespace sc_core;
 
+struct NafResourceStats
+{
+    bool present = false;
+    int instances = 0;
+    uint64_t requests = 0;
+    uint64_t queue_wait_cycles = 0;
+    uint64_t busy_cycles = 0;
+    uint64_t occupied_cycles = 0;
+};
+
 struct NafLayerStats
 {
     uint64_t mat_reqs = 0;
     uint64_t vec_reqs = 0;
     uint64_t mem_reqs = 0;
-    uint64_t accel_cycles = 0;
-    uint64_t cpu_cycles = 0;
-    uint64_t wait_cycles = 0;
+    uint64_t scalar_cycles = 0;
+    uint64_t stall_cycles = 0;
     uint64_t mem_cycles = 0;
     uint64_t rd_bytes = 0;
     uint64_t wr_bytes = 0;
+    uint64_t elapsed_cycles = 0;
+    NafResourceStats mat_pool;
+    NafResourceStats vec_pool;
+    NafResourceStats memory;
 };
 
 struct LayerRunResult
 {
     NafLayerStats stats;
+    std::vector<KernelWorkerInfo> worker_stats;
     bool verification_passed = false;
 };
 
@@ -42,18 +57,54 @@ struct NafOptions
     int block_w = 64;
 };
 
+static void accumulate_worker_info(KernelWorkerInfo &dst, const KernelWorkerInfo &src)
+{
+    dst.tid = src.tid;
+    dst.mat_reqs += src.mat_reqs;
+    dst.vec_reqs += src.vec_reqs;
+    dst.elapsed_cycles += src.elapsed_cycles;
+    dst.scalar_cycles += src.scalar_cycles;
+    dst.stall_cycles += src.stall_cycles;
+    dst.mem_cycles += src.mem_cycles;
+    dst.rd_bytes += src.rd_bytes;
+    dst.wr_bytes += src.wr_bytes;
+}
+
+static void finalize_layer_result(LayerRunResult &result)
+{
+    result.stats.scalar_cycles = 0;
+    result.stats.stall_cycles = 0;
+    result.stats.mem_cycles = 0;
+    for (const auto &worker : result.worker_stats)
+    {
+        result.stats.scalar_cycles += worker.scalar_cycles;
+        result.stats.stall_cycles += worker.stall_cycles;
+        result.stats.mem_cycles += worker.mem_cycles;
+    }
+}
+
 static NafLayerStats convert_stats(const MatmulSimulationStats &stats)
 {
     NafLayerStats out;
     out.mat_reqs = stats.mat_req_total;
     out.vec_reqs = stats.vec_req_total;
     out.mem_reqs = stats.memory_reqs;
-    out.accel_cycles = stats.mat_busy_total + stats.vec_busy_total;
-    out.cpu_cycles = stats.coordinator_compute;
-    out.wait_cycles = stats.total_worker_stall + stats.coordinator_stall;
-    out.mem_cycles = stats.memory_busy_cycles;
     out.rd_bytes = stats.total_rd_bytes;
     out.wr_bytes = stats.total_wr_bytes;
+    out.mat_pool.present = true;
+    out.mat_pool.requests = stats.mat_req_total;
+    out.mat_pool.queue_wait_cycles = stats.mat_qwait_total;
+    out.mat_pool.busy_cycles = stats.mat_busy_total;
+    out.mat_pool.occupied_cycles = stats.mat_occupied_total;
+    out.vec_pool.present = true;
+    out.vec_pool.requests = stats.vec_req_total;
+    out.vec_pool.queue_wait_cycles = stats.vec_qwait_total;
+    out.vec_pool.busy_cycles = stats.vec_busy_total;
+    out.vec_pool.occupied_cycles = stats.vec_occupied_total;
+    out.memory.present = true;
+    out.memory.requests = stats.memory_reqs;
+    out.memory.queue_wait_cycles = stats.memory_queue_wait_cycles;
+    out.memory.busy_cycles = stats.memory_busy_cycles;
     return out;
 }
 
@@ -62,11 +113,17 @@ static NafLayerStats convert_stats(const DwConvSimulationStats &stats)
     NafLayerStats out;
     out.vec_reqs = stats.total_vec_calls;
     out.mem_reqs = stats.memory_reqs;
-    out.accel_cycles = stats.vec_acc_busy_cycles;
-    out.wait_cycles = stats.total_wait_cycles;
-    out.mem_cycles = stats.total_mem_cycles;
     out.rd_bytes = stats.total_rd_bytes;
     out.wr_bytes = stats.total_wr_bytes;
+    out.vec_pool.present = true;
+    out.vec_pool.requests = stats.vec_acc_reqs;
+    out.vec_pool.queue_wait_cycles = stats.vec_acc_queue_wait_cycles;
+    out.vec_pool.busy_cycles = stats.vec_acc_busy_cycles;
+    out.vec_pool.occupied_cycles = stats.vec_acc_occupied_cycles;
+    out.memory.present = true;
+    out.memory.requests = stats.memory_reqs;
+    out.memory.queue_wait_cycles = stats.memory_queue_wait_cycles;
+    out.memory.busy_cycles = stats.memory_busy_cycles;
     return out;
 }
 
@@ -75,15 +132,17 @@ static NafLayerStats convert_stats(const LayerNormSimulationStats &stats)
     NafLayerStats out;
     out.vec_reqs = stats.total_vec_reqs;
     out.mem_reqs = stats.memory_reqs;
-    out.mem_cycles = stats.memory_busy_cycles;
     out.rd_bytes = stats.total_rd_bytes;
     out.wr_bytes = stats.total_wr_bytes;
-    for (const auto &step : stats.steps)
-    {
-        out.accel_cycles += step.accel_cycles;
-        out.cpu_cycles += step.scalar_cycles;
-        out.wait_cycles += step.wait_cycles;
-    }
+    out.vec_pool.present = true;
+    out.vec_pool.requests = stats.vec_acc_reqs;
+    out.vec_pool.queue_wait_cycles = stats.vec_acc_queue_wait_cycles;
+    out.vec_pool.busy_cycles = stats.vec_acc_busy_cycles;
+    out.vec_pool.occupied_cycles = stats.vec_acc_occupied_cycles;
+    out.memory.present = true;
+    out.memory.requests = stats.memory_reqs;
+    out.memory.queue_wait_cycles = stats.memory_queue_wait_cycles;
+    out.memory.busy_cycles = stats.memory_busy_cycles;
     return out;
 }
 
@@ -92,11 +151,17 @@ static NafLayerStats convert_stats(const PoolSimulationStats &stats)
     NafLayerStats out;
     out.vec_reqs = stats.total_vec_calls;
     out.mem_reqs = stats.memory_reqs;
-    out.accel_cycles = stats.vec_acc_busy_cycles;
-    out.wait_cycles = stats.total_wait_cycles;
-    out.mem_cycles = stats.total_mem_cycles;
     out.rd_bytes = stats.total_rd_bytes;
     out.wr_bytes = stats.total_wr_bytes;
+    out.vec_pool.present = true;
+    out.vec_pool.requests = stats.vec_acc_reqs;
+    out.vec_pool.queue_wait_cycles = stats.vec_acc_queue_wait_cycles;
+    out.vec_pool.busy_cycles = stats.vec_acc_busy_cycles;
+    out.vec_pool.occupied_cycles = stats.vec_acc_occupied_cycles;
+    out.memory.present = true;
+    out.memory.requests = stats.memory_reqs;
+    out.memory.queue_wait_cycles = stats.memory_queue_wait_cycles;
+    out.memory.busy_cycles = stats.memory_busy_cycles;
     return out;
 }
 
@@ -105,11 +170,17 @@ static NafLayerStats convert_stats(const VecOpsSimulationStats &stats)
     NafLayerStats out;
     out.vec_reqs = stats.total_vec_calls;
     out.mem_reqs = stats.memory_reqs;
-    out.accel_cycles = stats.vec_acc_busy_cycles;
-    out.wait_cycles = stats.total_wait_cycles;
-    out.mem_cycles = stats.total_mem_cycles;
     out.rd_bytes = stats.total_rd_bytes;
     out.wr_bytes = stats.total_wr_bytes;
+    out.vec_pool.present = true;
+    out.vec_pool.requests = stats.vec_acc_reqs;
+    out.vec_pool.queue_wait_cycles = stats.vec_acc_queue_wait_cycles;
+    out.vec_pool.busy_cycles = stats.vec_acc_busy_cycles;
+    out.vec_pool.occupied_cycles = stats.vec_acc_occupied_cycles;
+    out.memory.present = true;
+    out.memory.requests = stats.memory_reqs;
+    out.memory.queue_wait_cycles = stats.memory_queue_wait_cycles;
+    out.memory.busy_cycles = stats.memory_busy_cycles;
     return out;
 }
 
@@ -139,10 +210,21 @@ struct MatmulLayerRunner : LayerRunnerBase
 
     LayerRunResult run() override
     {
+        const sc_time layer_start = sc_time_stamp();
         start_ev.notify(SC_ZERO_TIME);
         wait(done_ev);
         const MatmulSimulationStats stats = top->collect_stats();
-        return {convert_stats(stats), stats.verification_passed};
+        LayerRunResult result;
+        result.stats = convert_stats(stats);
+        result.stats.elapsed_cycles =
+            static_cast<uint64_t>((sc_time_stamp() - layer_start) / CYCLE);
+        result.stats.mat_pool.instances = top->cfg.mat_accel_count;
+        result.stats.vec_pool.instances = top->cfg.vec_accel_count;
+        result.stats.memory.instances = 1;
+        result.verification_passed = stats.verification_passed;
+        result.worker_stats = top->collect_worker_info();
+        finalize_layer_result(result);
+        return result;
     }
 };
 
@@ -163,10 +245,20 @@ struct DwConvLayerRunner : LayerRunnerBase
 
     LayerRunResult run() override
     {
+        const sc_time layer_start = sc_time_stamp();
         start_ev.notify(SC_ZERO_TIME);
         wait(done_ev);
         const DwConvSimulationStats stats = top->collect_stats();
-        return {convert_stats(stats), stats.verification_passed};
+        LayerRunResult result;
+        result.stats = convert_stats(stats);
+        result.stats.elapsed_cycles =
+            static_cast<uint64_t>((sc_time_stamp() - layer_start) / CYCLE);
+        result.stats.vec_pool.instances = top->cfg.vec_acc_instances;
+        result.stats.memory.instances = 1;
+        result.verification_passed = stats.verification_passed;
+        result.worker_stats = top->collect_worker_info();
+        finalize_layer_result(result);
+        return result;
     }
 };
 
@@ -187,10 +279,20 @@ struct LayerNormLayerRunner : LayerRunnerBase
 
     LayerRunResult run() override
     {
+        const sc_time layer_start = sc_time_stamp();
         start_ev.notify(SC_ZERO_TIME);
         wait(done_ev);
         const LayerNormSimulationStats stats = top->collect_stats();
-        return {convert_stats(stats), stats.verification_passed};
+        LayerRunResult result;
+        result.stats = convert_stats(stats);
+        result.stats.elapsed_cycles =
+            static_cast<uint64_t>((sc_time_stamp() - layer_start) / CYCLE);
+        result.stats.vec_pool.instances = top->cfg.vec_acc_instances;
+        result.stats.memory.instances = 1;
+        result.verification_passed = stats.verification_passed;
+        result.worker_stats = top->collect_worker_info();
+        finalize_layer_result(result);
+        return result;
     }
 };
 
@@ -211,10 +313,20 @@ struct PoolLayerRunner : LayerRunnerBase
 
     LayerRunResult run() override
     {
+        const sc_time layer_start = sc_time_stamp();
         start_ev.notify(SC_ZERO_TIME);
         wait(done_ev);
         const PoolSimulationStats stats = top->collect_stats();
-        return {convert_stats(stats), stats.verification_passed};
+        LayerRunResult result;
+        result.stats = convert_stats(stats);
+        result.stats.elapsed_cycles =
+            static_cast<uint64_t>((sc_time_stamp() - layer_start) / CYCLE);
+        result.stats.vec_pool.instances = top->cfg.vec_acc_instances;
+        result.stats.memory.instances = 1;
+        result.verification_passed = stats.verification_passed;
+        result.worker_stats = top->collect_worker_info();
+        finalize_layer_result(result);
+        return result;
     }
 };
 
@@ -250,6 +362,7 @@ struct VecOpsLayerRunner : LayerRunnerBase
     {
         LayerRunResult result;
         result.verification_passed = true;
+        const sc_time layer_start = sc_time_stamp();
 
         for (auto &phase : phases)
         {
@@ -259,14 +372,32 @@ struct VecOpsLayerRunner : LayerRunnerBase
             NafLayerStats converted = convert_stats(stats);
             result.stats.vec_reqs += converted.vec_reqs;
             result.stats.mem_reqs += converted.mem_reqs;
-            result.stats.accel_cycles += converted.accel_cycles;
-            result.stats.wait_cycles += converted.wait_cycles;
-            result.stats.mem_cycles += converted.mem_cycles;
             result.stats.rd_bytes += converted.rd_bytes;
             result.stats.wr_bytes += converted.wr_bytes;
+            result.stats.vec_pool.present = result.stats.vec_pool.present || converted.vec_pool.present;
+            result.stats.vec_pool.requests += converted.vec_pool.requests;
+            result.stats.vec_pool.queue_wait_cycles += converted.vec_pool.queue_wait_cycles;
+            result.stats.vec_pool.busy_cycles += converted.vec_pool.busy_cycles;
+            result.stats.vec_pool.occupied_cycles += converted.vec_pool.occupied_cycles;
+            result.stats.vec_pool.instances = phase->top->cfg.vec_acc_instances;
+            result.stats.memory.present = result.stats.memory.present || converted.memory.present;
+            result.stats.memory.requests += converted.memory.requests;
+            result.stats.memory.queue_wait_cycles += converted.memory.queue_wait_cycles;
+            result.stats.memory.busy_cycles += converted.memory.busy_cycles;
+            result.stats.memory.instances = 1;
             result.verification_passed &= stats.verification_passed;
+
+            for (const auto &wi : phase->top->collect_worker_info())
+            {
+                if (result.worker_stats.size() <= static_cast<size_t>(wi.tid))
+                    result.worker_stats.resize(static_cast<size_t>(wi.tid) + 1);
+                accumulate_worker_info(result.worker_stats[wi.tid], wi);
+            }
         }
 
+        result.stats.elapsed_cycles =
+            static_cast<uint64_t>((sc_time_stamp() - layer_start) / CYCLE);
+        finalize_layer_result(result);
         return result;
     }
 };
@@ -378,17 +509,6 @@ int sc_main(int argc, char *argv[])
     if (!parse_args(argc, argv, opts))
         return (argc > 1) ? 1 : 0;
 
-    if (opts.nafblock_only)
-    {
-        std::cout << "[Mode] nafblock-only: C=" << opts.block_c
-                  << " H=" << opts.block_h
-                  << " W=" << opts.block_w << "\n";
-    }
-    else if (opts.intro_only)
-    {
-        std::cout << "[Mode] intro-only: simulating only the intro CONV layer\n";
-    }
-
     NafTop top("nafnet_top", opts);
 
     if (opts.nafblock_only)
@@ -404,22 +524,39 @@ int sc_main(int argc, char *argv[])
     }
 
     sc_start();
-
-    std::cout << "\n--- Per-Layer Summary ---\n";
-    std::cout << std::left
-              << std::setw(22) << "Layer"
-              << std::setw(12) << "Backend"
-              << std::setw(12) << "MatReqs"
-              << std::setw(12) << "VecReqs"
-              << std::setw(12) << "MemReqs"
-              << std::setw(14) << "RdBytes"
-              << std::setw(14) << "WrBytes"
-              << std::setw(8) << "Check"
-              << "\n";
-    std::cout << std::string(106, '-') << "\n";
-
+    const uint64_t total_elapsed_cycles =
+        static_cast<uint64_t>(sc_time_stamp() / CYCLE);
     NafLayerStats totals;
+    totals.mat_pool.instances = MAT_ACCEL_COUNT_CFG;
+    totals.vec_pool.instances = VEC_ACCEL_COUNT_CFG;
+    totals.memory.instances = 1;
     bool all_layers_ok = true;
+    report::Table layer_summary;
+    layer_summary.headers = {
+        "Layer",
+        "Backend",
+        "Elapsed Cycles [cycles]",
+        "Matrix Requests [requests]",
+        "Vector Requests [requests]",
+        "Memory Requests [requests]",
+        "Read Bytes [bytes]",
+        "Write Bytes [bytes]",
+        "Verification",
+    };
+
+    std::vector<KernelWorkerInfo> global_worker(N_WORKERS);
+    for (int worker_id = 0; worker_id < N_WORKERS; ++worker_id)
+        global_worker[worker_id].tid = worker_id;
+
+    auto accumulate_resource = [](NafResourceStats &dst, const NafResourceStats &src) {
+        dst.present = dst.present || src.present;
+        dst.instances = std::max(dst.instances, src.instances);
+        dst.requests += src.requests;
+        dst.queue_wait_cycles += src.queue_wait_cycles;
+        dst.busy_cycles += src.busy_cycles;
+        dst.occupied_cycles += src.occupied_cycles;
+    };
+
     for (size_t i = 0; i < top.layers.size(); ++i)
     {
         const LayerDesc &layer = top.layers[i];
@@ -428,54 +565,177 @@ int sc_main(int argc, char *argv[])
         totals.mat_reqs += result.stats.mat_reqs;
         totals.vec_reqs += result.stats.vec_reqs;
         totals.mem_reqs += result.stats.mem_reqs;
-        totals.accel_cycles += result.stats.accel_cycles;
-        totals.cpu_cycles += result.stats.cpu_cycles;
-        totals.wait_cycles += result.stats.wait_cycles;
+        totals.scalar_cycles += result.stats.scalar_cycles;
+        totals.stall_cycles += result.stats.stall_cycles;
         totals.mem_cycles += result.stats.mem_cycles;
         totals.rd_bytes += result.stats.rd_bytes;
         totals.wr_bytes += result.stats.wr_bytes;
+        totals.elapsed_cycles += result.stats.elapsed_cycles;
+        accumulate_resource(totals.mat_pool, result.stats.mat_pool);
+        accumulate_resource(totals.vec_pool, result.stats.vec_pool);
+        accumulate_resource(totals.memory, result.stats.memory);
         all_layers_ok &= result.verification_passed;
 
-        std::cout << std::left
-                  << std::setw(22) << layer.name
-                  << std::setw(12) << layer_backend_str(layer.backend)
-                  << std::setw(12) << result.stats.mat_reqs
-                  << std::setw(12) << result.stats.vec_reqs
-                  << std::setw(12) << result.stats.mem_reqs
-                  << std::setw(14) << result.stats.rd_bytes
-                  << std::setw(14) << result.stats.wr_bytes
-                  << std::setw(8) << (result.verification_passed ? "PASS" : "FAIL")
-                  << "\n";
+        layer_summary.rows.push_back({
+            layer.name,
+            layer_backend_str(layer.backend),
+            report::fmt_u64(result.stats.elapsed_cycles),
+            report::fmt_u64(result.stats.mat_reqs),
+            report::fmt_u64(result.stats.vec_reqs),
+            report::fmt_u64(result.stats.mem_reqs),
+            report::fmt_u64(result.stats.rd_bytes),
+            report::fmt_u64(result.stats.wr_bytes),
+            result.verification_passed ? "PASS" : "FAIL",
+        });
+
+        for (const auto &worker : result.worker_stats)
+        {
+            if (worker.tid >= 0 && worker.tid < N_WORKERS)
+                accumulate_worker_info(global_worker[worker.tid], worker);
+        }
     }
 
-    std::cout << "\n--- Aggregate Summary ---\n";
-    std::cout << "Layers                  : " << top.layers.size() << "\n";
-    std::cout << "Total mat requests      : " << totals.mat_reqs << "\n";
-    std::cout << "Total vec requests      : " << totals.vec_reqs << "\n";
-    std::cout << "Total memory requests   : " << totals.mem_reqs << "\n";
-    std::cout << "Total accelerator cycles: " << totals.accel_cycles << "\n";
-    std::cout << "Total cpu cycles        : " << totals.cpu_cycles << "\n";
-    std::cout << "Total wait cycles       : " << totals.wait_cycles << "\n";
-    std::cout << "Total memory cycles     : " << totals.mem_cycles << "\n";
-    std::cout << "Total read bytes        : " << totals.rd_bytes << "\n";
-    std::cout << "Total write bytes       : " << totals.wr_bytes << "\n";
-
     bool manifest_ok = true;
+    std::string manifest_err;
     if (opts.nafblock_only)
     {
-        std::string err;
         manifest_ok = validate_nafblock_manifest(top.layers, "nafblock",
-                                                 opts.block_c, opts.block_h, opts.block_w, &err);
-        std::cout << "\n--- NafBlock Verification ---\n";
-        std::cout << "[" << (manifest_ok ? "PASS" : "FAIL") << "] manifest";
-        if (!manifest_ok)
-            std::cout << ": " << err;
-        std::cout << "\n";
+                                                 opts.block_c, opts.block_h, opts.block_w,
+                                                 &manifest_err);
     }
 
     bool pass = manifest_ok && all_layers_ok;
-    std::cout << "[" << (pass ? "PASS" : "FAIL")
-              << "] delegated kernel backend verification\n";
-    std::cout << (pass ? "\nAll checks passed.\n" : "\nSome checks FAILED.\n");
+
+    auto utilization = [total_elapsed_cycles](uint64_t busy_cycles, int instances) {
+        const double capacity =
+            static_cast<double>(total_elapsed_cycles) * static_cast<double>(instances);
+        return (capacity > 0.0)
+            ? static_cast<double>(busy_cycles) / capacity * 100.0
+            : 0.0;
+    };
+    auto occupancy = [total_elapsed_cycles](uint64_t occupied_cycles, int instances) {
+        const double capacity =
+            static_cast<double>(total_elapsed_cycles) * static_cast<double>(instances);
+        return (capacity > 0.0)
+            ? static_cast<double>(occupied_cycles) / capacity * 100.0
+            : 0.0;
+    };
+
+    report::print_section_title(std::cout, "Simulation Info");
+    report::print_fields(std::cout, {
+        {"Run Mode", opts.nafblock_only ? "NafBlock only" :
+                      (opts.intro_only ? "Intro layer only" : "Full NafNet pipeline")},
+        {"Layer Count [count]", report::fmt_u64(top.layers.size())},
+        {"NafBlock Tensor Shape", opts.nafblock_only
+            ? ("[C=" + report::fmt_int(opts.block_c) +
+               ", H=" + report::fmt_int(opts.block_h) +
+               ", W=" + report::fmt_int(opts.block_w) + "]")
+            : report::na()},
+    });
+
+    report::print_section_title(std::cout, "Hardware Configuration");
+    report::print_fields(std::cout, {
+        {"Workers [count]", report::fmt_int(N_WORKERS)},
+        {"Matrix Accelerators [count]", report::fmt_int(MAT_ACCEL_COUNT_CFG)},
+        {"Vector Accelerators [count]", report::fmt_int(VEC_ACCEL_COUNT_CFG)},
+        {"Matrix Accelerator Tile", "[" + report::fmt_u64(MATMUL_M) + " x " +
+                                     report::fmt_u64(MATMUL_K) + " x " +
+                                     report::fmt_u64(MATMUL_N) + "]"},
+        {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(VECTOR_ACC_CAP)},
+        {"Accelerator Queue Depth [requests]", report::fmt_u64(HW_ACC_QUEUE_DEPTH)},
+        {"Memory Bandwidth [bytes/cycle]",
+         "matrix=" + report::fmt_u64(HW_MATMUL_MEMORY_BYTES_PER_CYCLE) +
+         ", depth-wise convolution=" + report::fmt_u64(HW_DW_MEMORY_BYTES_PER_CYCLE) +
+         ", other kernels=" + report::fmt_u64(HW_MEMORY_BYTES_PER_CYCLE)},
+        {"Memory Base Latency [cycles]", report::fmt_u64(HW_MEMORY_BASE_LAT)},
+    });
+
+    report::print_section_title(std::cout, "Worker Summary");
+    for (size_t i = 0; i < top.layers.size(); ++i)
+    {
+        const LayerDesc &layer = top.layers[i];
+        const LayerRunResult &result = top.results[i];
+        report::print_subtitle(
+            std::cout,
+            std::string("Per-layer Worker Summary: ") + layer.name +
+            " (" + layer_backend_str(layer.backend) + ")");
+        report::print_table(std::cout, report::make_worker_summary_table(result.worker_stats));
+    }
+    report::print_subtitle(std::cout, "Aggregate Per-Worker Summary Across All Layers");
+    report::print_table(std::cout, report::make_worker_summary_table(global_worker));
+
+    report::print_section_title(std::cout, "Accelerator Summary");
+    report::print_table(std::cout, report::make_accelerator_summary_table({
+        {
+            "Matrix Accelerator",
+            "pool-level",
+            totals.mat_pool.present ? report::fmt_int(totals.mat_pool.instances) : report::na(),
+            totals.mat_pool.present ? report::fmt_u64(totals.mat_pool.requests) : report::na(),
+            totals.mat_pool.present ? report::fmt_u64(totals.mat_pool.queue_wait_cycles) : report::na(),
+            totals.mat_pool.present ? report::fmt_u64(totals.mat_pool.busy_cycles) : report::na(),
+            totals.mat_pool.present ? report::fmt_u64(totals.mat_pool.occupied_cycles) : report::na(),
+            totals.mat_pool.present ? report::fmt_percent(
+                utilization(totals.mat_pool.busy_cycles, totals.mat_pool.instances)) : report::na(),
+            totals.mat_pool.present ? report::fmt_percent(
+                occupancy(totals.mat_pool.occupied_cycles, totals.mat_pool.instances)) : report::na(),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Vector Accelerator",
+            "pool-level",
+            totals.vec_pool.present ? report::fmt_int(totals.vec_pool.instances) : report::na(),
+            totals.vec_pool.present ? report::fmt_u64(totals.vec_pool.requests) : report::na(),
+            totals.vec_pool.present ? report::fmt_u64(totals.vec_pool.queue_wait_cycles) : report::na(),
+            totals.vec_pool.present ? report::fmt_u64(totals.vec_pool.busy_cycles) : report::na(),
+            totals.vec_pool.present ? report::fmt_u64(totals.vec_pool.occupied_cycles) : report::na(),
+            totals.vec_pool.present ? report::fmt_percent(
+                utilization(totals.vec_pool.busy_cycles, totals.vec_pool.instances)) : report::na(),
+            totals.vec_pool.present ? report::fmt_percent(
+                occupancy(totals.vec_pool.occupied_cycles, totals.vec_pool.instances)) : report::na(),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Memory",
+            "shared resource",
+            "1",
+            report::fmt_u64(totals.memory.requests),
+            report::fmt_u64(totals.memory.queue_wait_cycles),
+            report::fmt_u64(totals.memory.busy_cycles),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::fmt_u64(totals.rd_bytes),
+            report::fmt_u64(totals.wr_bytes),
+        },
+    }));
+
+    report::print_section_title(std::cout, "Overall Summary");
+    report::print_subtitle(std::cout, "Per-Layer Summary");
+    report::print_table(std::cout, layer_summary);
+    report::print_subtitle(std::cout, "Aggregate Summary");
+    report::print_fields(std::cout, {
+        {"Layer Count [count]", report::fmt_u64(top.layers.size())},
+        {"Total Elapsed Cycles [cycles]", report::fmt_u64(total_elapsed_cycles)},
+        {"Total Matrix Accelerator Requests [requests]", report::fmt_u64(totals.mat_reqs)},
+        {"Total Vector Accelerator Requests [requests]", report::fmt_u64(totals.vec_reqs)},
+        {"Total Memory Requests [requests]", report::fmt_u64(totals.mem_reqs)},
+        {"Total Read Bytes [bytes]", report::fmt_u64(totals.rd_bytes)},
+        {"Total Write Bytes [bytes]", report::fmt_u64(totals.wr_bytes)},
+        {"Total Stall Cycles [cycles]", report::fmt_u64(totals.stall_cycles)},
+        {"Total Memory Cycles [cycles]", report::fmt_u64(totals.mem_cycles)},
+        {"Total Scalar Cycles [cycles]", report::fmt_u64(totals.scalar_cycles)},
+    });
+
+    report::print_section_title(std::cout, "Verification");
+    report::print_fields(std::cout, {
+        {"Delegated Kernel Verification", all_layers_ok ? "PASS" : "FAIL"},
+        {"NafBlock Manifest Verification", opts.nafblock_only
+            ? (manifest_ok ? "PASS" : ("FAIL: " + manifest_err))
+            : report::na()},
+        {"Overall Verification Status", pass ? "PASS" : "FAIL"},
+    });
+
     return pass ? 0 : 2;
 }

@@ -8,6 +8,7 @@
 #include "memory.h"
 
 #include <memory>
+#include <iosfwd>
 #include <systemc>
 #include <vector>
 
@@ -62,11 +63,13 @@ struct LayerNormSimulationStats
     uint64_t expected_vec_reqs = 0;
     uint64_t vec_acc_reqs = 0;
     uint64_t vec_acc_busy_cycles = 0;
+    uint64_t vec_acc_occupied_cycles = 0;
     uint64_t vec_acc_queue_wait_cycles = 0;
     uint64_t memory_reqs = 0;
     uint64_t memory_busy_cycles = 0;
     uint64_t memory_queue_wait_cycles = 0;
     double vec_util = 0.0;
+    double vec_occupancy = 0.0;
     bool verification_passed = false;
 };
 
@@ -91,5 +94,7 @@ struct LayerNormTop : sc_module
     ~LayerNormTop() override;
 
     LayerNormSimulationStats collect_stats() const;
+    std::vector<KernelWorkerInfo> collect_worker_info() const;
+    void print_report(std::ostream &os) const;
     void done_monitor();
 };

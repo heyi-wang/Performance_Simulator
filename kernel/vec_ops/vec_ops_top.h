@@ -8,6 +8,7 @@
 #include "vec_ops_config.h"
 
 #include <memory>
+#include <iosfwd>
 #include <systemc>
 #include <vector>
 
@@ -98,5 +99,7 @@ struct VecOpsTop : sc_module
     ~VecOpsTop() override;
 
     VecOpsSimulationStats collect_stats() const;
+    std::vector<KernelWorkerInfo> collect_worker_info() const;
+    void print_report(std::ostream &os) const;
     void done_monitor();
 };

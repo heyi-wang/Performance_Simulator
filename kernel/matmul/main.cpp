@@ -43,15 +43,6 @@ int sc_main(int argc, char *argv[])
     MatmulRuntimeConfig cfg = MatmulRuntimeConfig::defaults(thread_count);
     MatmulTop top("top", cfg);
 
-    std::cout << "=== K-split GEMM Performance Simulator ===\n";
-    std::cout << "Threads              : " << cfg.thread_count << "\n";
-    std::cout << "Active threads       : " << cfg.active_thread_count() << "\n";
-    std::cout << "Mat accels           : " << cfg.mat_accel_count << "\n";
-    std::cout << "Vec accels           : " << cfg.vec_accel_count << "\n";
-    std::cout << "GEMM shape           : [" << cfg.gemm_m() << " x "
-              << cfg.gemm_k() << " x " << cfg.gemm_n() << "]\n";
-    std::cout << "K per thread         : " << cfg.gemm_k_per_thread() << "\n";
-
     sc_start();
 
     const MatmulSimulationStats stats = top.collect_stats();
@@ -63,11 +54,5 @@ int sc_main(int argc, char *argv[])
         stats.vec_req_total == stats.expected_vec_req_total &&
         stats.mat_req_total == stats.expected_mat_req_total;
 
-    std::cout << "\n=== Verification ===\n";
-    std::cout << "mat reqs             : " << stats.mat_req_total
-              << " (expected " << stats.expected_mat_req_total << ")\n";
-    std::cout << "vec reqs             : " << stats.vec_req_total
-              << " (expected " << stats.expected_vec_req_total << ")\n";
-    std::cout << "final status         : " << (pass ? "PASS" : "FAIL") << "\n";
     return pass ? 0 : 2;
 }

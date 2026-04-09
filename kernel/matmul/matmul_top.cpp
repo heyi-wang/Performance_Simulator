@@ -4,6 +4,8 @@
 #include <iomanip>
 #include <iostream>
 
+#include "report_formatter.h"
+
 MatmulTop::MatmulTop(sc_module_name nm,
                      const MatmulRuntimeConfig &cfg_,
                      sc_event *start_event,
@@ -183,52 +185,155 @@ MatmulSimulationStats MatmulTop::collect_stats() const
     return stats;
 }
 
+std::vector<KernelWorkerInfo> MatmulTop::collect_worker_info() const
+{
+    std::vector<KernelWorkerInfo> info;
+    info.reserve(workers.size());
+
+    for (const auto *w : workers)
+    {
+        KernelWorkerInfo wi;
+        wi.tid = w->tid;
+        wi.mat_reqs = w->mat_calls;
+        wi.vec_reqs = w->vec_calls;
+        wi.elapsed_cycles = w->elapsed_cycles;
+        wi.stall_cycles = w->stall_cycles;
+        wi.mem_cycles = w->mem_cycles_accum;
+
+        const uint64_t service_cycles =
+            w->mat_calls * w->mat_cycles +
+            w->vec_calls * w->vec_cycles;
+        wi.scalar_cycles = (w->compute_cycles >= service_cycles)
+            ? (w->compute_cycles - service_cycles)
+            : 0;
+
+        wi.rd_bytes =
+            w->mat_calls * (w->A_bytes + w->B_bytes) +
+            w->accum_vec_calls * cfg.gemm_accum_rd_bytes() +
+            w->quant_vec_calls * cfg.gemm_quant_rd_bytes();
+        wi.wr_bytes =
+            w->mat_calls * w->C_bytes +
+            w->accum_vec_calls * cfg.gemm_accum_wr_bytes() +
+            w->quant_vec_calls * cfg.gemm_quant_wr_bytes();
+        info.push_back(wi);
+    }
+
+    return info;
+}
+
 void MatmulTop::print_report(std::ostream &os) const
 {
     const MatmulSimulationStats stats = collect_stats();
+    const std::vector<KernelWorkerInfo> worker_info = collect_worker_info();
 
-    os << "\n=== Accelerator stats ===\n";
-    os << "mat_acc pool : units=" << mat_acc.instance_count()
-       << "  reqs=" << stats.mat_req_total
-       << "  busy_cycles=" << stats.mat_busy_total
-       << "  occupied_cycles=" << stats.mat_occupied_total
-       << "  shared_qwait_cycles=" << stats.mat_qwait_total << "\n";
-    os << "vec_acc pool : units=" << vec_acc.instance_count()
-       << "  reqs=" << stats.vec_req_total
-       << "  busy_cycles=" << stats.vec_busy_total
-       << "  occupied_cycles=" << stats.vec_occupied_total
-       << "  shared_qwait_cycles=" << stats.vec_qwait_total << "\n";
-    os << "memory  : reqs=" << stats.memory_reqs
-       << "  busy_cycles=" << stats.memory_busy_cycles
-       << "  queue_wait_cycles=" << stats.memory_queue_wait_cycles << "\n";
+    uint64_t total_scalar_cycles = 0;
+    uint64_t total_stall_cycles = 0;
+    uint64_t total_mem_cycles = 0;
+    for (const auto &worker : worker_info)
+    {
+        total_scalar_cycles += worker.scalar_cycles;
+        total_stall_cycles += worker.stall_cycles;
+        total_mem_cycles += worker.mem_cycles;
+    }
 
-    os << "\n=== Performance summary ===\n";
-    os << std::fixed << std::setprecision(2);
-    os << "GEMM               : [" << cfg.gemm_m() << " x "
-       << cfg.gemm_k() << " x " << cfg.gemm_n() << "]\n";
-    os << "Threads            : " << cfg.thread_count << "\n";
-    os << "Active threads     : " << cfg.active_thread_count() << "\n";
-    os << "Total MACs         : " << stats.total_macs << "\n";
-    os << "Mat phase          : " << stats.max_mat_elapsed
-       << " cycles  (critical-path worker)\n";
-    os << "Accum overhead     : " << stats.accum_overhead
-       << " cycles  (beyond worker mat critical path)\n";
-    os << "Total elapsed      : " << stats.total_elapsed << " cycles\n";
-    os << "Throughput         : " << stats.gflops << " GFLOPS  (at 1 GHz)\n";
-    os << "mat_acc occupancy  : " << stats.mat_occupancy << "%\n";
-    os << "mat_acc compute    : " << stats.mat_compute_util << "%\n";
-    os << "vec_acc occupancy  : " << stats.vec_occupancy << "%\n";
-    os << "vec_acc compute    : " << stats.vec_compute_util << "%\n";
-    os << "Mem BW avg         : " << stats.mem_bw << " bytes/cycle\n";
-    os << "Worker mat stall   : " << stats.total_worker_stall
-       << " cycles  (all worker-side backpressure across mat/reduction/quant)\n";
-    os << "Post-mat stall     : " << stats.coordinator_stall
-       << " cycles  (worker-driven reduction/final-quant vec backpressure)\n";
-    os << "Post-mat compute   : " << stats.coordinator_compute
-       << " cycles  (worker-driven reduction/final-quant scalar+service time)\n";
-    os << "Read bytes         : " << stats.total_rd_bytes << "\n";
-    os << "Write bytes        : " << stats.total_wr_bytes << "\n";
-    os << "Verification       : " << (stats.verification_passed ? "PASS" : "FAIL") << "\n";
+    report::print_section_title(os, "Simulation Info");
+    report::print_fields(os, {
+        {"Operation Type", "K-split General Matrix Multiply"},
+        {"GEMM Shape", "[" + report::fmt_u64(cfg.gemm_m()) + " x " +
+                       report::fmt_u64(cfg.gemm_k()) + " x " +
+                       report::fmt_u64(cfg.gemm_n()) + "]"},
+        {"K per Worker", report::fmt_u64(cfg.gemm_k_per_thread())},
+        {"Active Workers [count]", report::fmt_int(cfg.active_thread_count())},
+    });
+
+    report::print_section_title(os, "Hardware Configuration");
+    report::print_fields(os, {
+        {"Workers [count]", report::fmt_int(cfg.thread_count)},
+        {"Matrix Accelerators [count]", report::fmt_int(cfg.mat_accel_count)},
+        {"Vector Accelerators [count]", report::fmt_int(cfg.vec_accel_count)},
+        {"Matrix Accelerator Tile", "[" + report::fmt_u64(MATMUL_M) + " x " +
+                                     report::fmt_u64(MATMUL_K) + " x " +
+                                     report::fmt_u64(MATMUL_N) + "]"},
+        {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(VECTOR_ACC_CAP)},
+        {"Matrix Accelerator Queue Depth [requests]", report::fmt_u64(cfg.mat_acc_queue_cap())},
+        {"Vector Accelerator Queue Depth [requests]", report::fmt_u64(cfg.vec_acc_queue_cap())},
+        {"Memory Bandwidth [bytes/cycle]", report::fmt_u64(cfg.memory_bw)},
+        {"Memory Base Latency [cycles]", report::fmt_u64(cfg.memory_base_lat)},
+    });
+
+    report::print_section_title(os, "Worker Summary");
+    report::print_table(os, report::make_worker_summary_table(worker_info));
+
+    report::print_section_title(os, "Accelerator Summary");
+    report::print_table(os, report::make_accelerator_summary_table({
+        {
+            "Matrix Accelerator",
+            "pool-level",
+            report::fmt_int(cfg.mat_accel_count),
+            report::fmt_u64(stats.mat_req_total),
+            report::fmt_u64(stats.mat_qwait_total),
+            report::fmt_u64(stats.mat_busy_total),
+            report::fmt_u64(stats.mat_occupied_total),
+            report::fmt_percent(stats.mat_compute_util),
+            report::fmt_percent(stats.mat_occupancy),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Vector Accelerator",
+            "pool-level",
+            report::fmt_int(cfg.vec_accel_count),
+            report::fmt_u64(stats.vec_req_total),
+            report::fmt_u64(stats.vec_qwait_total),
+            report::fmt_u64(stats.vec_busy_total),
+            report::fmt_u64(stats.vec_occupied_total),
+            report::fmt_percent(stats.vec_compute_util),
+            report::fmt_percent(stats.vec_occupancy),
+            report::na(),
+            report::na(),
+        },
+        {
+            "Memory",
+            "shared resource",
+            "1",
+            report::fmt_u64(stats.memory_reqs),
+            report::fmt_u64(stats.memory_queue_wait_cycles),
+            report::fmt_u64(stats.memory_busy_cycles),
+            report::na(),
+            report::na(),
+            report::na(),
+            report::fmt_u64(stats.total_rd_bytes),
+            report::fmt_u64(stats.total_wr_bytes),
+        },
+    }));
+
+    report::print_section_title(os, "Overall Summary");
+    report::print_fields(os, {
+        {"Total Elapsed Cycles [cycles]", report::fmt_u64(stats.total_elapsed)},
+        {"Total Matrix Accelerator Requests [requests]", report::fmt_u64(stats.mat_req_total)},
+        {"Total Vector Accelerator Requests [requests]", report::fmt_u64(stats.vec_req_total)},
+        {"Total Memory Requests [requests]", report::fmt_u64(stats.memory_reqs)},
+        {"Total Read Bytes [bytes]", report::fmt_u64(stats.total_rd_bytes)},
+        {"Total Write Bytes [bytes]", report::fmt_u64(stats.total_wr_bytes)},
+        {"Total Stall Cycles [cycles]", report::fmt_u64(total_stall_cycles)},
+        {"Total Memory Cycles [cycles]", report::fmt_u64(total_mem_cycles)},
+        {"Total Scalar Cycles [cycles]", report::fmt_u64(total_scalar_cycles)},
+        {"Total MACs [operations]", report::fmt_u64(stats.total_macs)},
+        {"Mat Phase Critical Path [cycles]", report::fmt_u64(stats.max_mat_elapsed)},
+        {"Post-Mat Overhead [cycles]", report::fmt_u64(stats.accum_overhead)},
+        {"Throughput @ 1 GHz [GFLOPS]", report::fmt_double(stats.gflops)},
+        {"Average Memory Bandwidth [bytes/cycle]", report::fmt_rate(stats.mem_bw, "bytes/cycle")},
+        {"Post-Mat Stall Cycles [cycles]", report::fmt_u64(stats.coordinator_stall)},
+    });
+
+    report::print_section_title(os, "Verification");
+    report::print_fields(os, {
+        {"Expected Matrix Accelerator Requests [requests]", report::fmt_u64(stats.expected_mat_req_total)},
+        {"Actual Matrix Accelerator Requests [requests]", report::fmt_u64(stats.mat_req_total)},
+        {"Expected Vector Accelerator Requests [requests]", report::fmt_u64(stats.expected_vec_req_total)},
+        {"Actual Vector Accelerator Requests [requests]", report::fmt_u64(stats.vec_req_total)},
+        {"Verification Status", stats.verification_passed ? "PASS" : "FAIL"},
+    });
 }
 
 void MatmulTop::done_monitor()

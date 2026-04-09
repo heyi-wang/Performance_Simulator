@@ -192,6 +192,7 @@ struct MatmulTop : sc_module
     ~MatmulTop() override;
 
     MatmulSimulationStats collect_stats() const;
+    std::vector<KernelWorkerInfo> collect_worker_info() const;
     void print_report(std::ostream &os) const;
     void done_monitor();
 };

@@ -183,7 +183,7 @@ void Worker::issue_end(PendingReq &p)
     p.gp->get_extension(ext);
 
     uint64_t qwait = ext ? ext->accel_qwait_cycles : 0;
-    wait_cycles      += qwait + p.stall_cycles;
+    wait_cycles      += qwait;
     stall_cycles     += p.stall_cycles;
     compute_cycles   += p.svc_cycles;
     mem_cycles_accum += ext ? ext->mem_cycles : 0;
