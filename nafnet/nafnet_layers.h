@@ -23,6 +23,9 @@ enum LayerOpKind
     LAYER_OP_SIMPLEGATE,
     LAYER_OP_GAP,
     LAYER_OP_SCA_SCALE,
+    LAYER_OP_SCA_CONV,
+    LAYER_OP_PIXELSHUFFLE,
+    LAYER_OP_SKIP_ADD,
     LAYER_OP_RESIDUAL,
 };
 
@@ -93,6 +96,9 @@ static inline const char *layer_op_kind_str(LayerOpKind op)
     case LAYER_OP_SIMPLEGATE: return "SIMPLEGATE";
     case LAYER_OP_GAP:        return "GAP";
     case LAYER_OP_SCA_SCALE:  return "SCA_SCALE";
+    case LAYER_OP_SCA_CONV:   return "SCA_CONV";
+    case LAYER_OP_PIXELSHUFFLE: return "PIXELSHUFFLE";
+    case LAYER_OP_SKIP_ADD:   return "SKIP_ADD";
     case LAYER_OP_RESIDUAL:   return "RESIDUAL";
     }
     return "UNKNOWN";
@@ -208,6 +214,41 @@ static inline LayerDesc make_scale_layer(int &id_ctr,
                       LAYER_OP_SCA_SCALE, BACKEND_VECOPS,
                       H, W, C, H, W, C,
                       1, 1, 1, 0, 1, 1, VOP_SCALAR_MUL);
+}
+
+static inline LayerDesc make_sca_conv_layer(int &id_ctr,
+                                            const char *name,
+                                            int C)
+{
+    return make_layer(id_ctr, name,
+                      LAYER_OP_SCA_CONV, BACKEND_VECOPS,
+                      1, 1, C, 1, 1, C,
+                      1, 1, 1, 0, 1, 2,
+                      VOP_SCA_DOT_I8_TO_I32,
+                      VOP_SCA_BIAS_QUANT_I32_TO_I8);
+}
+
+static inline LayerDesc make_skip_add_layer(int &id_ctr,
+                                            const char *name,
+                                            int H, int W, int C)
+{
+    return make_layer(id_ctr, name,
+                      LAYER_OP_SKIP_ADD, BACKEND_VECOPS,
+                      H, W, C, H, W, C,
+                      1, 1, 1, 0, 1, 1, VOP_ELEMWISE_ADD);
+}
+
+static inline LayerDesc make_pixelshuffle_layer(int &id_ctr,
+                                                const char *name,
+                                                int Hin, int Win, int Cin,
+                                                int upscale = 2)
+{
+    const int spatial_scale = upscale * upscale;
+    return make_layer(id_ctr, name,
+                      LAYER_OP_PIXELSHUFFLE, BACKEND_VECOPS,
+                      Hin, Win, Cin,
+                      Hin * upscale, Win * upscale, Cin / spatial_scale,
+                      1, 1, 1, 0, 1, 1, VOP_PIXELSHUFFLE_MOVE);
 }
 
 static inline LayerDesc make_residual_layer(int &id_ctr,
@@ -338,6 +379,13 @@ static inline uint64_t naf_vecop_requests_per_channel(uint64_t spatial, VopType 
     return cdiv64(spatial, vop_tile_cap_elems(op));
 }
 
+static inline uint64_t naf_vecop_extent_per_channel(const LayerDesc &l, VopType op)
+{
+    if (op == VOP_SCA_DOT_I8_TO_I32)
+        return static_cast<uint64_t>(l.Cin);
+    return static_cast<uint64_t>(l.Hout) * l.Wout;
+}
+
 static inline uint64_t naf_dwconv_strip_rd_bytes(const LayerDesc &l,
                                                  int oh,
                                                  uint64_t strip_start,
@@ -466,17 +514,17 @@ static inline LayerExpectedStats expected_layer_stats(const LayerDesc &l, int n_
 
     case BACKEND_VECOPS:
     {
-        uint64_t spatial = static_cast<uint64_t>(l.Hout) * l.Wout;
         auto accumulate_op = [&](VopType op) {
+            uint64_t extent = naf_vecop_extent_per_channel(l, op);
             uint64_t tile_cap = vop_tile_cap_elems(op);
-            uint64_t n_tiles = cdiv64(spatial, tile_cap);
+            uint64_t n_tiles = cdiv64(extent, tile_cap);
             stats.vec_reqs += static_cast<uint64_t>(l.Cout) * n_tiles;
             stats.accel_cycles += static_cast<uint64_t>(l.Cout) * n_tiles * VOP_VEC_ACC_CYCLE;
             for (int c = 0; c < l.Cout; ++c)
             {
                 for (uint64_t t = 0; t < n_tiles; ++t)
                 {
-                    uint64_t tile_elems = std::min<uint64_t>(tile_cap, spatial - t * tile_cap);
+                    uint64_t tile_elems = std::min<uint64_t>(tile_cap, extent - t * tile_cap);
                     stats.rd_bytes += vop_rd_bytes(op, tile_elems);
                     stats.wr_bytes += vop_wr_bytes(op, tile_elems);
                 }
@@ -516,7 +564,7 @@ static inline void append_nafblock_layers(std::vector<LayerDesc> &layers,
     layers.push_back(make_gap_layer(id, nm, H, W, C));
 
     std::snprintf(nm, sizeof(nm), "%s_sca_conv", prefix);
-    layers.push_back(make_conv_layer(id, nm, 1, 1, C, 1, 1, C, 1, 1, 1, 0));
+    layers.push_back(make_sca_conv_layer(id, nm, C));
 
     std::snprintf(nm, sizeof(nm), "%s_sca_scale", prefix);
     layers.push_back(make_scale_layer(id, nm, H, W, C));
@@ -563,13 +611,13 @@ static inline bool validate_nafblock_manifest(const std::vector<LayerDesc> &laye
     }};
     static const std::array<LayerOpKind, 14> ops = {{
         LAYER_OP_LAYERNORM, LAYER_OP_CONV, LAYER_OP_DWCONV, LAYER_OP_SIMPLEGATE,
-        LAYER_OP_GAP, LAYER_OP_CONV, LAYER_OP_SCA_SCALE, LAYER_OP_CONV,
+        LAYER_OP_GAP, LAYER_OP_SCA_CONV, LAYER_OP_SCA_SCALE, LAYER_OP_CONV,
         LAYER_OP_RESIDUAL, LAYER_OP_LAYERNORM, LAYER_OP_CONV, LAYER_OP_SIMPLEGATE,
         LAYER_OP_CONV, LAYER_OP_RESIDUAL
     }};
     static const std::array<LayerBackend, 14> backends = {{
         BACKEND_LAYERNORM, BACKEND_MATMUL, BACKEND_DWCONV, BACKEND_VECOPS,
-        BACKEND_POOLING, BACKEND_MATMUL, BACKEND_VECOPS, BACKEND_MATMUL,
+        BACKEND_POOLING, BACKEND_VECOPS, BACKEND_VECOPS, BACKEND_MATMUL,
         BACKEND_VECOPS, BACKEND_LAYERNORM, BACKEND_MATMUL, BACKEND_VECOPS,
         BACKEND_MATMUL, BACKEND_VECOPS
     }};
@@ -609,6 +657,9 @@ static inline bool validate_nafblock_manifest(const std::vector<LayerDesc> &laye
         dw.Cin == 2 * C && dw.Cout == 2 * C && dw.groups == 2 * C &&
         gap.Cin == C && gap.Cout == C && gap.Hout == 1 && gap.Wout == 1 &&
         sca_c.Hin == 1 && sca_c.Win == 1 && sca_c.Cin == C && sca_c.Cout == C &&
+        sca_c.phase_count == 2 &&
+        sca_c.primary_vop == VOP_SCA_DOT_I8_TO_I32 &&
+        sca_c.secondary_vop == VOP_SCA_BIAS_QUANT_I32_TO_I8 &&
         res1.Cin == C && res1.Cout == C && res1.Hout == H && res1.Wout == W;
 
     if (!ok && error)
@@ -620,15 +671,15 @@ static inline bool validate_nafblock_manifest(const std::vector<LayerDesc> &laye
 inline std::vector<LayerDesc> build_nafnet32_layers()
 {
     std::vector<LayerDesc> layers;
-    layers.reserve(768);
+    layers.reserve(544);
     int id = 0;
     char nm[64];
 
     static const int ENC_CH[4]   = {  32,  64, 128, 256 };
-    static const int ENC_H[4]    = {  64,  32,  16,   8 };
+    static const int ENC_H[4]    = { 512, 256, 128,  64 };
     static const int ENC_NBLK[4] = {   2,   2,   4,   8 };
 
-    layers.push_back(make_conv_layer(id, "intro", 64, 64, 3, 64, 64, 32, 3, 3, 1, 1));
+    layers.push_back(make_conv_layer(id, "intro", 512, 512, 3, 512, 512, 32, 3, 3, 1, 1));
 
     for (int lvl = 0; lvl < 4; ++lvl)
     {
@@ -648,17 +699,18 @@ inline std::vector<LayerDesc> build_nafnet32_layers()
     for (int b = 0; b < 12; ++b)
     {
         std::snprintf(nm, sizeof(nm), "mid_blk%d", b);
-        append_nafblock_layers(layers, id, nm, 512, 4, 4);
+        append_nafblock_layers(layers, id, nm, 512, 32, 32);
     }
 
     static const int DEC_CH[4]  = { 256, 128,  64,  32 };
-    static const int DEC_H[4]   = {   8,  16,  32,  64 };
+    static const int DEC_H[4]   = {  64, 128, 256, 512 };
     static const int DEC_CIN[4] = { 512, 256, 128,  64 };
+    static const int DEC_NBLK[4] = {   2,   2,   2,   2 };
 
     for (int lvl = 0; lvl < 4; ++lvl)
     {
         int Cin = DEC_CIN[lvl];
-        int Hin = (lvl == 0) ? 4 : DEC_H[lvl - 1];
+        int Hin = (lvl == 0) ? 32 : DEC_H[lvl - 1];
 
         std::snprintf(nm, sizeof(nm), "ups_%d", lvl);
         layers.push_back(make_conv_layer(id, nm,
@@ -666,11 +718,20 @@ inline std::vector<LayerDesc> build_nafnet32_layers()
                                          Hin, Hin, DEC_CH[lvl] * 4,
                                          1, 1, 1, 0));
 
-        std::snprintf(nm, sizeof(nm), "dec%d_blk0", lvl);
-        append_nafblock_layers(layers, id, nm, DEC_CH[lvl], DEC_H[lvl], DEC_H[lvl]);
+        std::snprintf(nm, sizeof(nm), "ups_%d_pixelshuffle", lvl);
+        // layers.push_back(make_pixelshuffle_layer(id, nm, Hin, Hin, DEC_CH[lvl] * 4));
+
+        std::snprintf(nm, sizeof(nm), "dec%d_skip_add", lvl);
+        layers.push_back(make_skip_add_layer(id, nm, DEC_H[lvl], DEC_H[lvl], DEC_CH[lvl]));
+
+        for (int b = 0; b < DEC_NBLK[lvl]; ++b)
+        {
+            std::snprintf(nm, sizeof(nm), "dec%d_blk%d", lvl, b);
+            append_nafblock_layers(layers, id, nm, DEC_CH[lvl], DEC_H[lvl], DEC_H[lvl]);
+        }
     }
 
-    layers.push_back(make_conv_layer(id, "ending", 64, 64, 32, 64, 64, 3, 1, 1, 1, 0));
+    layers.push_back(make_conv_layer(id, "ending", 512, 512, 32, 512, 512, 3, 3, 3, 1, 1));
 
     return layers;
 }

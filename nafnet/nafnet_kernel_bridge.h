@@ -65,6 +65,7 @@ inline VecOpsRuntimeConfig make_vecops_runtime_config(const LayerDesc &layer, Vo
     cfg.channels = layer.Cout;
     cfg.height = layer.Hout;
     cfg.width = layer.Wout;
+    cfg.reduce_len = (op == VOP_SCA_DOT_I8_TO_I32) ? layer.Cin : 0;
     cfg.worker_count = N_WORKERS;
     return cfg;
 }
