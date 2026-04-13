@@ -19,6 +19,7 @@ struct VecOpsRuntimeConfig
     int channels = VOP_C;
     int height = VOP_H;
     int width = VOP_W;
+    int reduce_len = 0;
     int worker_count = VOP_NUM_WORKERS;
     uint64_t vec_acc_cap = VOP_VEC_ACC_CAP;
     uint64_t vec_acc_cycle = VOP_VEC_ACC_CYCLE;
@@ -34,6 +35,12 @@ struct VecOpsRuntimeConfig
     }
 
     int spatial() const { return height * width; }
+    int work_items_per_channel() const
+    {
+        if (op == VOP_SCA_DOT_I8_TO_I32)
+            return (reduce_len > 0) ? reduce_len : spatial();
+        return spatial();
+    }
     uint64_t tile_cap() const
     {
         switch (vop_vec_shape(op))
@@ -48,7 +55,7 @@ struct VecOpsRuntimeConfig
     int tile_count() const
     {
         return static_cast<int>(
-            ceil_div_u64(static_cast<uint64_t>(spatial()), tile_cap()));
+            ceil_div_u64(static_cast<uint64_t>(work_items_per_channel()), tile_cap()));
     }
 };
 

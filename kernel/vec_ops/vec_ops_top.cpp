@@ -31,6 +31,10 @@ static uint64_t cfg_rd_bytes(const VecOpsRuntimeConfig &cfg, uint64_t vl)
     case VOP_ELEMWISE_ADD:         return vl * cfg.elem_bytes * 2;
     case VOP_ELEMWISE_MUL:         return vl * cfg.elem_bytes * 2;
     case VOP_SCALAR_MUL:           return vl * cfg.elem_bytes;
+    case VOP_PIXELSHUFFLE_MOVE:    return vl * cfg.elem_bytes;
+    case VOP_SCA_DOT_I8_TO_I32:    return vl * 2;
+    case VOP_SCA_BIAS_QUANT_I32_TO_I8:
+        return (vl > 0) ? 8 : 0;
     case VOP_QUANTIZE_I32_TO_I8:   return vl * 4;
     case VOP_DEQUANTIZE_I8_TO_I32: return vl * 1;
     case VOP_BIAS_ADD_I32:         return vl * 4;
@@ -45,6 +49,10 @@ static uint64_t cfg_wr_bytes(const VecOpsRuntimeConfig &cfg, uint64_t vl)
     case VOP_ELEMWISE_ADD:         return vl * cfg.elem_bytes;
     case VOP_ELEMWISE_MUL:         return vl * cfg.elem_bytes;
     case VOP_SCALAR_MUL:           return vl * cfg.elem_bytes;
+    case VOP_PIXELSHUFFLE_MOVE:    return vl * cfg.elem_bytes;
+    case VOP_SCA_DOT_I8_TO_I32:    return 0;
+    case VOP_SCA_BIAS_QUANT_I32_TO_I8:
+        return (vl > 0) ? 1 : 0;
     case VOP_QUANTIZE_I32_TO_I8:   return vl * 1;
     case VOP_DEQUANTIZE_I8_TO_I32: return vl * 4;
     case VOP_BIAS_ADD_I32:         return vl * 4;
@@ -324,6 +332,8 @@ struct VecOpsWorker : sc_module
         int c_end = ((tid + 1) * cfg.channels) / n_workers;
         const uint64_t tile_cap = cfg_tile_cap(cfg);
         const uint64_t extra_rd = cfg_extra_rd_bytes_per_channel(cfg);
+        const uint64_t work_items =
+            static_cast<uint64_t>(cfg.work_items_per_channel());
 
         for (int c = c_start; c < c_end; ++c)
         {
@@ -341,7 +351,7 @@ struct VecOpsWorker : sc_module
             {
                 uint64_t tile_elems =
                     std::min<uint64_t>(tile_cap,
-                                       static_cast<uint64_t>(cfg.spatial()) -
+                                       work_items -
                                            static_cast<uint64_t>(t) * tile_cap);
                 uint64_t rd = cfg_rd_bytes(cfg, tile_elems);
                 uint64_t wr = cfg_wr_bytes(cfg, tile_elems);
@@ -420,6 +430,8 @@ VecOpsSimulationStats VecOpsTop::collect_stats() const
     VecOpsSimulationStats stats;
     const uint64_t tile_cap = cfg_tile_cap(cfg);
     const uint64_t extra_rd_per_channel = cfg_extra_rd_bytes_per_channel(cfg);
+    const uint64_t work_items =
+        static_cast<uint64_t>(cfg.work_items_per_channel());
 
     for (const auto *w : workers)
     {
@@ -439,7 +451,7 @@ VecOpsSimulationStats VecOpsTop::collect_stats() const
     {
         uint64_t vl = std::min<uint64_t>(
             tile_cap,
-            static_cast<uint64_t>(cfg.spatial()) - static_cast<uint64_t>(t) * tile_cap);
+            work_items - static_cast<uint64_t>(t) * tile_cap);
         per_chan_rd += cfg_rd_bytes(cfg, vl);
         per_chan_wr += cfg_wr_bytes(cfg, vl);
     }

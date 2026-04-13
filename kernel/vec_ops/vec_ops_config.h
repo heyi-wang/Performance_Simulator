@@ -25,6 +25,9 @@ enum VopType
     VOP_ELEMWISE_ADD,        // mf_elemwise_add_i8:       rd = 2*vl*elem, wr = vl*elem
     VOP_ELEMWISE_MUL,        // mf_elemwise_mul_i8:       rd = 2*vl*elem, wr = vl*elem
     VOP_SCALAR_MUL,          // mf_elemwise_mul_scalar_i8: rd = vl*elem,  wr = vl*elem
+    VOP_PIXELSHUFFLE_MOVE,   // PixelShuffle repack:      rd = vl*elem,  wr = vl*elem
+    VOP_SCA_DOT_I8_TO_I32,   // SCA 1x1 reduction:        rd = 2*vl,      wr = 0
+    VOP_SCA_BIAS_QUANT_I32_TO_I8, // SCA 1x1 finalize:   rd = 8,         wr = 1
     VOP_QUANTIZE_I32_TO_I8,  // mf_quantize_i32_to_i8:   rd = vl*4,     wr = vl*1
     VOP_DEQUANTIZE_I8_TO_I32,// mf_dequantize_i8_to_i32: rd = vl*1,     wr = vl*4
     VOP_BIAS_ADD_I32,        // mf_bias_add_i32:          rd = vl*4,     wr = vl*4
@@ -109,6 +112,9 @@ static inline VopVecShape vop_vec_shape(VopType op)
     case VOP_ELEMWISE_ADD:         return VopVecShape::E8M4;
     case VOP_ELEMWISE_MUL:         return VopVecShape::E8M4;
     case VOP_SCALAR_MUL:           return VopVecShape::E8M4;
+    case VOP_PIXELSHUFFLE_MOVE:    return VopVecShape::E8M4;
+    case VOP_SCA_DOT_I8_TO_I32:    return VopVecShape::E8M4;
+    case VOP_SCA_BIAS_QUANT_I32_TO_I8:
     case VOP_QUANTIZE_I32_TO_I8:   return VopVecShape::E32M4;
     case VOP_DEQUANTIZE_I8_TO_I32: return VopVecShape::E8M1;
     case VOP_BIAS_ADD_I32:         return VopVecShape::E32M4;
@@ -148,6 +154,10 @@ static inline uint64_t vop_rd_bytes(VopType op, uint64_t vl)
     case VOP_ELEMWISE_ADD:         return vl * VOP_ELEM_BYTES * 2;
     case VOP_ELEMWISE_MUL:         return vl * VOP_ELEM_BYTES * 2;
     case VOP_SCALAR_MUL:           return vl * VOP_ELEM_BYTES;
+    case VOP_PIXELSHUFFLE_MOVE:    return vl * VOP_ELEM_BYTES;
+    case VOP_SCA_DOT_I8_TO_I32:    return vl * 2;
+    case VOP_SCA_BIAS_QUANT_I32_TO_I8:
+        return (vl > 0) ? 8 : 0;
     case VOP_QUANTIZE_I32_TO_I8:   return vl * 4;
     case VOP_DEQUANTIZE_I8_TO_I32: return vl * 1;
     case VOP_BIAS_ADD_I32:         return vl * 4;
@@ -165,6 +175,9 @@ static inline uint64_t vop_extra_rd_bytes_per_channel(VopType op)
     case VOP_ELEMWISE_ADD:
     case VOP_ELEMWISE_MUL:
     case VOP_SCALAR_MUL:
+    case VOP_PIXELSHUFFLE_MOVE:
+    case VOP_SCA_DOT_I8_TO_I32:
+    case VOP_SCA_BIAS_QUANT_I32_TO_I8:
     case VOP_QUANTIZE_I32_TO_I8:
     case VOP_DEQUANTIZE_I8_TO_I32:
         return 0;
@@ -179,6 +192,10 @@ static inline uint64_t vop_wr_bytes(VopType op, uint64_t vl)
     case VOP_ELEMWISE_ADD:         return vl * VOP_ELEM_BYTES;
     case VOP_ELEMWISE_MUL:         return vl * VOP_ELEM_BYTES;
     case VOP_SCALAR_MUL:           return vl * VOP_ELEM_BYTES;
+    case VOP_PIXELSHUFFLE_MOVE:    return vl * VOP_ELEM_BYTES;
+    case VOP_SCA_DOT_I8_TO_I32:    return 0;
+    case VOP_SCA_BIAS_QUANT_I32_TO_I8:
+        return (vl > 0) ? 1 : 0;
     case VOP_QUANTIZE_I32_TO_I8:   return vl * 1;
     case VOP_DEQUANTIZE_I8_TO_I32: return vl * 4;
     case VOP_BIAS_ADD_I32:         return vl * 4;
@@ -194,6 +211,10 @@ static inline const char *vop_name(VopType op)
     case VOP_ELEMWISE_ADD:         return "mf_elemwise_add_i8";
     case VOP_ELEMWISE_MUL:         return "mf_elemwise_mul_i8";
     case VOP_SCALAR_MUL:           return "mf_elemwise_mul_scalar_i8";
+    case VOP_PIXELSHUFFLE_MOVE:    return "mf_pixelshuffle_move_i8";
+    case VOP_SCA_DOT_I8_TO_I32:    return "mf_sca_dot_i8_to_i32";
+    case VOP_SCA_BIAS_QUANT_I32_TO_I8:
+        return "mf_sca_bias_quant_i32_to_i8";
     case VOP_QUANTIZE_I32_TO_I8:   return "mf_quantize_i32_to_i8";
     case VOP_DEQUANTIZE_I8_TO_I32: return "mf_dequantize_i8_to_i32";
     case VOP_BIAS_ADD_I32:         return "mf_bias_add_i32";
