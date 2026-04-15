@@ -78,9 +78,7 @@ MatmulTop::MatmulTop(sc_module_name nm,
                              cfg.vec_acc_queue_cap(),
                              post_processor,
                              start_event,
-                             completion_fifo.get(),
-                             cfg.gemm_a_bytes() + cfg.gemm_b_bytes(),  // dma_rd_bytes (L2→L1)
-                             cfg.gemm_c_bytes());                      // dma_wr_bytes (L1→L2)
+                             completion_fifo.get());
         workers.push_back(w);
         if (post_processor)
             active_workers.push_back(w);

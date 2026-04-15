@@ -21,9 +21,7 @@ Worker::Worker(sc_module_name name,
                uint64_t max_inflight_vec_reqs_,
                WorkerPostProcessor *post_processor_,
                sc_event *start_event_,
-               sc_fifo<int> *completion_fifo_,
-               uint64_t dma_rd_bytes_,
-               uint64_t dma_wr_bytes_)
+               sc_fifo<int> *completion_fifo_)
     : sc_module(name),
       init("init"),
       peq("peq"),
@@ -43,9 +41,7 @@ Worker::Worker(sc_module_name name,
       B_bytes(B_bytes_),
       C_bytes(C_bytes_),
       vec_rd_bytes(vec_rd_),
-      vec_wr_bytes(vec_wr_),
-      dma_rd_bytes(dma_rd_bytes_),
-      dma_wr_bytes(dma_wr_bytes_)
+      vec_wr_bytes(vec_wr_)
 {
     init.register_nb_transport_bw(this, &Worker::nb_transport_bw);
     SC_THREAD(peq_thread);
@@ -208,10 +204,11 @@ void Worker::issue_end(PendingReq &p)
     p.tx_ext  = nullptr;
 }
 
-void Worker::issue_dma(bool is_write, uint64_t bytes)
+Worker::DmaReq Worker::issue_dma_begin(bool is_write, uint64_t bytes)
 {
+    DmaReq p;
     if (bytes == 0)
-        return;
+        return p;
 
     auto *gp = new tlm_generic_payload();
     gp->set_command(is_write ? TLM_WRITE_COMMAND : TLM_READ_COMMAND);
@@ -234,6 +231,12 @@ void Worker::issue_dma(bool is_write, uint64_t bytes)
     de->fired    = false;
     done_map[gp] = de;
 
+    p.gp         = gp;
+    p.mem_ext    = mem_ext;
+    p.tx_ext     = tx;
+    p.done_entry = de;
+    p.sync_done  = false;
+
     tlm_phase phase = BEGIN_REQ;
     sc_time   delay = SC_ZERO_TIME;
     auto status = init->nb_transport_fw(*gp, phase, delay);
@@ -241,27 +244,40 @@ void Worker::issue_dma(bool is_write, uint64_t bytes)
     if (status == TLM_COMPLETED)
     {
         done_map.erase(gp);
-    }
-    else
-    {
-        if (!de->fired)
-            wait(*de->ev);
-        done_map.erase(gp);
+        p.sync_done = true;
     }
 
-    delete de->ev;
-    delete de->admit_ev;
-    delete de;
+    return p;
+}
+
+void Worker::finish_dma(DmaReq &p)
+{
+    if (!p.gp)
+        return;
+
+    if (!p.sync_done && !p.done_entry->fired)
+        wait(*p.done_entry->ev);
+
+    done_map.erase(p.gp);
+
+    delete p.done_entry->ev;
+    delete p.done_entry->admit_ev;
+    delete p.done_entry;
+    p.done_entry = nullptr;
 
     tlm_phase end_phase = END_RESP;
     sc_time   end_delay = SC_ZERO_TIME;
-    init->nb_transport_fw(*gp, end_phase, end_delay);
+    init->nb_transport_fw(*p.gp, end_phase, end_delay);
 
-    gp->clear_extension(mem_ext);
-    gp->clear_extension(tx);
-    delete mem_ext;
-    delete tx;
-    delete gp;
+    p.gp->clear_extension(p.mem_ext);
+    p.gp->clear_extension(p.tx_ext);
+    delete p.mem_ext;
+    delete p.tx_ext;
+    delete p.gp;
+
+    p.gp      = nullptr;
+    p.mem_ext = nullptr;
+    p.tx_ext  = nullptr;
 }
 
 void Worker::issue_stream(uint64_t addr,
@@ -269,6 +285,8 @@ void Worker::issue_stream(uint64_t addr,
                           uint64_t svc_cycles,
                           uint64_t rd,
                           uint64_t wr,
+                          uint64_t dma_rd,
+                          uint64_t dma_wr,
                           uint64_t &call_counter,
                           uint64_t *phase_counter,
                           uint64_t max_inflight)
@@ -276,71 +294,142 @@ void Worker::issue_stream(uint64_t addr,
     if (call_count == 0)
         return;
 
-    std::deque<PendingReq> inflight;
-    uint64_t issued = 0;
+    std::deque<DmaReq>     read_inflight;
+    std::deque<PendingReq> accel_inflight;
+    std::deque<DmaReq>     write_inflight;
+    uint64_t reads_issued = 0;
+    uint64_t accel_issued = 0;
     uint64_t window = std::max<uint64_t>(max_inflight, 1);
 
-    auto issue_one = [&]() {
-        issue_dma(false, dma_rd_bytes);
-        inflight.push_back(issue_begin(addr, svc_cycles, rd, wr));
+    auto dma_done = [](const DmaReq &p) {
+        return !p.gp || p.sync_done ||
+               (p.done_entry && p.done_entry->fired);
+    };
+
+    auto accel_done = [](const PendingReq &p) {
+        return p.sync_done ||
+               (p.done_entry && p.done_entry->fired);
+    };
+
+    auto issue_read = [&]() {
+        read_inflight.push_back(issue_dma_begin(false, dma_rd));
+        ++reads_issued;
+    };
+
+    auto issue_accel = [&]() {
+        if (accel_issued > 0)
+            do_scalar(scalar_cycles);
+        accel_inflight.push_back(issue_begin(addr, svc_cycles, rd, wr));
         ++call_counter;
         if (phase_counter)
             ++(*phase_counter);
-        ++issued;
+        ++accel_issued;
     };
 
-    auto retire_one = [&]() {
-        bool has_completed = false;
-        for (auto &pending : inflight)
-        {
-            if (pending.sync_done || (pending.done_entry && pending.done_entry->fired))
-            {
-                has_completed = true;
-                break;
-            }
-        }
+    auto fill_reads = [&]() {
+        while (reads_issued < call_count && read_inflight.size() < window)
+            issue_read();
+    };
 
-        if (!has_completed)
+    auto promote_reads = [&]() {
+        bool progressed = false;
+        while (!read_inflight.empty() &&
+               accel_inflight.size() < window &&
+               dma_done(read_inflight.front()))
         {
-            sc_event_or_list wait_list;
-            for (auto &pending : inflight)
-            {
-                if (!pending.sync_done && pending.done_entry && !pending.done_entry->fired)
-                    wait_list |= *pending.done_entry->ev;
-            }
-            wait(wait_list);
+            finish_dma(read_inflight.front());
+            read_inflight.pop_front();
+            issue_accel();
+            progressed = true;
         }
+        return progressed;
+    };
 
-        for (auto it = inflight.begin(); it != inflight.end(); ++it)
+    auto retire_accels = [&]() {
+        bool progressed = false;
+        for (auto it = accel_inflight.begin();
+             it != accel_inflight.end() && write_inflight.size() < window;)
         {
-            if (it->sync_done || (it->done_entry && it->done_entry->fired))
+            if (accel_done(*it))
             {
                 issue_end(*it);
-                inflight.erase(it);
-                issue_dma(true, dma_wr_bytes);
-                return;
+                it = accel_inflight.erase(it);
+                write_inflight.push_back(issue_dma_begin(true, dma_wr));
+                progressed = true;
+            }
+            else
+            {
+                ++it;
             }
         }
-
-        issue_end(inflight.front());
-        inflight.pop_front();
-        issue_dma(true, dma_wr_bytes);
+        return progressed;
     };
 
-    issue_one();
+    auto retire_writes = [&](bool wait_for_front) {
+        bool progressed = false;
+        while (!write_inflight.empty() &&
+               (dma_done(write_inflight.front()) || wait_for_front))
+        {
+            finish_dma(write_inflight.front());
+            write_inflight.pop_front();
+            progressed = true;
+            wait_for_front = false;
+        }
+        return progressed;
+    };
 
-    while (issued < call_count)
+    auto wait_for_progress = [&]() {
+        sc_event_or_list wait_list;
+        bool has_event = false;
+
+        auto add_dma_event = [&](const DmaReq &p) {
+            if (p.gp && !p.sync_done && p.done_entry && !p.done_entry->fired)
+            {
+                wait_list |= *p.done_entry->ev;
+                has_event = true;
+            }
+        };
+
+        auto add_accel_event = [&](const PendingReq &p) {
+            if (!p.sync_done && p.done_entry && !p.done_entry->fired)
+            {
+                wait_list |= *p.done_entry->ev;
+                has_event = true;
+            }
+        };
+
+        for (const auto &p : read_inflight)
+            add_dma_event(p);
+        for (const auto &p : accel_inflight)
+            add_accel_event(p);
+        for (const auto &p : write_inflight)
+            add_dma_event(p);
+
+        if (has_event)
+            wait(wait_list);
+    };
+
+    fill_reads();
+
+    while (accel_issued < call_count ||
+           !read_inflight.empty() ||
+           !accel_inflight.empty() ||
+           !write_inflight.empty())
     {
-        do_scalar(scalar_cycles);
+        bool progressed = false;
 
-        while (inflight.size() >= window)
-            retire_one();
+        fill_reads();
+        progressed = promote_reads() || progressed;
+        fill_reads();
+        progressed = retire_accels() || progressed;
+        progressed = retire_writes(false) || progressed;
 
-        issue_one();
+        if (write_inflight.size() >= window)
+            progressed = retire_writes(true) || progressed;
+
+        if (!progressed)
+            wait_for_progress();
     }
-
-    while (!inflight.empty())
-        retire_one();
 }
 
 void Worker::run()
@@ -358,6 +447,8 @@ void Worker::run()
         issue_stream(Interconnect::ADDR_MAT,
                      access_mat,
                      mat_cycles,
+                     A_bytes + B_bytes,
+                     C_bytes,
                      A_bytes + B_bytes,
                      C_bytes,
                      mat_calls,
@@ -388,6 +479,8 @@ void Worker::run()
             issue_stream(Interconnect::ADDR_VEC,
                          access_vec,
                          vec_cycles,
+                         vrd,
+                         vwr,
                          vrd,
                          vwr,
                          vec_calls,

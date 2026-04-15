@@ -8,6 +8,7 @@
 #include <unordered_map>
 
 struct Worker;
+struct MemoryAccessExt;
 
 // Optional hook for simulator-specific post-matmul work that still runs
 // inside the worker's own SC_THREAD.
@@ -71,9 +72,6 @@ struct Worker : sc_module
     uint64_t vec_rd_bytes = 0;   // vec-request read bytes  (0 → uses A+B)
     uint64_t vec_wr_bytes = 0;   // vec-request write bytes (0 → uses C)
 
-    uint64_t dma_rd_bytes = 0;   // per-tile DMA read bytes (L2→L1), 0 = no DMA
-    uint64_t dma_wr_bytes = 0;   // per-tile DMA write bytes (L1→L2), 0 = no DMA
-
     // ----------------------------------------------------------
     // DoneEntry — per-request synchronisation state.
     //   ev:       notified when accelerator sends BEGIN_RESP.
@@ -105,6 +103,16 @@ struct Worker : sc_module
         bool                 sync_done    = false;
     };
 
+    // Handle for an in-flight DMA request.
+    struct DmaReq
+    {
+        tlm_generic_payload *gp         = nullptr;
+        MemoryAccessExt     *mem_ext    = nullptr;
+        TxnExt              *tx_ext     = nullptr;
+        DoneEntry           *done_entry = nullptr;
+        bool                 sync_done  = true;
+    };
+
     SC_HAS_PROCESS(Worker);
 
     Worker(sc_module_name name,
@@ -123,9 +131,7 @@ struct Worker : sc_module
            uint64_t max_inflight_vec_reqs_ = 1,
            WorkerPostProcessor *post_processor_ = nullptr,
            sc_event *start_event_ = nullptr,
-           sc_fifo<int> *completion_fifo_ = nullptr,
-           uint64_t dma_rd_bytes_ = 0,
-           uint64_t dma_wr_bytes_ = 0);
+           sc_fifo<int> *completion_fifo_ = nullptr);
 
     tlm_sync_enum nb_transport_bw(tlm_generic_payload &gp,
                                   tlm_phase &phase,
@@ -140,7 +146,8 @@ struct Worker : sc_module
     // Convenience overload: uses A_bytes+B_bytes and C_bytes (mat requests)
     PendingReq issue_begin(uint64_t addr, uint64_t svc_cycles);
 
-    void issue_dma(bool is_write, uint64_t bytes);
+    DmaReq issue_dma_begin(bool is_write, uint64_t bytes);
+    void finish_dma(DmaReq &p);
 
     void issue_end(PendingReq &p);
     void issue_stream(uint64_t addr,
@@ -148,6 +155,8 @@ struct Worker : sc_module
                       uint64_t svc_cycles,
                       uint64_t rd,
                       uint64_t wr,
+                      uint64_t dma_rd,
+                      uint64_t dma_wr,
                       uint64_t &call_counter,
                       uint64_t *phase_counter = nullptr,
                       uint64_t max_inflight = 1);
