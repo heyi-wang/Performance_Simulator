@@ -16,9 +16,12 @@ MatmulTop::MatmulTop(sc_module_name nm,
       vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap()),
       noc("noc"),
       memory("memory",
-             cfg.memory_base_lat,
-             cfg.memory_bw,
-             cfg.memory_parallel_slots),
+             cfg.l1_base_lat,
+             cfg.l1_bw,
+             cfg.dma_base_lat,
+             cfg.dma_bw,
+             cfg.l1_slots,
+             cfg.dma_slots),
       done_event(done_event_)
 {
     // Bind accelerators and memory to the interconnect
@@ -75,7 +78,9 @@ MatmulTop::MatmulTop(sc_module_name nm,
                              cfg.vec_acc_queue_cap(),
                              post_processor,
                              start_event,
-                             completion_fifo.get());
+                             completion_fifo.get(),
+                             cfg.gemm_a_bytes() + cfg.gemm_b_bytes(),  // dma_rd_bytes (L2→L1)
+                             cfg.gemm_c_bytes());                      // dma_wr_bytes (L1→L2)
         workers.push_back(w);
         if (post_processor)
             active_workers.push_back(w);
@@ -126,9 +131,19 @@ MatmulSimulationStats MatmulTop::collect_stats() const
     stats.vec_busy_total = vec_acc.busy_cycles_total();
     stats.vec_occupied_total = vec_acc.occupied_cycles_total();
     stats.vec_qwait_total = vec_acc.queue_wait_cycles_total();
-    stats.memory_reqs = memory.reqs;
-    stats.memory_busy_cycles = memory.busy_cycles;
-    stats.memory_queue_wait_cycles = memory.qwait_cycles;
+    stats.l1_reqs = memory.l1_reqs;
+    stats.l1_read_bytes = memory.l1_read_bytes;
+    stats.l1_write_bytes = memory.l1_write_bytes;
+    stats.l1_busy_cycles = memory.l1_busy_cycles;
+    stats.l1_qwait_cycles = memory.l1_qwait_cycles;
+    stats.dma_reqs = memory.dma_reqs;
+    stats.dma_read_bytes = memory.dma_read_bytes;
+    stats.dma_write_bytes = memory.dma_write_bytes;
+    stats.dma_busy_cycles = memory.dma_busy_cycles;
+    stats.dma_qwait_cycles = memory.dma_qwait_cycles;
+    stats.memory_reqs = stats.l1_reqs + stats.dma_reqs;
+    stats.memory_busy_cycles = stats.l1_busy_cycles + stats.dma_busy_cycles;
+    stats.memory_queue_wait_cycles = stats.l1_qwait_cycles + stats.dma_qwait_cycles;
     stats.coordinator_stall = coordinator->stall_cycles;
     stats.coordinator_compute = coordinator->compute_cycles;
     stats.total_rd_bytes =
@@ -146,8 +161,7 @@ MatmulSimulationStats MatmulTop::collect_stats() const
             (static_cast<double>(stats.total_macs) * 2.0) /
             static_cast<double>(stats.total_elapsed);
         stats.mem_bw =
-            static_cast<double>(memory.busy_cycles) *
-            static_cast<double>(cfg.memory_bw) /
+            static_cast<double>(stats.total_rd_bytes + stats.total_wr_bytes) /
             static_cast<double>(stats.total_elapsed);
     }
 
@@ -257,62 +271,77 @@ void MatmulTop::print_report(std::ostream &os) const
         {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(VECTOR_ACC_CAP)},
         {"Matrix Accelerator Queue Depth [requests]", report::fmt_u64(cfg.mat_acc_queue_cap())},
         {"Vector Accelerator Queue Depth [requests]", report::fmt_u64(cfg.vec_acc_queue_cap())},
-        {"Memory Bandwidth [bytes/cycle]", report::fmt_u64(cfg.memory_bw)},
-        {"Memory Base Latency [cycles]", report::fmt_u64(cfg.memory_base_lat)},
+        {"L1 Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l1_bw)},
+        {"L1 Base Latency [cycles]", report::fmt_u64(cfg.l1_base_lat)},
+        {"L1 Parallel Slots", report::fmt_u64(cfg.l1_slots)},
+        {"DMA Bandwidth [bytes/cycle]", report::fmt_u64(cfg.dma_bw)},
+        {"DMA Base Latency [cycles]", report::fmt_u64(cfg.dma_base_lat)},
+        {"DMA Parallel Slots", report::fmt_u64(cfg.dma_slots)},
     });
 
     report::print_section_title(os, "Worker Summary");
     report::print_table(os, report::make_worker_summary_table(worker_info));
 
     report::print_section_title(os, "Accelerator Summary");
-    report::print_table(os, report::make_accelerator_summary_table({
-        {
-            "Matrix Accelerator",
-            "pool-level",
-            report::fmt_int(cfg.mat_accel_count),
-            report::fmt_u64(stats.mat_req_total),
-            report::fmt_u64(stats.mat_qwait_total),
-            report::fmt_u64(stats.mat_busy_total),
-            report::fmt_u64(stats.mat_occupied_total),
-            report::fmt_percent(stats.mat_compute_util),
-            report::fmt_percent(stats.mat_occupancy),
-            report::na(),
-            report::na(),
-        },
-        {
-            "Vector Accelerator",
-            "pool-level",
-            report::fmt_int(cfg.vec_accel_count),
-            report::fmt_u64(stats.vec_req_total),
-            report::fmt_u64(stats.vec_qwait_total),
-            report::fmt_u64(stats.vec_busy_total),
-            report::fmt_u64(stats.vec_occupied_total),
-            report::fmt_percent(stats.vec_compute_util),
-            report::fmt_percent(stats.vec_occupancy),
-            report::na(),
-            report::na(),
-        },
-        {
-            "Memory",
-            "shared resource",
-            "1",
-            report::fmt_u64(stats.memory_reqs),
-            report::fmt_u64(stats.memory_queue_wait_cycles),
-            report::fmt_u64(stats.memory_busy_cycles),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::fmt_u64(stats.total_rd_bytes),
-            report::fmt_u64(stats.total_wr_bytes),
-        },
-    }));
+    std::vector<report::AcceleratorSummaryRow> accel_rows;
+    accel_rows.push_back({
+        "Matrix Accelerator",
+        "pool-level",
+        report::fmt_int(cfg.mat_accel_count),
+        report::fmt_u64(stats.mat_req_total),
+        report::fmt_u64(stats.mat_qwait_total),
+        report::fmt_u64(stats.mat_busy_total),
+        report::fmt_u64(stats.mat_occupied_total),
+        report::fmt_percent(stats.mat_compute_util),
+        report::fmt_percent(stats.mat_occupancy),
+        report::na(),
+        report::na(),
+    });
+    for (auto &r : report::make_per_instance_accel_rows(
+             "Matrix Accelerator", mat_acc.per_instance_stats(), stats.total_elapsed))
+        accel_rows.push_back(std::move(r));
+
+    accel_rows.push_back({
+        "Vector Accelerator",
+        "pool-level",
+        report::fmt_int(cfg.vec_accel_count),
+        report::fmt_u64(stats.vec_req_total),
+        report::fmt_u64(stats.vec_qwait_total),
+        report::fmt_u64(stats.vec_busy_total),
+        report::fmt_u64(stats.vec_occupied_total),
+        report::fmt_percent(stats.vec_compute_util),
+        report::fmt_percent(stats.vec_occupancy),
+        report::na(),
+        report::na(),
+    });
+    for (auto &r : report::make_per_instance_accel_rows(
+             "Vector Accelerator", vec_acc.per_instance_stats(), stats.total_elapsed))
+        accel_rows.push_back(std::move(r));
+
+    report::print_table(os, report::make_accelerator_summary_table(accel_rows));
+
+    report::print_section_title(os, "Memory Hierarchy");
+    report::print_fields(os, {
+        {"L1 Engine Requests [requests]", report::fmt_u64(stats.l1_reqs)},
+        {"L1 Engine Read Bytes [bytes]", report::fmt_u64(stats.l1_read_bytes)},
+        {"L1 Engine Write Bytes [bytes]", report::fmt_u64(stats.l1_write_bytes)},
+        {"L1 Engine Busy Cycles [cycles]", report::fmt_u64(stats.l1_busy_cycles)},
+        {"L1 Engine Queue Wait [cycles]", report::fmt_u64(stats.l1_qwait_cycles)},
+        {"DMA Engine Requests [requests]", report::fmt_u64(stats.dma_reqs)},
+        {"DMA Engine Read Bytes [bytes]", report::fmt_u64(stats.dma_read_bytes)},
+        {"DMA Engine Write Bytes [bytes]", report::fmt_u64(stats.dma_write_bytes)},
+        {"DMA Engine Busy Cycles [cycles]", report::fmt_u64(stats.dma_busy_cycles)},
+        {"DMA Engine Queue Wait [cycles]", report::fmt_u64(stats.dma_qwait_cycles)},
+        {"Total Memory Requests [requests]", report::fmt_u64(stats.memory_reqs)},
+        {"Total Memory Busy Cycles [cycles]", report::fmt_u64(stats.memory_busy_cycles)},
+    });
 
     report::print_section_title(os, "Overall Summary");
     report::print_fields(os, {
         {"Total Elapsed Cycles [cycles]", report::fmt_u64(stats.total_elapsed)},
         {"Total Matrix Accelerator Requests [requests]", report::fmt_u64(stats.mat_req_total)},
         {"Total Vector Accelerator Requests [requests]", report::fmt_u64(stats.vec_req_total)},
-        {"Total Memory Requests [requests]", report::fmt_u64(stats.memory_reqs)},
+        {"Total Memory Requests (L1+DMA) [requests]", report::fmt_u64(stats.memory_reqs)},
         {"Total Read Bytes [bytes]", report::fmt_u64(stats.total_rd_bytes)},
         {"Total Write Bytes [bytes]", report::fmt_u64(stats.total_wr_bytes)},
         {"Total Stall Cycles [cycles]", report::fmt_u64(total_stall_cycles)},

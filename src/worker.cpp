@@ -1,5 +1,6 @@
 #include "worker.h"
 #include "interconnect.h"   // for Interconnect::ADDR_MAT / ADDR_VEC
+#include "memory.h"         // for MemoryAccessExt / MemoryAccessKind
 #include <iostream>
 
 SC_HAS_PROCESS(Worker);
@@ -20,7 +21,9 @@ Worker::Worker(sc_module_name name,
                uint64_t max_inflight_vec_reqs_,
                WorkerPostProcessor *post_processor_,
                sc_event *start_event_,
-               sc_fifo<int> *completion_fifo_)
+               sc_fifo<int> *completion_fifo_,
+               uint64_t dma_rd_bytes_,
+               uint64_t dma_wr_bytes_)
     : sc_module(name),
       init("init"),
       peq("peq"),
@@ -40,7 +43,9 @@ Worker::Worker(sc_module_name name,
       B_bytes(B_bytes_),
       C_bytes(C_bytes_),
       vec_rd_bytes(vec_rd_),
-      vec_wr_bytes(vec_wr_)
+      vec_wr_bytes(vec_wr_),
+      dma_rd_bytes(dma_rd_bytes_),
+      dma_wr_bytes(dma_wr_bytes_)
 {
     init.register_nb_transport_bw(this, &Worker::nb_transport_bw);
     SC_THREAD(peq_thread);
@@ -203,6 +208,62 @@ void Worker::issue_end(PendingReq &p)
     p.tx_ext  = nullptr;
 }
 
+void Worker::issue_dma(bool is_write, uint64_t bytes)
+{
+    if (bytes == 0)
+        return;
+
+    auto *gp = new tlm_generic_payload();
+    gp->set_command(is_write ? TLM_WRITE_COMMAND : TLM_READ_COMMAND);
+    gp->set_address(Interconnect::ADDR_MEM);
+    gp->set_data_ptr(nullptr);
+    gp->set_data_length(static_cast<unsigned>(bytes));
+    gp->set_streaming_width(static_cast<unsigned>(bytes));
+    gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
+
+    auto *mem_ext = new MemoryAccessExt(MemoryAccessKind::Dma);
+    gp->set_extension(mem_ext);
+
+    auto *tx = new TxnExt();
+    tx->src_worker = tid;
+    gp->set_extension(tx);
+
+    auto *de = new DoneEntry();
+    de->ev       = new sc_event();
+    de->admit_ev = new sc_event();
+    de->fired    = false;
+    done_map[gp] = de;
+
+    tlm_phase phase = BEGIN_REQ;
+    sc_time   delay = SC_ZERO_TIME;
+    auto status = init->nb_transport_fw(*gp, phase, delay);
+
+    if (status == TLM_COMPLETED)
+    {
+        done_map.erase(gp);
+    }
+    else
+    {
+        if (!de->fired)
+            wait(*de->ev);
+        done_map.erase(gp);
+    }
+
+    delete de->ev;
+    delete de->admit_ev;
+    delete de;
+
+    tlm_phase end_phase = END_RESP;
+    sc_time   end_delay = SC_ZERO_TIME;
+    init->nb_transport_fw(*gp, end_phase, end_delay);
+
+    gp->clear_extension(mem_ext);
+    gp->clear_extension(tx);
+    delete mem_ext;
+    delete tx;
+    delete gp;
+}
+
 void Worker::issue_stream(uint64_t addr,
                           uint64_t call_count,
                           uint64_t svc_cycles,
@@ -220,6 +281,7 @@ void Worker::issue_stream(uint64_t addr,
     uint64_t window = std::max<uint64_t>(max_inflight, 1);
 
     auto issue_one = [&]() {
+        issue_dma(false, dma_rd_bytes);
         inflight.push_back(issue_begin(addr, svc_cycles, rd, wr));
         ++call_counter;
         if (phase_counter)
@@ -255,12 +317,14 @@ void Worker::issue_stream(uint64_t addr,
             {
                 issue_end(*it);
                 inflight.erase(it);
+                issue_dma(true, dma_wr_bytes);
                 return;
             }
         }
 
         issue_end(inflight.front());
         inflight.pop_front();
+        issue_dma(true, dma_wr_bytes);
     };
 
     issue_one();

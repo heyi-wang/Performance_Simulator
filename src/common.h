@@ -27,3 +27,12 @@ struct KernelWorkerInfo
     uint64_t rd_bytes = 0;
     uint64_t wr_bytes = 0;
 };
+
+struct AccelInstanceStats
+{
+    int      instance_id = -1;
+    uint64_t req_count = 0;
+    uint64_t busy_cycles = 0;
+    uint64_t occupied_cycles = 0;
+    uint64_t queue_wait_cycles = 0;
+};

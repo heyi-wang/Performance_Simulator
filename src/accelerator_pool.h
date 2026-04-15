@@ -58,4 +58,6 @@ struct AcceleratorPool : sc_module
     uint64_t busy_cycles_total() const;
     uint64_t occupied_cycles_total() const;
     uint64_t queue_wait_cycles_total() const;
+
+    std::vector<AccelInstanceStats> per_instance_stats() const;
 };

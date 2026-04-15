@@ -216,4 +216,39 @@ inline Table make_accelerator_summary_table(
     return table;
 }
 
+inline std::vector<AcceleratorSummaryRow> make_per_instance_accel_rows(
+    const std::string &accel_type,
+    const std::vector<AccelInstanceStats> &instances,
+    uint64_t total_elapsed)
+{
+    std::vector<AcceleratorSummaryRow> rows;
+    const double elapsed = static_cast<double>(total_elapsed);
+
+    for (const auto &inst : instances)
+    {
+        double compute_util = (elapsed > 0.0)
+            ? static_cast<double>(inst.busy_cycles) / elapsed * 100.0
+            : 0.0;
+        double occ_util = (elapsed > 0.0)
+            ? static_cast<double>(inst.occupied_cycles) / elapsed * 100.0
+            : 0.0;
+
+        rows.push_back({
+            accel_type,
+            "instance-" + fmt_int(inst.instance_id),
+            "1",
+            fmt_u64(inst.req_count),
+            fmt_u64(inst.queue_wait_cycles),
+            fmt_u64(inst.busy_cycles),
+            fmt_u64(inst.occupied_cycles),
+            fmt_percent(compute_util),
+            fmt_percent(occ_util),
+            na(),
+            na(),
+        });
+    }
+
+    return rows;
+}
+
 }  // namespace report

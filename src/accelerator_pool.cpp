@@ -176,3 +176,20 @@ uint64_t AcceleratorPool::queue_wait_cycles_total() const
         total += unit->queue_wait_cycles;
     return total;
 }
+
+std::vector<AccelInstanceStats> AcceleratorPool::per_instance_stats() const
+{
+    std::vector<AccelInstanceStats> out;
+    out.reserve(units.size());
+    for (size_t i = 0; i < units.size(); ++i)
+    {
+        AccelInstanceStats s;
+        s.instance_id      = static_cast<int>(i);
+        s.req_count        = units[i]->req_count;
+        s.busy_cycles      = units[i]->busy_cycles;
+        s.occupied_cycles  = units[i]->occupied_cycles;
+        s.queue_wait_cycles = units[i]->queue_wait_cycles;
+        out.push_back(s);
+    }
+    return out;
+}

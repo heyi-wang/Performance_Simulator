@@ -32,6 +32,13 @@ struct MatmulRuntimeConfig
     uint64_t memory_base_lat = HW_MEMORY_BASE_LAT;
     uint64_t memory_bw = HW_MATMUL_MEMORY_BYTES_PER_CYCLE;
     uint64_t memory_parallel_slots = MEMORY_PARALLEL_SLOTS_CFG;
+
+    uint64_t l1_base_lat  = 1;
+    uint64_t l1_bw        = 256;
+    uint64_t l1_slots     = 4;
+    uint64_t dma_base_lat = 10;
+    uint64_t dma_bw       = 64;
+    uint64_t dma_slots    = 8;
     size_t mat_queue_cap_value =
         std::max(HW_ACC_QUEUE_DEPTH,
                  static_cast<size_t>(MAT_ACCEL_COUNT * 4));
@@ -143,6 +150,17 @@ struct MatmulSimulationStats
     uint64_t memory_reqs = 0;
     uint64_t memory_busy_cycles = 0;
     uint64_t memory_queue_wait_cycles = 0;
+
+    uint64_t l1_reqs = 0;
+    uint64_t l1_read_bytes = 0;
+    uint64_t l1_write_bytes = 0;
+    uint64_t l1_busy_cycles = 0;
+    uint64_t l1_qwait_cycles = 0;
+    uint64_t dma_reqs = 0;
+    uint64_t dma_read_bytes = 0;
+    uint64_t dma_write_bytes = 0;
+    uint64_t dma_busy_cycles = 0;
+    uint64_t dma_qwait_cycles = 0;
     uint64_t total_worker_stall = 0;
     uint64_t coordinator_stall = 0;
     uint64_t coordinator_compute = 0;
@@ -176,7 +194,7 @@ struct MatmulTop : sc_module
     AcceleratorPool mat_acc;
     AcceleratorPool vec_acc;
     Interconnect    noc;
-    Memory          memory;
+    L1L2Memory      memory;
 
     std::vector<Worker *> workers;
     std::vector<Worker *> active_workers;
