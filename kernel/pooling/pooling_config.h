@@ -36,7 +36,7 @@ static const int POOL_W = 64;    // spatial width
 //   worker tid owns channels [c_start, c_end)
 //   where c_start = (tid * POOL_C) / POOL_NUM_WORKERS
 // ------------------------------------------------------------
-static const int POOL_NUM_WORKERS = 16;
+static const int POOL_NUM_WORKERS = 1;
 
 // ------------------------------------------------------------
 // Vector accelerator: processes POOL_VEC_ACC_CAP elements per
@@ -71,6 +71,32 @@ static const uint64_t POOL_DIVIDE_CYCLES = 4;   // approx cycles for integer div
 // ------------------------------------------------------------
 static const uint64_t POOL_MEM_BASE_LAT = HW_MEMORY_BASE_LAT;      // fixed base latency (cycles)
 static const uint64_t POOL_MEM_BW       = HW_MEMORY_BYTES_PER_CYCLE; // bandwidth: bytes per cycle
+
+#ifndef POOL_L1_BASE_LAT
+#define POOL_L1_BASE_LAT 1
+#endif
+
+#ifndef POOL_L1_BW
+#define POOL_L1_BW (HW_MEMORY_BYTES_PER_CYCLE * 4)
+#endif
+
+#ifndef POOL_L2_BASE_LAT
+#define POOL_L2_BASE_LAT HW_MEMORY_BASE_LAT
+#endif
+
+#ifndef POOL_L2_BW
+#define POOL_L2_BW HW_MEMORY_BYTES_PER_CYCLE
+#endif
+
+#ifndef POOL_L1_TILE_BUFFERS
+#define POOL_L1_TILE_BUFFERS 2
+#endif
+
+static const uint64_t POOL_L1_BASE_LAT_CFG = POOL_L1_BASE_LAT;
+static const uint64_t POOL_L1_BW_CFG = POOL_L1_BW;
+static const uint64_t POOL_L2_BASE_LAT_CFG = POOL_L2_BASE_LAT;
+static const uint64_t POOL_L2_BW_CFG = POOL_L2_BW;
+static const int      POOL_L1_TILE_BUFFERS_CFG = POOL_L1_TILE_BUFFERS;
 
 // ------------------------------------------------------------
 // Accelerator queue depth.

@@ -25,8 +25,11 @@ struct PoolRuntimeConfig
     int vec_acc_instances = POOL_VEC_ACC_INSTANCES;
     uint64_t scalar_overhead = POOL_SCALAR_OVERHEAD;
     uint64_t divide_cycles = POOL_DIVIDE_CYCLES;
-    uint64_t memory_base_lat = POOL_MEM_BASE_LAT;
-    uint64_t memory_bw = POOL_MEM_BW;
+    uint64_t l1_base_lat = POOL_L1_BASE_LAT_CFG;
+    uint64_t l1_bw = POOL_L1_BW_CFG;
+    uint64_t l2_base_lat = POOL_L2_BASE_LAT_CFG;
+    uint64_t l2_bw = POOL_L2_BW_CFG;
+    int l1_tile_buffers = POOL_L1_TILE_BUFFERS_CFG;
     size_t acc_queue_depth = POOL_ACC_QUEUE_DEPTH;
 
     static PoolRuntimeConfig defaults()
@@ -53,18 +56,31 @@ struct PoolSimulationStats
     uint64_t total_mem_cycles = 0;
     uint64_t max_elapsed_cycles = 0;
     uint64_t expected_vec_calls = 0;
-    uint64_t expected_rd_bytes = 0;
-    uint64_t expected_wr_bytes = 0;
+    uint64_t expected_l1_read_bytes = 0;
+    uint64_t expected_l1_write_bytes = 0;
+    uint64_t expected_l1_reqs = 0;
+    uint64_t expected_l2_read_bytes = 0;
+    uint64_t expected_l2_write_bytes = 0;
+    uint64_t expected_l2_dma_reqs = 0;
     uint64_t vec_acc_reqs = 0;
     uint64_t vec_acc_busy_cycles = 0;
     uint64_t vec_acc_occupied_cycles = 0;
     uint64_t vec_acc_queue_wait_cycles = 0;
-    uint64_t memory_reqs = 0;
-    uint64_t memory_busy_cycles = 0;
-    uint64_t memory_queue_wait_cycles = 0;
+    uint64_t l1_reqs = 0;
+    uint64_t l1_read_bytes = 0;
+    uint64_t l1_write_bytes = 0;
+    uint64_t l1_busy_cycles = 0;
+    uint64_t l1_queue_wait_cycles = 0;
+    uint64_t l2_dma_reqs = 0;
+    uint64_t l2_dma_read_bytes = 0;
+    uint64_t l2_dma_write_bytes = 0;
+    uint64_t l2_dma_busy_cycles = 0;
+    uint64_t l2_dma_queue_wait_cycles = 0;
+    uint64_t dma_accel_overlap_cycles = 0;
     double vec_util = 0.0;
     double vec_occupancy = 0.0;
-    double mem_bw = 0.0;
+    double l1_bw_observed = 0.0;
+    double l2_bw_observed = 0.0;
     bool verification_passed = false;
 };
 
@@ -74,7 +90,7 @@ struct PoolTop : sc_module
     AcceleratorTLM  mat_acc;
     AcceleratorPool vec_acc;
     Interconnect    noc;
-    Memory          memory;
+    L1L2Memory      memory;
 
     std::vector<PoolWorker *> workers;
     sc_event *done_event = nullptr;

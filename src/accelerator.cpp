@@ -1,5 +1,6 @@
 #include "accelerator.h"
 #include "interconnect.h"   // for Interconnect::ADDR_MEM
+#include "memory.h"
 
 SC_HAS_PROCESS(AcceleratorTLM);
 
@@ -72,6 +73,9 @@ void AcceleratorTLM::mem_access(bool is_write, uint64_t bytes)
     gp->set_streaming_width((unsigned)bytes);
     gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
 
+    auto *mem_ext = new MemoryAccessExt(MemoryAccessKind::L1);
+    gp->set_extension(mem_ext);
+
     sc_event done_ev;
     mem_done_map[gp] = &done_ev;
 
@@ -82,6 +86,8 @@ void AcceleratorTLM::mem_access(bool is_write, uint64_t bytes)
     if (status == TLM_COMPLETED)
     {
         mem_done_map.erase(gp);
+        gp->clear_extension(mem_ext);
+        delete mem_ext;
         delete gp;
         return;
     }
@@ -89,6 +95,8 @@ void AcceleratorTLM::mem_access(bool is_write, uint64_t bytes)
     wait(done_ev);
 
     mem_done_map.erase(gp);
+    gp->clear_extension(mem_ext);
+    delete mem_ext;
     delete gp;
 }
 
@@ -136,14 +144,19 @@ void AcceleratorTLM::service_thread()
 
         sc_time m0 = sc_time_stamp();
         mem_access(false, ext ? ext->rd_bytes : 0);
-        mem_access(true,  ext ? ext->wr_bytes : 0);
         sc_time m1 = sc_time_stamp();
-
-        if (ext)
-            ext->mem_cycles = (uint64_t)((m1 - m0) / CYCLE);
 
         busy_cycles += svc;
         wait(svc * CYCLE);
+
+        sc_time m2 = sc_time_stamp();
+        mem_access(true, ext ? ext->wr_bytes : 0);
+        sc_time m3 = sc_time_stamp();
+
+        if (ext)
+            ext->mem_cycles =
+                static_cast<uint64_t>(((m1 - m0) + (m3 - m2)) / CYCLE);
+
         occupied_cycles += (uint64_t)((sc_time_stamp() - t_start) / CYCLE);
 
         // Signal busy end (compute finished, about to send response)

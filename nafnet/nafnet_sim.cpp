@@ -150,18 +150,18 @@ static NafLayerStats convert_stats(const PoolSimulationStats &stats)
 {
     NafLayerStats out;
     out.vec_reqs = stats.total_vec_calls;
-    out.mem_reqs = stats.memory_reqs;
-    out.rd_bytes = stats.total_rd_bytes;
-    out.wr_bytes = stats.total_wr_bytes;
+    out.mem_reqs = stats.l2_dma_reqs;
+    out.rd_bytes = stats.l2_dma_read_bytes;
+    out.wr_bytes = stats.l2_dma_write_bytes;
     out.vec_pool.present = true;
     out.vec_pool.requests = stats.vec_acc_reqs;
     out.vec_pool.queue_wait_cycles = stats.vec_acc_queue_wait_cycles;
     out.vec_pool.busy_cycles = stats.vec_acc_busy_cycles;
     out.vec_pool.occupied_cycles = stats.vec_acc_occupied_cycles;
     out.memory.present = true;
-    out.memory.requests = stats.memory_reqs;
-    out.memory.queue_wait_cycles = stats.memory_queue_wait_cycles;
-    out.memory.busy_cycles = stats.memory_busy_cycles;
+    out.memory.requests = stats.l2_dma_reqs;
+    out.memory.queue_wait_cycles = stats.l2_dma_queue_wait_cycles;
+    out.memory.busy_cycles = stats.l2_dma_busy_cycles;
     return out;
 }
 
