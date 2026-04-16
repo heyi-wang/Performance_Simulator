@@ -1,11 +1,17 @@
 #include "matmul_top.h"
 
+#include <algorithm>
 #include <iostream>
 #include <string>
 
-static bool parse_args(int argc, char *argv[], int &thread_count)
+static bool parse_args(int argc,
+                       char *argv[],
+                       int &thread_count,
+                       uint64_t &accumulator_register_count)
 {
     thread_count = MatmulConfig::default_thread_count;
+    accumulator_register_count =
+        MatmulConfig::default_accumulator_register_count;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -19,9 +25,20 @@ static bool parse_args(int argc, char *argv[], int &thread_count)
             }
             thread_count = std::max(std::stoi(argv[++i]), 1);
         }
+        else if (arg == "--accum-registers")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for --accum-registers\n";
+                return false;
+            }
+            accumulator_register_count =
+                std::max<uint64_t>(std::stoull(argv[++i]), 1);
+        }
         else if (arg == "--help" || arg == "-h")
         {
-            std::cout << "Usage: " << argv[0] << " [--threads N]\n";
+            std::cout << "Usage: " << argv[0]
+                      << " [--threads N] [--accum-registers N]\n";
             return false;
         }
         else
@@ -37,10 +54,16 @@ static bool parse_args(int argc, char *argv[], int &thread_count)
 int sc_main(int argc, char *argv[])
 {
     int thread_count = MatmulConfig::default_thread_count;
-    if (!parse_args(argc, argv, thread_count))
+    uint64_t accumulator_register_count =
+        MatmulConfig::default_accumulator_register_count;
+    if (!parse_args(argc, argv, thread_count, accumulator_register_count))
         return (argc > 1) ? 1 : 0;
 
-    MatmulRuntimeConfig cfg = MatmulRuntimeConfig::defaults(thread_count);
+    MatmulRuntimeConfig cfg =
+        MatmulRuntimeConfig::defaults(thread_count,
+                                      MAT_ACCEL_COUNT,
+                                      VEC_ACCEL_COUNT,
+                                      accumulator_register_count);
     MatmulTop top("top", cfg);
 
     sc_start();

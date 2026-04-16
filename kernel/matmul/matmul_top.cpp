@@ -79,6 +79,10 @@ MatmulTop::MatmulTop(sc_module_name nm,
                              post_processor,
                              start_event,
                              completion_fifo.get());
+        w->configure_gemm_reuse(cfg.gemm_tile_m(),
+                                cfg.gemm_tile_n(),
+                                cfg.local_tile_k_for_thread(i),
+                                cfg.accumulator_register_count);
         workers.push_back(w);
         if (post_processor)
             active_workers.push_back(w);
@@ -120,12 +124,39 @@ MatmulSimulationStats MatmulTop::collect_stats() const
     stats.vec_req_total = vec_acc.req_count_total();
     stats.expected_mat_req_total = 0;
     for (int tid = 0; tid < cfg.thread_count; ++tid)
+    {
         stats.expected_mat_req_total += cfg.local_access_mat_for_thread(tid);
+        const uint64_t mat_reqs = cfg.local_access_mat_for_thread(tid);
+        const uint64_t output_tiles = cfg.local_output_tiles_for_thread(tid);
+        stats.expected_l1_reqs += mat_reqs + output_tiles;
+        stats.expected_l1_read_bytes += cfg.local_mat_l1_read_bytes_for_thread(tid);
+        stats.expected_l1_write_bytes += cfg.local_mat_l1_write_bytes_for_thread(tid);
+        stats.expected_dma_reqs +=
+            mat_reqs + cfg.local_b_dma_tiles_for_thread(tid) + output_tiles;
+        stats.expected_dma_read_bytes += cfg.local_mat_dma_read_bytes_for_thread(tid);
+        stats.expected_dma_write_bytes += cfg.local_mat_dma_write_bytes_for_thread(tid);
+    }
     stats.expected_accum_pairs =
         static_cast<uint64_t>(std::max(cfg.active_thread_count() - 1, 0));
     stats.expected_vec_req_total =
         stats.expected_accum_pairs * cfg.gemm_accum_vec_calls() +
         ((cfg.active_thread_count() > 0) ? cfg.gemm_quant_vec_calls() : 0);
+    const uint64_t expected_accum_vec_calls =
+        stats.expected_accum_pairs * cfg.gemm_accum_vec_calls();
+    const uint64_t expected_quant_vec_calls =
+        (cfg.active_thread_count() > 0) ? cfg.gemm_quant_vec_calls() : 0;
+    const uint64_t expected_vec_l1_read_bytes =
+        expected_accum_vec_calls * cfg.gemm_accum_rd_bytes() +
+        expected_quant_vec_calls * cfg.gemm_quant_rd_bytes();
+    const uint64_t expected_vec_l1_write_bytes =
+        expected_accum_vec_calls * cfg.gemm_accum_wr_bytes() +
+        expected_quant_vec_calls * cfg.gemm_quant_wr_bytes();
+    stats.expected_l1_reqs += stats.expected_vec_req_total * 2;
+    stats.expected_l1_read_bytes += expected_vec_l1_read_bytes;
+    stats.expected_l1_write_bytes += expected_vec_l1_write_bytes;
+    stats.expected_dma_reqs += stats.expected_vec_req_total * 2;
+    stats.expected_dma_read_bytes += expected_vec_l1_read_bytes;
+    stats.expected_dma_write_bytes += expected_vec_l1_write_bytes;
     stats.vec_busy_total = vec_acc.busy_cycles_total();
     stats.vec_occupied_total = vec_acc.occupied_cycles_total();
     stats.vec_qwait_total = vec_acc.queue_wait_cycles_total();
@@ -144,14 +175,8 @@ MatmulSimulationStats MatmulTop::collect_stats() const
     stats.memory_queue_wait_cycles = stats.l1_qwait_cycles + stats.dma_qwait_cycles;
     stats.coordinator_stall = coordinator->stall_cycles;
     stats.coordinator_compute = coordinator->compute_cycles;
-    stats.total_rd_bytes =
-        stats.mat_req_total * (cfg.gemm_a_bytes() + cfg.gemm_b_bytes()) +
-        coordinator->accum_vec_calls_total * cfg.gemm_accum_rd_bytes() +
-        coordinator->final_quant_calls_total * cfg.gemm_quant_rd_bytes();
-    stats.total_wr_bytes =
-        stats.mat_req_total * cfg.gemm_c_bytes() +
-        coordinator->accum_vec_calls_total * cfg.gemm_accum_wr_bytes() +
-        coordinator->final_quant_calls_total * cfg.gemm_quant_wr_bytes();
+    stats.total_rd_bytes = stats.dma_read_bytes;
+    stats.total_wr_bytes = stats.dma_write_bytes;
 
     if (stats.total_elapsed > 0)
     {
@@ -188,6 +213,12 @@ MatmulSimulationStats MatmulTop::collect_stats() const
     stats.verification_passed =
         stats.mat_req_total == stats.expected_mat_req_total &&
         stats.vec_req_total == stats.expected_vec_req_total &&
+        stats.l1_reqs == stats.expected_l1_reqs &&
+        stats.l1_read_bytes == stats.expected_l1_read_bytes &&
+        stats.l1_write_bytes == stats.expected_l1_write_bytes &&
+        stats.dma_reqs == stats.expected_dma_reqs &&
+        stats.dma_read_bytes == stats.expected_dma_read_bytes &&
+        stats.dma_write_bytes == stats.expected_dma_write_bytes &&
         coordinator->quant_start_time >= coordinator->accum_end_time &&
         coordinator->accum_vec_calls_total ==
             stats.expected_accum_pairs * cfg.gemm_accum_vec_calls() &&
@@ -220,11 +251,11 @@ std::vector<KernelWorkerInfo> MatmulTop::collect_worker_info() const
             : 0;
 
         wi.rd_bytes =
-            w->mat_calls * (w->A_bytes + w->B_bytes) +
+            cfg.local_mat_dma_read_bytes_for_thread(w->tid) +
             w->accum_vec_calls * cfg.gemm_accum_rd_bytes() +
             w->quant_vec_calls * cfg.gemm_quant_rd_bytes();
         wi.wr_bytes =
-            w->mat_calls * w->C_bytes +
+            cfg.local_mat_dma_write_bytes_for_thread(w->tid) +
             w->accum_vec_calls * cfg.gemm_accum_wr_bytes() +
             w->quant_vec_calls * cfg.gemm_quant_wr_bytes();
         info.push_back(wi);
@@ -263,6 +294,7 @@ void MatmulTop::print_report(std::ostream &os) const
         {"Workers [count]", report::fmt_int(cfg.thread_count)},
         {"Matrix Accelerators [count]", report::fmt_int(cfg.mat_accel_count)},
         {"Vector Accelerators [count]", report::fmt_int(cfg.vec_accel_count)},
+        {"C Accumulator Registers [tiles]", report::fmt_u64(cfg.accumulator_register_count)},
         {"Matrix Accelerator Tile", "[" + report::fmt_u64(MATMUL_M) + " x " +
                                      report::fmt_u64(MATMUL_K) + " x " +
                                      report::fmt_u64(MATMUL_N) + "]"},
@@ -321,13 +353,19 @@ void MatmulTop::print_report(std::ostream &os) const
     report::print_section_title(os, "Memory Hierarchy");
     report::print_fields(os, {
         {"L1 Engine Requests [requests]", report::fmt_u64(stats.l1_reqs)},
+        {"Expected L1 Engine Requests [requests]", report::fmt_u64(stats.expected_l1_reqs)},
         {"L1 Engine Read Bytes [bytes]", report::fmt_u64(stats.l1_read_bytes)},
+        {"Expected L1 Engine Read Bytes [bytes]", report::fmt_u64(stats.expected_l1_read_bytes)},
         {"L1 Engine Write Bytes [bytes]", report::fmt_u64(stats.l1_write_bytes)},
+        {"Expected L1 Engine Write Bytes [bytes]", report::fmt_u64(stats.expected_l1_write_bytes)},
         {"L1 Engine Busy Cycles [cycles]", report::fmt_u64(stats.l1_busy_cycles)},
         {"L1 Engine Queue Wait [cycles]", report::fmt_u64(stats.l1_qwait_cycles)},
         {"DMA Engine Requests [requests]", report::fmt_u64(stats.dma_reqs)},
+        {"Expected DMA Engine Requests [requests]", report::fmt_u64(stats.expected_dma_reqs)},
         {"DMA Engine Read Bytes [bytes]", report::fmt_u64(stats.dma_read_bytes)},
+        {"Expected DMA Engine Read Bytes [bytes]", report::fmt_u64(stats.expected_dma_read_bytes)},
         {"DMA Engine Write Bytes [bytes]", report::fmt_u64(stats.dma_write_bytes)},
+        {"Expected DMA Engine Write Bytes [bytes]", report::fmt_u64(stats.expected_dma_write_bytes)},
         {"DMA Engine Busy Cycles [cycles]", report::fmt_u64(stats.dma_busy_cycles)},
         {"DMA Engine Queue Wait [cycles]", report::fmt_u64(stats.dma_qwait_cycles)},
         {"Total Memory Requests [requests]", report::fmt_u64(stats.memory_reqs)},
@@ -359,6 +397,14 @@ void MatmulTop::print_report(std::ostream &os) const
         {"Actual Matrix Accelerator Requests [requests]", report::fmt_u64(stats.mat_req_total)},
         {"Expected Vector Accelerator Requests [requests]", report::fmt_u64(stats.expected_vec_req_total)},
         {"Actual Vector Accelerator Requests [requests]", report::fmt_u64(stats.vec_req_total)},
+        {"Expected L1 Read Bytes [bytes]", report::fmt_u64(stats.expected_l1_read_bytes)},
+        {"Actual L1 Read Bytes [bytes]", report::fmt_u64(stats.l1_read_bytes)},
+        {"Expected L1 Write Bytes [bytes]", report::fmt_u64(stats.expected_l1_write_bytes)},
+        {"Actual L1 Write Bytes [bytes]", report::fmt_u64(stats.l1_write_bytes)},
+        {"Expected DMA Read Bytes [bytes]", report::fmt_u64(stats.expected_dma_read_bytes)},
+        {"Actual DMA Read Bytes [bytes]", report::fmt_u64(stats.dma_read_bytes)},
+        {"Expected DMA Write Bytes [bytes]", report::fmt_u64(stats.expected_dma_write_bytes)},
+        {"Actual DMA Write Bytes [bytes]", report::fmt_u64(stats.dma_write_bytes)},
         {"Verification Status", stats.verification_passed ? "PASS" : "FAIL"},
     });
 }

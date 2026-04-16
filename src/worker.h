@@ -45,6 +45,10 @@ struct Worker : sc_module
     uint64_t scalar_cycles;
     uint64_t max_inflight_mat_reqs = 1;
     uint64_t max_inflight_vec_reqs = 1;
+    uint64_t gemm_m_tiles = 0;
+    uint64_t gemm_n_tiles = 0;
+    uint64_t gemm_k_tiles = 0;
+    uint64_t accumulator_register_count = 1;
     WorkerPostProcessor *post_processor = nullptr;
     sc_event *start_event = nullptr;
     sc_fifo<int> *completion_fifo = nullptr;
@@ -150,6 +154,10 @@ struct Worker : sc_module
     void finish_dma(DmaReq &p);
 
     void issue_end(PendingReq &p);
+    void configure_gemm_reuse(uint64_t m_tiles,
+                              uint64_t n_tiles,
+                              uint64_t k_tiles,
+                              uint64_t accumulator_registers);
     void issue_stream(uint64_t addr,
                       uint64_t call_count,
                       uint64_t svc_cycles,
@@ -159,7 +167,9 @@ struct Worker : sc_module
                       uint64_t dma_wr,
                       uint64_t &call_counter,
                       uint64_t *phase_counter = nullptr,
-                      uint64_t max_inflight = 1);
+                      uint64_t max_inflight = 1,
+                      bool scalar_between_streams = false);
+    void issue_gemm_reuse_stream();
 
     void run();
 };

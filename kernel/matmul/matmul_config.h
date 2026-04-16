@@ -21,10 +21,12 @@
 struct MatmulConfig
 {
     static constexpr int default_thread_count = 32;
+    static constexpr uint64_t default_accumulator_register_count = 4;
 
     int thread_count = default_thread_count;
     int mat_accel_count = MAT_ACCEL_COUNT;
     int vec_accel_count = VEC_ACCEL_COUNT;
+    uint64_t accumulator_register_count = default_accumulator_register_count;
 
     // Default workload mirrors the previous root conv-style GEMM mapping.
     static constexpr uint64_t workload_n = 1;
@@ -68,10 +70,13 @@ struct MatmulConfig
 
     explicit MatmulConfig(int threads = default_thread_count,
                           int mat_accels = MAT_ACCEL_COUNT,
-                          int vec_accels = VEC_ACCEL_COUNT)
+                          int vec_accels = VEC_ACCEL_COUNT,
+                          uint64_t accumulator_registers =
+                              default_accumulator_register_count)
         : thread_count(std::max(threads, 1)),
           mat_accel_count(std::max(mat_accels, 1)),
-          vec_accel_count(std::max(vec_accels, 1))
+          vec_accel_count(std::max(vec_accels, 1)),
+          accumulator_register_count(std::max<uint64_t>(accumulator_registers, 1))
     {
     }
 

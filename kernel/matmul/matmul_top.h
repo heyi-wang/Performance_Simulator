@@ -17,6 +17,8 @@ struct MatmulRuntimeConfig
     int thread_count = MatmulConfig::default_thread_count;
     int mat_accel_count = MAT_ACCEL_COUNT;
     int vec_accel_count = VEC_ACCEL_COUNT;
+    uint64_t accumulator_register_count =
+        MatmulConfig::default_accumulator_register_count;
 
     uint64_t workload_n = MatmulConfig::workload_n;
     uint64_t workload_h = MatmulConfig::workload_h;
@@ -53,12 +55,16 @@ struct MatmulRuntimeConfig
 
     static MatmulRuntimeConfig defaults(int threads = MatmulConfig::default_thread_count,
                                         int mat_accels = MAT_ACCEL_COUNT,
-                                        int vec_accels = VEC_ACCEL_COUNT)
+                                        int vec_accels = VEC_ACCEL_COUNT,
+                                        uint64_t accumulator_registers =
+                                            MatmulConfig::default_accumulator_register_count)
     {
         MatmulRuntimeConfig cfg;
         cfg.thread_count = std::max(threads, 1);
         cfg.mat_accel_count = std::max(mat_accels, 1);
         cfg.vec_accel_count = std::max(vec_accels, 1);
+        cfg.accumulator_register_count =
+            std::max<uint64_t>(accumulator_registers, 1);
         cfg.mat_queue_cap_value =
             std::max(HW_ACC_QUEUE_DEPTH,
                      static_cast<size_t>(cfg.mat_accel_count * 4));
@@ -113,9 +119,44 @@ struct MatmulRuntimeConfig
     }
     uint64_t local_access_mat_for_thread(int tid) const
     {
+        return gemm_tile_m() * local_tile_k_for_thread(tid) * gemm_tile_n();
+    }
+    uint64_t local_tile_k_for_thread(int tid) const
+    {
         uint64_t local_k = local_k_extent_for_thread(tid);
-        uint64_t local_tile_k = (local_k > 0) ? ceil_div_u64(local_k, MATMUL_K) : 0;
-        return gemm_tile_m() * local_tile_k * gemm_tile_n();
+        return (local_k > 0) ? ceil_div_u64(local_k, MATMUL_K) : 0;
+    }
+    uint64_t gemm_m_batches() const
+    {
+        return ceil_div_u64(gemm_tile_m(), accumulator_register_count);
+    }
+    uint64_t local_output_tiles_for_thread(int tid) const
+    {
+        return (local_tile_k_for_thread(tid) > 0)
+                   ? gemm_tile_m() * gemm_tile_n()
+                   : 0;
+    }
+    uint64_t local_b_dma_tiles_for_thread(int tid) const
+    {
+        return gemm_m_batches() * gemm_tile_n() * local_tile_k_for_thread(tid);
+    }
+    uint64_t local_mat_l1_read_bytes_for_thread(int tid) const
+    {
+        return local_access_mat_for_thread(tid) *
+               (gemm_a_bytes() + gemm_b_bytes());
+    }
+    uint64_t local_mat_l1_write_bytes_for_thread(int tid) const
+    {
+        return local_output_tiles_for_thread(tid) * gemm_c_bytes();
+    }
+    uint64_t local_mat_dma_read_bytes_for_thread(int tid) const
+    {
+        return local_access_mat_for_thread(tid) * gemm_a_bytes() +
+               local_b_dma_tiles_for_thread(tid) * gemm_b_bytes();
+    }
+    uint64_t local_mat_dma_write_bytes_for_thread(int tid) const
+    {
+        return local_output_tiles_for_thread(tid) * gemm_c_bytes();
     }
     int active_thread_count() const
     {
@@ -141,6 +182,12 @@ struct MatmulSimulationStats
     uint64_t expected_mat_req_total = 0;
     uint64_t expected_vec_req_total = 0;
     uint64_t expected_accum_pairs = 0;
+    uint64_t expected_l1_reqs = 0;
+    uint64_t expected_l1_read_bytes = 0;
+    uint64_t expected_l1_write_bytes = 0;
+    uint64_t expected_dma_reqs = 0;
+    uint64_t expected_dma_read_bytes = 0;
+    uint64_t expected_dma_write_bytes = 0;
     uint64_t mat_busy_total = 0;
     uint64_t mat_occupied_total = 0;
     uint64_t mat_qwait_total = 0;

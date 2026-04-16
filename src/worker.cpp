@@ -1,6 +1,7 @@
 #include "worker.h"
 #include "interconnect.h"   // for Interconnect::ADDR_MAT / ADDR_VEC
 #include "memory.h"         // for MemoryAccessExt / MemoryAccessKind
+#include <algorithm>
 #include <iostream>
 
 SC_HAS_PROCESS(Worker);
@@ -280,6 +281,17 @@ void Worker::finish_dma(DmaReq &p)
     p.tx_ext  = nullptr;
 }
 
+void Worker::configure_gemm_reuse(uint64_t m_tiles,
+                                  uint64_t n_tiles,
+                                  uint64_t k_tiles,
+                                  uint64_t accumulator_registers)
+{
+    gemm_m_tiles = m_tiles;
+    gemm_n_tiles = n_tiles;
+    gemm_k_tiles = k_tiles;
+    accumulator_register_count = std::max<uint64_t>(accumulator_registers, 1);
+}
+
 void Worker::issue_stream(uint64_t addr,
                           uint64_t call_count,
                           uint64_t svc_cycles,
@@ -289,7 +301,8 @@ void Worker::issue_stream(uint64_t addr,
                           uint64_t dma_wr,
                           uint64_t &call_counter,
                           uint64_t *phase_counter,
-                          uint64_t max_inflight)
+                          uint64_t max_inflight,
+                          bool scalar_between_streams)
 {
     if (call_count == 0)
         return;
@@ -317,7 +330,7 @@ void Worker::issue_stream(uint64_t addr,
     };
 
     auto issue_accel = [&]() {
-        if (accel_issued > 0)
+        if (accel_issued > 0 || (scalar_between_streams && call_counter > 0))
             do_scalar(scalar_cycles);
         accel_inflight.push_back(issue_begin(addr, svc_cycles, rd, wr));
         ++call_counter;
@@ -432,6 +445,41 @@ void Worker::issue_stream(uint64_t addr,
     }
 }
 
+void Worker::issue_gemm_reuse_stream()
+{
+    if (gemm_m_tiles == 0 || gemm_n_tiles == 0 || gemm_k_tiles == 0)
+        return;
+
+    const uint64_t regs = std::max<uint64_t>(accumulator_register_count, 1);
+
+    for (uint64_t mg = 0; mg < gemm_m_tiles; mg += regs)
+    {
+        const uint64_t m_batch = std::min<uint64_t>(regs, gemm_m_tiles - mg);
+
+        for (uint64_t nt = 0; nt < gemm_n_tiles; ++nt)
+        {
+            for (uint64_t kt = 0; kt < gemm_k_tiles; ++kt)
+            {
+                DmaReq b_read = issue_dma_begin(false, B_bytes);
+                finish_dma(b_read);
+
+                const bool final_k = (kt + 1 == gemm_k_tiles);
+                issue_stream(Interconnect::ADDR_MAT,
+                             m_batch,
+                             mat_cycles,
+                             A_bytes + B_bytes,
+                             final_k ? C_bytes : 0,
+                             A_bytes,
+                             final_k ? C_bytes : 0,
+                             mat_calls,
+                             nullptr,
+                             max_inflight_mat_reqs,
+                             true);
+            }
+        }
+    }
+}
+
 void Worker::run()
 {
     if (start_event)
@@ -444,16 +492,21 @@ void Worker::run()
     // Pipeline: issue → scalar (overlapped) → issue_end → issue...
     // ----------------------------------------------------------
     if (access_mat > 0)
-        issue_stream(Interconnect::ADDR_MAT,
-                     access_mat,
-                     mat_cycles,
-                     A_bytes + B_bytes,
-                     C_bytes,
-                     A_bytes + B_bytes,
-                     C_bytes,
-                     mat_calls,
-                     nullptr,
-                     max_inflight_mat_reqs);
+    {
+        if (gemm_m_tiles > 0 && gemm_n_tiles > 0 && gemm_k_tiles > 0)
+            issue_gemm_reuse_stream();
+        else
+            issue_stream(Interconnect::ADDR_MAT,
+                         access_mat,
+                         mat_cycles,
+                         A_bytes + B_bytes,
+                         C_bytes,
+                         A_bytes + B_bytes,
+                         C_bytes,
+                         mat_calls,
+                         nullptr,
+                         max_inflight_mat_reqs);
+    }
 
     if (post_processor)
     {
