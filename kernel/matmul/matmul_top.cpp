@@ -58,6 +58,8 @@ MatmulTop::MatmulTop(sc_module_name nm,
     //   Workers execute local matmul first, then run reduction and final
     //   quantization inside the same SC_THREAD via the passive coordinator.
     // -------------------------------------------------------
+    workers.reserve(static_cast<size_t>(cfg.thread_count));
+    active_workers.reserve(static_cast<size_t>(cfg.active_thread_count()));
     for (int i = 0; i < cfg.thread_count; i++)
     {
         WorkerPostProcessor *post_processor =
@@ -102,6 +104,14 @@ MatmulTop::~MatmulTop()
 MatmulSimulationStats MatmulTop::collect_stats() const
 {
     MatmulSimulationStats stats;
+    const int active_threads = cfg.active_thread_count();
+    const uint64_t accum_vec_calls = cfg.gemm_accum_vec_calls();
+    const uint64_t quant_vec_calls =
+        (active_threads > 0) ? cfg.gemm_quant_vec_calls() : 0;
+    const uint64_t accum_rd_bytes = cfg.gemm_accum_rd_bytes();
+    const uint64_t accum_wr_bytes = cfg.gemm_accum_wr_bytes();
+    const uint64_t quant_rd_bytes = cfg.gemm_quant_rd_bytes();
+    const uint64_t quant_wr_bytes = cfg.gemm_quant_wr_bytes();
 
     for (const auto *w : workers)
     {
@@ -137,20 +147,18 @@ MatmulSimulationStats MatmulTop::collect_stats() const
         stats.expected_dma_write_bytes += cfg.local_mat_dma_write_bytes_for_thread(tid);
     }
     stats.expected_accum_pairs =
-        static_cast<uint64_t>(std::max(cfg.active_thread_count() - 1, 0));
+        static_cast<uint64_t>(std::max(active_threads - 1, 0));
     stats.expected_vec_req_total =
-        stats.expected_accum_pairs * cfg.gemm_accum_vec_calls() +
-        ((cfg.active_thread_count() > 0) ? cfg.gemm_quant_vec_calls() : 0);
+        stats.expected_accum_pairs * accum_vec_calls + quant_vec_calls;
     const uint64_t expected_accum_vec_calls =
-        stats.expected_accum_pairs * cfg.gemm_accum_vec_calls();
-    const uint64_t expected_quant_vec_calls =
-        (cfg.active_thread_count() > 0) ? cfg.gemm_quant_vec_calls() : 0;
+        stats.expected_accum_pairs * accum_vec_calls;
+    const uint64_t expected_quant_vec_calls = quant_vec_calls;
     const uint64_t expected_vec_l1_read_bytes =
-        expected_accum_vec_calls * cfg.gemm_accum_rd_bytes() +
-        expected_quant_vec_calls * cfg.gemm_quant_rd_bytes();
+        expected_accum_vec_calls * accum_rd_bytes +
+        expected_quant_vec_calls * quant_rd_bytes;
     const uint64_t expected_vec_l1_write_bytes =
-        expected_accum_vec_calls * cfg.gemm_accum_wr_bytes() +
-        expected_quant_vec_calls * cfg.gemm_quant_wr_bytes();
+        expected_accum_vec_calls * accum_wr_bytes +
+        expected_quant_vec_calls * quant_wr_bytes;
     stats.expected_l1_reqs += stats.expected_vec_req_total * 2;
     stats.expected_l1_read_bytes += expected_vec_l1_read_bytes;
     stats.expected_l1_write_bytes += expected_vec_l1_write_bytes;
@@ -221,9 +229,9 @@ MatmulSimulationStats MatmulTop::collect_stats() const
         stats.dma_write_bytes == stats.expected_dma_write_bytes &&
         coordinator->quant_start_time >= coordinator->accum_end_time &&
         coordinator->accum_vec_calls_total ==
-            stats.expected_accum_pairs * cfg.gemm_accum_vec_calls() &&
+            stats.expected_accum_pairs * accum_vec_calls &&
         coordinator->final_quant_calls_total ==
-            ((cfg.active_thread_count() > 0) ? cfg.gemm_quant_vec_calls() : 0);
+            quant_vec_calls;
 
     return stats;
 }

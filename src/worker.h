@@ -1,14 +1,15 @@
 #pragma once
 
 #include "extensions.h"
+#include "memory.h"
 #include <deque>
+#include <memory>
 #include <systemc>
 #include <tlm_utils/simple_initiator_socket.h>
 #include <tlm_utils/peq_with_get.h>
-#include <unordered_map>
+#include <vector>
 
 struct Worker;
-struct MemoryAccessExt;
 
 // Optional hook for simulator-specific post-matmul work that still runs
 // inside the worker's own SC_THREAD.
@@ -87,12 +88,34 @@ struct Worker : sc_module
     // ----------------------------------------------------------
     struct DoneEntry
     {
-        sc_event *ev       = nullptr;
-        sc_event *admit_ev = nullptr;
-        bool      fired    = false;
+        sc_event ev;
+        sc_event admit_ev;
+        bool     fired       = false;
+        bool     admit_fired = false;
     };
 
-    std::unordered_map<tlm_generic_payload *, DoneEntry *> done_map;
+    struct PendingReqStorage
+    {
+        tlm_generic_payload gp;
+        ReqExt              req_ext;
+        TxnExt              tx_ext;
+        DoneEntry           done_entry;
+        bool                in_use = false;
+    };
+
+    struct DmaReqStorage
+    {
+        tlm_generic_payload gp;
+        MemoryAccessExt     mem_ext;
+        TxnExt              tx_ext;
+        DoneEntry           done_entry;
+        bool                in_use = false;
+    };
+
+    std::deque<PendingReqStorage> pending_req_pool;
+    std::deque<DmaReqStorage>     dma_req_pool;
+    std::vector<PendingReqStorage *> free_pending_reqs;
+    std::vector<DmaReqStorage *>     free_dma_reqs;
 
     // Handle for an in-flight accelerator request.
     // Returned by issue_begin(); must be finalized with issue_end().
@@ -102,6 +125,7 @@ struct Worker : sc_module
         ReqExt              *req_ext      = nullptr;
         TxnExt              *tx_ext       = nullptr;
         DoneEntry           *done_entry   = nullptr;
+        PendingReqStorage   *storage      = nullptr;
         uint64_t             svc_cycles   = 0;
         uint64_t             stall_cycles = 0;   // backpressure stall for this request
         bool                 sync_done    = false;
@@ -114,6 +138,7 @@ struct Worker : sc_module
         MemoryAccessExt     *mem_ext    = nullptr;
         TxnExt              *tx_ext     = nullptr;
         DoneEntry           *done_entry = nullptr;
+        DmaReqStorage       *storage    = nullptr;
         bool                 sync_done  = true;
     };
 
@@ -152,6 +177,10 @@ struct Worker : sc_module
 
     DmaReq issue_dma_begin(bool is_write, uint64_t bytes);
     void finish_dma(DmaReq &p);
+    PendingReqStorage *acquire_pending_req_storage();
+    DmaReqStorage *acquire_dma_req_storage();
+    void release_pending_req_storage(PendingReqStorage *storage);
+    void release_dma_req_storage(DmaReqStorage *storage);
 
     void issue_end(PendingReq &p);
     void configure_gemm_reuse(uint64_t m_tiles,

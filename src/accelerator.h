@@ -6,7 +6,6 @@
 #include <tlm_utils/peq_with_get.h>
 #include <deque>
 #include <functional>
-#include <unordered_map>
 
 // ============================================================
 // AcceleratorTLM — single-server FIFO accelerator
@@ -55,8 +54,6 @@ struct AcceleratorTLM : sc_module
     uint64_t queue_wait_cycles = 0;
     uint64_t req_count         = 0;
 
-    std::unordered_map<tlm_generic_payload *, sc_event *> mem_done_map;
-
     SC_HAS_PROCESS(AcceleratorTLM);
 
     AcceleratorTLM(sc_module_name name, size_t cap);
@@ -70,6 +67,7 @@ struct AcceleratorTLM : sc_module
                                       sc_time &delay);
 
     void mem_access(bool is_write, uint64_t bytes);
+    void enqueue_request(tlm_generic_payload &gp);
 
     void peq_thread();
     void service_thread();

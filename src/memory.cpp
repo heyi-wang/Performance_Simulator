@@ -35,6 +35,15 @@ tlm_sync_enum Memory::nb_transport_fw(tlm_generic_payload &gp,
     return TLM_ACCEPTED;
 }
 
+void Memory::enqueue_request(tlm_generic_payload &gp)
+{
+    Entry e;
+    e.gp = &gp;
+    e.enqueue_time = sc_time_stamp();
+    q.push_back(e);
+    dispatch_ev.notify(SC_ZERO_TIME);
+}
+
 void Memory::peq_thread()
 {
     while (true)
@@ -42,11 +51,7 @@ void Memory::peq_thread()
         wait(req_peq.get_event());
         while (auto *gp = req_peq.get_next_transaction())
         {
-            Entry e;
-            e.gp           = gp;
-            e.enqueue_time = sc_time_stamp();
-            q.push_back(e);
-            dispatch_ev.notify(SC_ZERO_TIME);
+            enqueue_request(*gp);
         }
     }
 }
@@ -156,6 +161,24 @@ uint64_t L1L2Memory::transfer_cycles(uint64_t bytes,
     return base_lat_cycles + xfer;
 }
 
+void L1L2Memory::enqueue_request(tlm_generic_payload &gp)
+{
+    Entry e;
+    e.gp = &gp;
+    e.enqueue_time = sc_time_stamp();
+
+    if (access_kind(gp) == MemoryAccessKind::L1)
+    {
+        l1_q.push_back(e);
+        l1_dispatch_ev.notify(SC_ZERO_TIME);
+    }
+    else
+    {
+        dma_q.push_back(e);
+        dma_dispatch_ev.notify(SC_ZERO_TIME);
+    }
+}
+
 void L1L2Memory::peq_thread()
 {
     while (true)
@@ -163,20 +186,7 @@ void L1L2Memory::peq_thread()
         wait(req_peq.get_event());
         while (auto *gp = req_peq.get_next_transaction())
         {
-            Entry e;
-            e.gp = gp;
-            e.enqueue_time = sc_time_stamp();
-
-            if (access_kind(*gp) == MemoryAccessKind::L1)
-            {
-                l1_q.push_back(e);
-                l1_dispatch_ev.notify(SC_ZERO_TIME);
-            }
-            else
-            {
-                dma_q.push_back(e);
-                dma_dispatch_ev.notify(SC_ZERO_TIME);
-            }
+            enqueue_request(*gp);
         }
     }
 }
@@ -214,7 +224,6 @@ void L1L2Memory::l1_dispatch_thread()
             }
 
             l1_active_reqs += 1;
-            inflight_kind[e.gp] = MemoryAccessKind::L1;
             resp_peq.notify(*e.gp, lat * CYCLE);
         }
     }
@@ -253,7 +262,6 @@ void L1L2Memory::dma_dispatch_thread()
             }
 
             dma_active_reqs += 1;
-            inflight_kind[e.gp] = MemoryAccessKind::Dma;
             resp_peq.notify(*e.gp, lat * CYCLE);
         }
     }
@@ -272,11 +280,7 @@ void L1L2Memory::response_thread()
             sc_time bw_delay = SC_ZERO_TIME;
             tgt->nb_transport_bw(*gp, bw_phase, bw_delay);
 
-            auto it = inflight_kind.find(gp);
-            MemoryAccessKind kind =
-                (it != inflight_kind.end()) ? it->second : access_kind(*gp);
-            if (it != inflight_kind.end())
-                inflight_kind.erase(it);
+            MemoryAccessKind kind = access_kind(*gp);
 
             if (kind == MemoryAccessKind::L1)
             {

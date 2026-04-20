@@ -62,6 +62,9 @@ tlm_sync_enum Worker::nb_transport_bw(tlm_generic_payload &gp,
                                       tlm_phase &phase,
                                       sc_time &delay)
 {
+    TxnExt *tx = nullptr;
+    gp.get_extension(tx);
+
     if (phase == BEGIN_RESP)
     {
         peq.notify(gp, delay);
@@ -69,9 +72,12 @@ tlm_sync_enum Worker::nb_transport_bw(tlm_generic_payload &gp,
     }
     if (phase == END_REQ)
     {
-        auto it = done_map.find(&gp);
-        if (it != done_map.end() && it->second && it->second->admit_ev)
-            it->second->admit_ev->notify(SC_ZERO_TIME);
+        if (tx && tx->admit_ev)
+        {
+            if (tx->admit_fired)
+                *tx->admit_fired = true;
+            tx->admit_ev->notify(SC_ZERO_TIME);
+        }
         return TLM_ACCEPTED;
     }
     return TLM_ACCEPTED;
@@ -89,11 +95,12 @@ void Worker::peq_thread()
         wait(peq.get_event());
         while (auto *gp = peq.get_next_transaction())
         {
-            auto it = done_map.find(gp);
-            if (it != done_map.end() && it->second)
+            TxnExt *tx = nullptr;
+            gp->get_extension(tx);
+            if (tx && tx->done_ev && tx->done_fired)
             {
-                it->second->fired = true;
-                it->second->ev->notify(SC_ZERO_TIME);
+                *tx->done_fired = true;
+                tx->done_ev->notify(SC_ZERO_TIME);
             }
         }
     }
@@ -103,6 +110,66 @@ void Worker::do_scalar(uint64_t cyc)
 {
     compute_cycles += cyc;
     wait(cyc * CYCLE);
+}
+
+Worker::PendingReqStorage *Worker::acquire_pending_req_storage()
+{
+    PendingReqStorage *storage = nullptr;
+    if (!free_pending_reqs.empty())
+    {
+        storage = free_pending_reqs.back();
+        free_pending_reqs.pop_back();
+    }
+    else
+    {
+        pending_req_pool.emplace_back();
+        storage = &pending_req_pool.back();
+    }
+
+    storage->in_use = true;
+    storage->done_entry.fired = false;
+    storage->done_entry.admit_fired = false;
+    storage->req_ext = ReqExt();
+    storage->tx_ext = TxnExt();
+    return storage;
+}
+
+Worker::DmaReqStorage *Worker::acquire_dma_req_storage()
+{
+    DmaReqStorage *storage = nullptr;
+    if (!free_dma_reqs.empty())
+    {
+        storage = free_dma_reqs.back();
+        free_dma_reqs.pop_back();
+    }
+    else
+    {
+        dma_req_pool.emplace_back();
+        storage = &dma_req_pool.back();
+    }
+
+    storage->in_use = true;
+    storage->done_entry.fired = false;
+    storage->done_entry.admit_fired = false;
+    storage->mem_ext = MemoryAccessExt(MemoryAccessKind::Dma);
+    storage->tx_ext = TxnExt();
+    return storage;
+}
+
+void Worker::release_pending_req_storage(PendingReqStorage *storage)
+{
+    if (!storage)
+        return;
+    storage->in_use = false;
+    free_pending_reqs.push_back(storage);
+}
+
+void Worker::release_dma_req_storage(DmaReqStorage *storage)
+{
+    if (!storage)
+        return;
+    storage->in_use = false;
+    free_dma_reqs.push_back(storage);
 }
 
 // ----------------------------------------------------------
@@ -118,7 +185,8 @@ Worker::PendingReq Worker::issue_begin(uint64_t addr,
     PendingReq p;
     p.svc_cycles = svc_cycles;
 
-    auto *gp = new tlm_generic_payload();
+    auto *storage = acquire_pending_req_storage();
+    auto *gp = &storage->gp;
     gp->set_command(TLM_IGNORE_COMMAND);
     gp->set_address(addr);
     gp->set_data_ptr(nullptr);
@@ -126,8 +194,9 @@ Worker::PendingReq Worker::issue_begin(uint64_t addr,
     gp->set_streaming_width(0);
     gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
 
-    auto *req = new ReqExt(tid, svc_cycles, rd, wr);
-    auto *tx  = new TxnExt();
+    auto *req = &storage->req_ext;
+    *req = ReqExt(tid, svc_cycles, rd, wr);
+    auto *tx = &storage->tx_ext;
     tx->src_worker = tid;
 
     gp->set_extension(req);
@@ -136,11 +205,12 @@ Worker::PendingReq Worker::issue_begin(uint64_t addr,
     p.gp         = gp;
     p.req_ext    = req;
     p.tx_ext     = tx;
-    p.done_entry = new DoneEntry();
-    p.done_entry->ev       = new sc_event();
-    p.done_entry->admit_ev = new sc_event();
-    p.done_entry->fired    = false;
-    done_map[gp] = p.done_entry;
+    p.done_entry = &storage->done_entry;
+    p.storage    = storage;
+    tx->done_ev = &p.done_entry->ev;
+    tx->admit_ev = &p.done_entry->admit_ev;
+    tx->done_fired = &p.done_entry->fired;
+    tx->admit_fired = &p.done_entry->admit_fired;
 
     tlm_phase phase = BEGIN_REQ;
     sc_time   delay = SC_ZERO_TIME;
@@ -150,12 +220,12 @@ Worker::PendingReq Worker::issue_begin(uint64_t addr,
     {
         // Queue was full: stall until the accelerator grants a slot.
         sc_time t_stall_start = sc_time_stamp();
-        wait(*p.done_entry->admit_ev);
+        if (!p.done_entry->admit_fired)
+            wait(p.done_entry->admit_ev);
         p.stall_cycles = (uint64_t)((sc_time_stamp() - t_stall_start) / CYCLE);
     }
     else if (status == TLM_COMPLETED)
     {
-        done_map.erase(gp);
         p.sync_done = true;
     }
     // TLM_UPDATED: slot granted immediately, no stall needed.
@@ -173,13 +243,7 @@ void Worker::issue_end(PendingReq &p)
 {
     // If fired=true the response arrived before we got here; skip wait().
     if (!p.sync_done && !p.done_entry->fired)
-        wait(*p.done_entry->ev);
-
-    done_map.erase(p.gp);
-    delete p.done_entry->ev;
-    delete p.done_entry->admit_ev;
-    delete p.done_entry;
-    p.done_entry = nullptr;
+        wait(p.done_entry->ev);
 
     ReqExt *ext = nullptr;
     p.gp->get_extension(ext);
@@ -196,13 +260,13 @@ void Worker::issue_end(PendingReq &p)
 
     p.gp->clear_extension(p.req_ext);
     p.gp->clear_extension(p.tx_ext);
-    delete p.req_ext;
-    delete p.tx_ext;
-    delete p.gp;
+    release_pending_req_storage(p.storage);
 
     p.gp      = nullptr;
     p.req_ext = nullptr;
     p.tx_ext  = nullptr;
+    p.done_entry = nullptr;
+    p.storage = nullptr;
 }
 
 Worker::DmaReq Worker::issue_dma_begin(bool is_write, uint64_t bytes)
@@ -211,7 +275,8 @@ Worker::DmaReq Worker::issue_dma_begin(bool is_write, uint64_t bytes)
     if (bytes == 0)
         return p;
 
-    auto *gp = new tlm_generic_payload();
+    auto *storage = acquire_dma_req_storage();
+    auto *gp = &storage->gp;
     gp->set_command(is_write ? TLM_WRITE_COMMAND : TLM_READ_COMMAND);
     gp->set_address(Interconnect::ADDR_MEM);
     gp->set_data_ptr(nullptr);
@@ -219,23 +284,25 @@ Worker::DmaReq Worker::issue_dma_begin(bool is_write, uint64_t bytes)
     gp->set_streaming_width(static_cast<unsigned>(bytes));
     gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
 
-    auto *mem_ext = new MemoryAccessExt(MemoryAccessKind::Dma);
+    auto *mem_ext = &storage->mem_ext;
+    mem_ext->kind = MemoryAccessKind::Dma;
     gp->set_extension(mem_ext);
 
-    auto *tx = new TxnExt();
+    auto *tx = &storage->tx_ext;
     tx->src_worker = tid;
     gp->set_extension(tx);
 
-    auto *de = new DoneEntry();
-    de->ev       = new sc_event();
-    de->admit_ev = new sc_event();
-    de->fired    = false;
-    done_map[gp] = de;
+    auto *de = &storage->done_entry;
+    tx->done_ev = &de->ev;
+    tx->admit_ev = &de->admit_ev;
+    tx->done_fired = &de->fired;
+    tx->admit_fired = &de->admit_fired;
 
     p.gp         = gp;
     p.mem_ext    = mem_ext;
     p.tx_ext     = tx;
     p.done_entry = de;
+    p.storage    = storage;
     p.sync_done  = false;
 
     tlm_phase phase = BEGIN_REQ;
@@ -244,7 +311,6 @@ Worker::DmaReq Worker::issue_dma_begin(bool is_write, uint64_t bytes)
 
     if (status == TLM_COMPLETED)
     {
-        done_map.erase(gp);
         p.sync_done = true;
     }
 
@@ -257,13 +323,8 @@ void Worker::finish_dma(DmaReq &p)
         return;
 
     if (!p.sync_done && !p.done_entry->fired)
-        wait(*p.done_entry->ev);
+        wait(p.done_entry->ev);
 
-    done_map.erase(p.gp);
-
-    delete p.done_entry->ev;
-    delete p.done_entry->admit_ev;
-    delete p.done_entry;
     p.done_entry = nullptr;
 
     tlm_phase end_phase = END_RESP;
@@ -272,13 +333,12 @@ void Worker::finish_dma(DmaReq &p)
 
     p.gp->clear_extension(p.mem_ext);
     p.gp->clear_extension(p.tx_ext);
-    delete p.mem_ext;
-    delete p.tx_ext;
-    delete p.gp;
+    release_dma_req_storage(p.storage);
 
     p.gp      = nullptr;
     p.mem_ext = nullptr;
     p.tx_ext  = nullptr;
+    p.storage = nullptr;
 }
 
 void Worker::configure_gemm_reuse(uint64_t m_tiles,
@@ -398,7 +458,7 @@ void Worker::issue_stream(uint64_t addr,
         auto add_dma_event = [&](const DmaReq &p) {
             if (p.gp && !p.sync_done && p.done_entry && !p.done_entry->fired)
             {
-                wait_list |= *p.done_entry->ev;
+                wait_list |= p.done_entry->ev;
                 has_event = true;
             }
         };
@@ -406,7 +466,7 @@ void Worker::issue_stream(uint64_t addr,
         auto add_accel_event = [&](const PendingReq &p) {
             if (!p.sync_done && p.done_entry && !p.done_entry->fired)
             {
-                wait_list |= *p.done_entry->ev;
+                wait_list |= p.done_entry->ev;
                 has_event = true;
             }
         };

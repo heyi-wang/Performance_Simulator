@@ -4,7 +4,6 @@
 #include <tlm_utils/simple_target_socket.h>
 #include <tlm_utils/peq_with_get.h>
 #include <deque>
-#include <unordered_map>
 
 enum class MemoryAccessKind
 {
@@ -73,6 +72,7 @@ struct Memory : sc_module
     void peq_thread();
     void dispatch_thread();
     void response_thread();
+    void enqueue_request(tlm_generic_payload &gp);
 };
 
 // ============================================================
@@ -107,7 +107,6 @@ struct L1L2Memory : sc_module
     std::deque<Entry> dma_q;
     sc_event          l1_dispatch_ev;
     sc_event          dma_dispatch_ev;
-    std::unordered_map<tlm_generic_payload *, MemoryAccessKind> inflight_kind;
 
     uint64_t l1_reqs = 0;
     uint64_t l1_read_reqs = 0;
@@ -143,6 +142,7 @@ struct L1L2Memory : sc_module
     void l1_dispatch_thread();
     void dma_dispatch_thread();
     void response_thread();
+    void enqueue_request(tlm_generic_payload &gp);
 
 private:
     static MemoryAccessKind access_kind(tlm_generic_payload &gp);

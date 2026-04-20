@@ -32,9 +32,12 @@ struct ReqExt : tlm_extension<ReqExt>
 // ============================================================
 struct TxnExt : tlm_extension<TxnExt>
 {
-    int       src_worker  = -1;
-    sc_event *done_ev     = nullptr;
-    int       upstream_id = -1;
+    int       src_worker   = -1;
+    sc_event *done_ev      = nullptr;
+    sc_event *admit_ev     = nullptr;
+    bool     *done_fired   = nullptr;
+    bool     *admit_fired  = nullptr;
+    int       upstream_id  = -1;
 
     tlm_extension_base *clone() const override { return new TxnExt(*this); }
     void copy_from(const tlm_extension_base &ext) override

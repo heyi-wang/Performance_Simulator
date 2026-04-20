@@ -25,7 +25,6 @@ tlm_sync_enum AcceleratorTLM::nb_transport_fw(tlm_generic_payload &gp,
     {
         if (admitted < queue_capacity)
         {
-            // Slot available: admit immediately through the PEQ.
             ++admitted;
             peq.notify(gp, delay);
             phase = END_REQ;
@@ -49,9 +48,13 @@ tlm_sync_enum AcceleratorTLM::nb_transport_bw_mem(tlm_generic_payload &gp,
 {
     if (phase == BEGIN_RESP)
     {
-        auto it = mem_done_map.find(&gp);
-        if (it != mem_done_map.end() && it->second)
-            it->second->notify(delay);
+        TxnExt *tx = nullptr;
+        gp.get_extension(tx);
+        if (tx && tx->done_ev && tx->done_fired)
+        {
+            *tx->done_fired = true;
+            tx->done_ev->notify(delay);
+        }
 
         phase = END_RESP;
         delay = SC_ZERO_TIME;
@@ -65,39 +68,49 @@ void AcceleratorTLM::mem_access(bool is_write, uint64_t bytes)
     if (bytes == 0)
         return;
 
-    auto *gp = new tlm_generic_payload();
-    gp->set_command(is_write ? TLM_WRITE_COMMAND : TLM_READ_COMMAND);
-    gp->set_address(Interconnect::ADDR_MEM);
-    gp->set_data_ptr(nullptr);
-    gp->set_data_length((unsigned)bytes);
-    gp->set_streaming_width((unsigned)bytes);
-    gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
+    tlm_generic_payload gp;
+    gp.set_command(is_write ? TLM_WRITE_COMMAND : TLM_READ_COMMAND);
+    gp.set_address(Interconnect::ADDR_MEM);
+    gp.set_data_ptr(nullptr);
+    gp.set_data_length(static_cast<unsigned>(bytes));
+    gp.set_streaming_width(static_cast<unsigned>(bytes));
+    gp.set_response_status(TLM_INCOMPLETE_RESPONSE);
 
-    auto *mem_ext = new MemoryAccessExt(MemoryAccessKind::L1);
-    gp->set_extension(mem_ext);
+    MemoryAccessExt mem_ext(MemoryAccessKind::L1);
+    gp.set_extension(&mem_ext);
 
     sc_event done_ev;
-    mem_done_map[gp] = &done_ev;
+    bool done_fired = false;
+    TxnExt tx;
+    tx.done_ev = &done_ev;
+    tx.done_fired = &done_fired;
+    gp.set_extension(&tx);
 
     tlm_phase phase = BEGIN_REQ;
     sc_time   delay = SC_ZERO_TIME;
-    auto status = to_mem->nb_transport_fw(*gp, phase, delay);
+    auto status = to_mem->nb_transport_fw(gp, phase, delay);
 
     if (status == TLM_COMPLETED)
     {
-        mem_done_map.erase(gp);
-        gp->clear_extension(mem_ext);
-        delete mem_ext;
-        delete gp;
+        gp.clear_extension(&mem_ext);
+        gp.clear_extension(&tx);
         return;
     }
 
-    wait(done_ev);
+    if (!done_fired)
+        wait(done_ev);
 
-    mem_done_map.erase(gp);
-    gp->clear_extension(mem_ext);
-    delete mem_ext;
-    delete gp;
+    gp.clear_extension(&mem_ext);
+    gp.clear_extension(&tx);
+}
+
+void AcceleratorTLM::enqueue_request(tlm_generic_payload &gp)
+{
+    Entry e;
+    e.gp = &gp;
+    e.enqueue_time = sc_time_stamp();
+    q.push_back(e);
+    q_nonempty.notify(SC_ZERO_TIME);
 }
 
 void AcceleratorTLM::peq_thread()
@@ -107,11 +120,7 @@ void AcceleratorTLM::peq_thread()
         wait(peq.get_event());
         while (auto *gp = peq.get_next_transaction())
         {
-            Entry e;
-            e.gp           = gp;
-            e.enqueue_time = sc_time_stamp();
-            q.push_back(e);
-            q_nonempty.notify(SC_ZERO_TIME);
+            enqueue_request(*gp);
         }
     }
 }
@@ -168,12 +177,9 @@ void AcceleratorTLM::service_thread()
         // Release the admitted slot or hand it to the next stalled request.
         if (!stall_fifo.empty())
         {
-            // Admit the oldest stalled GP: route it through the PEQ so that
-            // peq_thread picks it up and enqueues it into q normally.
             tlm_generic_payload *next_gp = stall_fifo.front();
             stall_fifo.pop_front();
-            sc_time zero = SC_ZERO_TIME;
-            peq.notify(*next_gp, zero);
+            peq.notify(*next_gp, SC_ZERO_TIME);
 
             // Send the deferred END_REQ back to the worker so that
             // issue_begin (which is blocked waiting for admit_ev) unblocks.
