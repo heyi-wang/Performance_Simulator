@@ -83,29 +83,39 @@ struct MatmulRuntimeConfig
     uint64_t gemm_tile_m() const { return ceil_div_u64(gemm_m(), MATMUL_M); }
     uint64_t gemm_tile_n() const { return ceil_div_u64(gemm_n(), MATMUL_N); }
     uint64_t gemm_partial_elements() const { return gemm_m() * gemm_n(); }
+    // VECTOR_ACC_CAP is the vector datapath width in bytes; elements per call
+    // are derived from the input element bitwidth of each phase.
+    uint64_t gemm_accum_elems_per_call() const
+    {
+        return std::max<uint64_t>(VECTOR_ACC_CAP / gemm_accum_in_elem_bytes, 1);
+    }
+    uint64_t gemm_quant_elems_per_call() const
+    {
+        return std::max<uint64_t>(VECTOR_ACC_CAP / gemm_quant_in_elem_bytes, 1);
+    }
     uint64_t gemm_accum_vec_calls() const
     {
-        return ceil_div_u64(gemm_partial_elements(), VECTOR_ACC_CAP);
+        return ceil_div_u64(gemm_partial_elements(), gemm_accum_elems_per_call());
     }
     uint64_t gemm_quant_vec_calls() const
     {
-        return ceil_div_u64(gemm_partial_elements(), VECTOR_ACC_CAP);
+        return ceil_div_u64(gemm_partial_elements(), gemm_quant_elems_per_call());
     }
     uint64_t gemm_accum_rd_bytes() const
     {
-        return 2 * VECTOR_ACC_CAP * gemm_accum_in_elem_bytes;
+        return 2 * gemm_accum_elems_per_call() * gemm_accum_in_elem_bytes;
     }
     uint64_t gemm_accum_wr_bytes() const
     {
-        return VECTOR_ACC_CAP * gemm_accum_out_elem_bytes;
+        return gemm_accum_elems_per_call() * gemm_accum_out_elem_bytes;
     }
     uint64_t gemm_quant_rd_bytes() const
     {
-        return VECTOR_ACC_CAP * gemm_quant_in_elem_bytes;
+        return gemm_quant_elems_per_call() * gemm_quant_in_elem_bytes;
     }
     uint64_t gemm_quant_wr_bytes() const
     {
-        return VECTOR_ACC_CAP * gemm_quant_out_elem_bytes;
+        return gemm_quant_elems_per_call() * gemm_quant_out_elem_bytes;
     }
     uint64_t gemm_k_per_thread() const
     {

@@ -50,6 +50,15 @@ struct Worker : sc_module
     uint64_t gemm_n_tiles = 0;
     uint64_t gemm_k_tiles = 0;
     uint64_t accumulator_register_count = 1;
+
+    // Per-row scalar cost for DMA descriptor setup. When rows == 0 the cost
+    // is disabled, preserving behavior for kernels that don't model this.
+    uint64_t dma_a_rows        = 0;
+    uint64_t dma_b_rows        = 0;
+    uint64_t dma_c_rows        = 0;
+    uint64_t dma_a_row_scalar  = 0;
+    uint64_t dma_b_row_scalar  = 0;
+    uint64_t dma_c_row_scalar  = 0;
     WorkerPostProcessor *post_processor = nullptr;
     sc_event *start_event = nullptr;
     sc_fifo<int> *completion_fifo = nullptr;
@@ -187,6 +196,12 @@ struct Worker : sc_module
                               uint64_t n_tiles,
                               uint64_t k_tiles,
                               uint64_t accumulator_registers);
+    void configure_dma_row_cost(uint64_t a_rows,
+                                uint64_t b_rows,
+                                uint64_t c_rows,
+                                uint64_t a_row_cost,
+                                uint64_t b_row_cost,
+                                uint64_t c_row_cost);
     void issue_stream(uint64_t addr,
                       uint64_t call_count,
                       uint64_t svc_cycles,

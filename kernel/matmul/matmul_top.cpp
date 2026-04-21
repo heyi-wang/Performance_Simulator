@@ -85,6 +85,12 @@ MatmulTop::MatmulTop(sc_module_name nm,
                                 cfg.gemm_tile_n(),
                                 cfg.local_tile_k_for_thread(i),
                                 cfg.accumulator_register_count);
+        w->configure_dma_row_cost(MATMUL_M,
+                                  MATMUL_K,
+                                  MATMUL_M,
+                                  HW_DMA_A_ROW_SCALAR,
+                                  HW_DMA_B_ROW_SCALAR,
+                                  HW_DMA_C_ROW_SCALAR);
         workers.push_back(w);
         if (post_processor)
             active_workers.push_back(w);
@@ -306,7 +312,7 @@ void MatmulTop::print_report(std::ostream &os) const
         {"Matrix Accelerator Tile", "[" + report::fmt_u64(MATMUL_M) + " x " +
                                      report::fmt_u64(MATMUL_K) + " x " +
                                      report::fmt_u64(MATMUL_N) + "]"},
-        {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(VECTOR_ACC_CAP)},
+        {"Vector Accelerator Datapath [bytes/request]", report::fmt_u64(VECTOR_ACC_CAP)},
         {"Matrix Accelerator Queue Depth [requests]", report::fmt_u64(cfg.mat_acc_queue_cap())},
         {"Vector Accelerator Queue Depth [requests]", report::fmt_u64(cfg.vec_acc_queue_cap())},
         {"L1 Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l1_bw)},

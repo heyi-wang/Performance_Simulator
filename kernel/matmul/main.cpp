@@ -7,11 +7,17 @@
 static bool parse_args(int argc,
                        char *argv[],
                        int &thread_count,
-                       uint64_t &accumulator_register_count)
+                       uint64_t &accumulator_register_count,
+                       uint64_t &gemm_m,
+                       uint64_t &gemm_k,
+                       uint64_t &gemm_n)
 {
     thread_count = MatmulConfig::default_thread_count;
     accumulator_register_count =
         MatmulConfig::default_accumulator_register_count;
+    gemm_m = MatmulConfig::gemm_m;
+    gemm_k = MatmulConfig::gemm_k;
+    gemm_n = MatmulConfig::gemm_n;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -35,10 +41,38 @@ static bool parse_args(int argc,
             accumulator_register_count =
                 std::max<uint64_t>(std::stoull(argv[++i]), 1);
         }
+        else if (arg == "--gemm-m")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for --gemm-m\n";
+                return false;
+            }
+            gemm_m = std::max<uint64_t>(std::stoull(argv[++i]), 1);
+        }
+        else if (arg == "--gemm-k")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for --gemm-k\n";
+                return false;
+            }
+            gemm_k = std::max<uint64_t>(std::stoull(argv[++i]), 1);
+        }
+        else if (arg == "--gemm-n")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for --gemm-n\n";
+                return false;
+            }
+            gemm_n = std::max<uint64_t>(std::stoull(argv[++i]), 1);
+        }
         else if (arg == "--help" || arg == "-h")
         {
             std::cout << "Usage: " << argv[0]
-                      << " [--threads N] [--accum-registers N]\n";
+                      << " [--threads N] [--accum-registers N]"
+                      << " [--gemm-m M] [--gemm-k K] [--gemm-n N]\n";
             return false;
         }
         else
@@ -56,7 +90,16 @@ int sc_main(int argc, char *argv[])
     int thread_count = MatmulConfig::default_thread_count;
     uint64_t accumulator_register_count =
         MatmulConfig::default_accumulator_register_count;
-    if (!parse_args(argc, argv, thread_count, accumulator_register_count))
+    uint64_t gemm_m = MatmulConfig::gemm_m;
+    uint64_t gemm_k = MatmulConfig::gemm_k;
+    uint64_t gemm_n = MatmulConfig::gemm_n;
+    if (!parse_args(argc,
+                    argv,
+                    thread_count,
+                    accumulator_register_count,
+                    gemm_m,
+                    gemm_k,
+                    gemm_n))
         return (argc > 1) ? 1 : 0;
 
     MatmulRuntimeConfig cfg =
@@ -64,6 +107,13 @@ int sc_main(int argc, char *argv[])
                                       MAT_ACCEL_COUNT,
                                       VEC_ACCEL_COUNT,
                                       accumulator_register_count);
+    cfg.workload_n = 1;
+    cfg.workload_h = gemm_m;
+    cfg.workload_w = 1;
+    cfg.workload_c_in = gemm_k;
+    cfg.workload_kh = 1;
+    cfg.workload_kw = 1;
+    cfg.workload_c_out = gemm_n;
     MatmulTop top("top", cfg);
 
     sc_start();
