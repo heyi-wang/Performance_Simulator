@@ -43,7 +43,8 @@ struct Worker : sc_module
     uint64_t access_vec;
     uint64_t mat_cycles;
     uint64_t vec_cycles;
-    uint64_t scalar_cycles;
+    uint64_t mat_scalar_cycles;
+    uint64_t vec_scalar_cycles;
     uint64_t max_inflight_mat_reqs = 1;
     uint64_t max_inflight_vec_reqs = 1;
     uint64_t gemm_m_tiles = 0;
@@ -67,6 +68,7 @@ struct Worker : sc_module
     uint64_t wait_cycles      = 0;   // accelerator queue wait only
     uint64_t stall_cycles     = 0;   // worker-side backpressure stall only
     uint64_t mem_cycles_accum = 0;
+    uint64_t vec_service_cycles = 0;
     uint64_t mat_calls        = 0;
     uint64_t vec_calls        = 0;
     uint64_t accum_vec_calls  = 0;
@@ -159,7 +161,8 @@ struct Worker : sc_module
            uint64_t access_vec_,
            uint64_t mat_cycles_,
            uint64_t vec_cycles_,
-           uint64_t scalar_cycles_,
+           uint64_t mat_scalar_cycles_,
+           uint64_t vec_scalar_cycles_,
            uint64_t A_bytes_,
            uint64_t B_bytes_,
            uint64_t C_bytes_,
@@ -205,6 +208,7 @@ struct Worker : sc_module
     void issue_stream(uint64_t addr,
                       uint64_t call_count,
                       uint64_t svc_cycles,
+                      uint64_t scalar_cycles,
                       uint64_t rd,
                       uint64_t wr,
                       uint64_t dma_rd,

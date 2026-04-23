@@ -15,6 +15,12 @@ static inline uint64_t ceil_div_u64(uint64_t a, uint64_t b)
     return (a + b - 1) / b;
 }
 
+static inline uint64_t vec_request_cycles(uint64_t base_cycle,
+                                          uint64_t instruction_count)
+{
+    return base_cycle * instruction_count;
+}
+
 struct KernelWorkerInfo
 {
     int      tid = -1;

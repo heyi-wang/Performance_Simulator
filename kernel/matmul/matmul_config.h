@@ -59,6 +59,13 @@ struct MatmulConfig
     static constexpr uint64_t gemm_accum_in_elem_bytes = gemm_quant_in_elem_bytes;
     static constexpr uint64_t gemm_accum_out_elem_bytes = gemm_quant_in_elem_bytes;
 
+#ifndef MATMUL_ACCUM_VEC_INSNS
+#define MATMUL_ACCUM_VEC_INSNS 1
+#endif
+#ifndef MATMUL_QUANT_VEC_INSNS
+#define MATMUL_QUANT_VEC_INSNS 7
+#endif
+
     static constexpr uint64_t gemm_accum_rd_bytes =
         2 * VECTOR_ACC_CAP * gemm_accum_in_elem_bytes;
     static constexpr uint64_t gemm_accum_wr_bytes =

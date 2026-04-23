@@ -56,6 +56,7 @@ static const int DW_NUM_WORKERS = 16;
 // Vector accelerator: processes DW_VEC_ACC_CAP elements per
 // call in DW_VEC_ACC_CYCLE cycles.
 // DW_VEC_ACC_INSTANCES controls the pool size.
+// This kernel still uses a flat per-request vector latency model.
 // ------------------------------------------------------------
 static const uint64_t DW_VEC_ACC_CAP       = VECTOR_ACC_CAP;    // elements per call
 static const uint64_t DW_VEC_ACC_CYCLE     = VECTOR_ACC_CYCLE;  // cycles per call
@@ -65,7 +66,7 @@ static const int      DW_VEC_ACC_INSTANCES = VEC_ACCEL_COUNT;   // physical unit
 // Scalar CPU overhead per accelerator tile dispatch call.
 // (address computation, loop bookkeeping, tile setup)
 // ------------------------------------------------------------
-static const uint64_t DW_SCALAR_OVERHEAD = SCALAR_OVERHEAD;   // cycles per dispatch
+static const uint64_t DW_SCALAR_OVERHEAD = HW_VEC_SCALAR_OVERHEAD;   // cycles per dispatch
 
 // ------------------------------------------------------------
 // Shared memory subsystem.

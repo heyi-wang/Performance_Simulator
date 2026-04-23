@@ -29,8 +29,9 @@ struct MatmulRuntimeConfig
     uint64_t workload_c_out = MatmulConfig::workload_c_out;
 
     uint64_t mat_cycle = MATMUL_ACC_CYCLE;
-    uint64_t vec_cycle = VECTOR_ACC_CYCLE;
-    uint64_t scalar_overhead = SCALAR_OVERHEAD;
+    uint64_t vec_cycle = HW_VECTOR_INSN_CYCLE;
+    uint64_t mat_scalar_overhead = HW_MAT_SCALAR_OVERHEAD;
+    uint64_t vec_scalar_overhead = HW_VEC_SCALAR_OVERHEAD;
     uint64_t memory_base_lat = HW_MEMORY_BASE_LAT;
     uint64_t memory_bw = HW_MATMUL_MEMORY_BYTES_PER_CYCLE;
     uint64_t memory_parallel_slots = MEMORY_PARALLEL_SLOTS_CFG;
@@ -100,6 +101,14 @@ struct MatmulRuntimeConfig
     uint64_t gemm_quant_vec_calls() const
     {
         return ceil_div_u64(gemm_partial_elements(), gemm_quant_elems_per_call());
+    }
+    uint64_t gemm_accum_vec_cycles() const
+    {
+        return vec_request_cycles(vec_cycle, MATMUL_ACCUM_VEC_INSNS);
+    }
+    uint64_t gemm_quant_vec_cycles() const
+    {
+        return vec_request_cycles(vec_cycle, MATMUL_QUANT_VEC_INSNS);
     }
     uint64_t gemm_accum_rd_bytes() const
     {

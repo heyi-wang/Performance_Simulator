@@ -41,6 +41,8 @@ MatmulTop::MatmulTop(sc_module_name nm,
     coordinator = new AccumCoordinator("accum_coord",
                                        cfg.gemm_accum_vec_calls(),
                                        cfg.gemm_quant_vec_calls(),
+                                       cfg.gemm_accum_vec_cycles(),
+                                       cfg.gemm_quant_vec_cycles(),
                                        cfg.gemm_accum_rd_bytes(),
                                        cfg.gemm_accum_wr_bytes(),
                                        cfg.gemm_quant_rd_bytes(),
@@ -70,7 +72,8 @@ MatmulTop::MatmulTop(sc_module_name nm,
                              0,
                              cfg.mat_cycle,
                              cfg.vec_cycle,
-                             cfg.scalar_overhead,
+                             cfg.mat_scalar_overhead,
+                             cfg.vec_scalar_overhead,
                              cfg.gemm_a_bytes(),               // mat rd (A tile)
                              cfg.gemm_b_bytes(),               // mat rd (B tile)
                              cfg.gemm_c_bytes(),               // mat wr (C tile)
@@ -259,7 +262,7 @@ std::vector<KernelWorkerInfo> MatmulTop::collect_worker_info() const
 
         const uint64_t service_cycles =
             w->mat_calls * w->mat_cycles +
-            w->vec_calls * w->vec_cycles;
+            w->vec_service_cycles;
         wi.scalar_cycles = (w->compute_cycles >= service_cycles)
             ? (w->compute_cycles - service_cycles)
             : 0;
@@ -313,6 +316,9 @@ void MatmulTop::print_report(std::ostream &os) const
                                      report::fmt_u64(MATMUL_K) + " x " +
                                      report::fmt_u64(MATMUL_N) + "]"},
         {"Vector Accelerator Datapath [bytes/request]", report::fmt_u64(VECTOR_ACC_CAP)},
+        {"Vector Instruction Cycle [cycles/insn]", report::fmt_u64(cfg.vec_cycle)},
+        {"Accum Vector Instructions [insns/request]", report::fmt_u64(MATMUL_ACCUM_VEC_INSNS)},
+        {"Quant Vector Instructions [insns/request]", report::fmt_u64(MATMUL_QUANT_VEC_INSNS)},
         {"Matrix Accelerator Queue Depth [requests]", report::fmt_u64(cfg.mat_acc_queue_cap())},
         {"Vector Accelerator Queue Depth [requests]", report::fmt_u64(cfg.vec_acc_queue_cap())},
         {"L1 Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l1_bw)},

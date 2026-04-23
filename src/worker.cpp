@@ -12,7 +12,8 @@ Worker::Worker(sc_module_name name,
                uint64_t access_vec_,
                uint64_t mat_cycles_,
                uint64_t vec_cycles_,
-               uint64_t scalar_cycles_,
+               uint64_t mat_scalar_cycles_,
+               uint64_t vec_scalar_cycles_,
                uint64_t A_bytes_,
                uint64_t B_bytes_,
                uint64_t C_bytes_,
@@ -32,7 +33,8 @@ Worker::Worker(sc_module_name name,
       access_vec(access_vec_),
       mat_cycles(mat_cycles_),
       vec_cycles(vec_cycles_),
-      scalar_cycles(scalar_cycles_),
+      mat_scalar_cycles(mat_scalar_cycles_),
+      vec_scalar_cycles(vec_scalar_cycles_),
       max_inflight_mat_reqs(std::max<uint64_t>(max_inflight_mat_reqs_, 1)),
       max_inflight_vec_reqs(std::max<uint64_t>(max_inflight_vec_reqs_, 1)),
       post_processor(post_processor_),
@@ -253,6 +255,8 @@ void Worker::issue_end(PendingReq &p)
     stall_cycles     += p.stall_cycles;
     compute_cycles   += p.svc_cycles;
     mem_cycles_accum += ext ? ext->mem_cycles : 0;
+    if (p.gp->get_address() == Interconnect::ADDR_VEC)
+        vec_service_cycles += p.svc_cycles;
 
     tlm_phase end_phase = END_RESP;
     sc_time   end_delay = SC_ZERO_TIME;
@@ -370,6 +374,7 @@ void Worker::configure_dma_row_cost(uint64_t a_rows,
 void Worker::issue_stream(uint64_t addr,
                           uint64_t call_count,
                           uint64_t svc_cycles,
+                          uint64_t scalar_cycles,
                           uint64_t rd,
                           uint64_t wr,
                           uint64_t dma_rd,
@@ -548,6 +553,7 @@ void Worker::issue_gemm_reuse_stream()
                 issue_stream(Interconnect::ADDR_MAT,
                              m_batch,
                              mat_cycles,
+                             mat_scalar_cycles,
                              A_bytes + B_bytes,
                              final_k ? C_bytes : 0,
                              A_bytes,
@@ -580,6 +586,7 @@ void Worker::run()
             issue_stream(Interconnect::ADDR_MAT,
                          access_mat,
                          mat_cycles,
+                         mat_scalar_cycles,
                          A_bytes + B_bytes,
                          C_bytes,
                          A_bytes + B_bytes,
@@ -613,6 +620,7 @@ void Worker::run()
             issue_stream(Interconnect::ADDR_VEC,
                          access_vec,
                          vec_cycles,
+                         vec_scalar_cycles,
                          vrd,
                          vwr,
                          vrd,

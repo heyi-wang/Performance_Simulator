@@ -21,6 +21,8 @@ struct AccumCoordinator : sc_module, WorkerPostProcessor
 
     uint64_t accum_vec_calls;   // vec_acc calls per pairwise accumulation
     uint64_t final_quant_calls; // total vec_acc calls for final quantization
+    uint64_t accum_vec_cycles;
+    uint64_t quant_vec_cycles;
     uint64_t accum_rd_bytes;
     uint64_t accum_wr_bytes;
     uint64_t quant_rd_bytes;
@@ -74,6 +76,8 @@ struct AccumCoordinator : sc_module, WorkerPostProcessor
     explicit AccumCoordinator(sc_module_name name,
                               uint64_t accum_vec_calls_,
                               uint64_t final_quant_calls_,
+                              uint64_t accum_vec_cycles_,
+                              uint64_t quant_vec_cycles_,
                               uint64_t accum_rd_bytes_,
                               uint64_t accum_wr_bytes_,
                               uint64_t quant_rd_bytes_,

@@ -62,6 +62,9 @@ static const int VOP_NUM_WORKERS = 16;
 
 // ------------------------------------------------------------
 // Vector accelerator parameters.
+// This kernel still uses a flat per-request vector latency model.
+// Future task-specific models can derive request cycles with
+// vec_request_cycles(base_cycle, instruction_count).
 // ------------------------------------------------------------
 static const uint64_t VOP_VEC_ACC_CAP       = VECTOR_ACC_CAP;
 static const uint64_t VOP_VEC_ACC_CYCLE     = VECTOR_ACC_CYCLE;
@@ -70,7 +73,7 @@ static const int      VOP_VEC_ACC_INSTANCES = VEC_ACCEL_COUNT;
 // ------------------------------------------------------------
 // Scalar CPU overhead per accelerator tile dispatch call.
 // ------------------------------------------------------------
-static const uint64_t VOP_SCALAR_OVERHEAD = SCALAR_OVERHEAD;
+static const uint64_t VOP_SCALAR_OVERHEAD = HW_VEC_SCALAR_OVERHEAD;
 
 // ------------------------------------------------------------
 // Shared memory subsystem.
