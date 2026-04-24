@@ -55,13 +55,23 @@ static const uint64_t HW_DW_MEMORY_BYTES_PER_CYCLE =
 static const size_t HW_ACC_QUEUE_DEPTH = ACC_QUEUE_DEPTH;
 
 // Matrix accelerator tile geometry and timing.
-static const uint64_t MATMUL_M = 8;
-static const uint64_t MATMUL_K = 8;
-static const uint64_t MATMUL_N = 8;
-static const uint64_t MATMUL_ACC_CYCLE = 1;
+#ifndef MATMUL_M
+#define MATMUL_M 8
+#endif
+#ifndef MATMUL_K
+#define MATMUL_K 8
+#endif
+#ifndef MATMUL_N
+#define MATMUL_N 8
+#endif
+#ifndef MATMUL_ACC_CYCLE
+#define MATMUL_ACC_CYCLE 1
+#endif
 
 // Vector accelerator throughput (in bytes per cycle) and timing.
-static const uint64_t VECTOR_ACC_CAP = 64;
+#ifndef VECTOR_ACC_CAP
+#define VECTOR_ACC_CAP 64
+#endif
 #ifndef VECTOR_INSN_CYCLE
 #define VECTOR_INSN_CYCLE 1
 #endif
