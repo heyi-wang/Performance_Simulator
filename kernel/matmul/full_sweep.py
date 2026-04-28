@@ -11,8 +11,10 @@ Dimensions (see kernel/matmul/Parametric_Sweep.md):
     - threads         : --threads                            (runtime CLI)
 
 The 5 compile-time parameters define a "hardware point". Each unique hardware
-point is built once into its own per-point binary under kernel/build/sweep/.
-Each binary is then re-invoked across the (shape x threads) grid.
+point is built once into its own per-point BUILDDIR under
+kernel/matmul/.sweep_bin/<tag>/, then the resulting binary is re-invoked
+across the (shape x threads) grid. With --jobs N, N hardware points are
+built and run concurrently, each in its own private BUILDDIR.
 
 Results are stored one row per sweep point in a long/tidy CSV so any
 parameter combination can be filtered/plotted later via plot_sweep.py.
@@ -242,7 +244,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--jobs",
         type=int,
         default=1,
-        help="Parallel worker count (1 = serial). Each job uses its own build dir.",
+        help=(
+            "Parallel worker count (1 = serial). Each worker builds and runs "
+            "one hardware point at a time in its own private BUILDDIR; "
+            "recommend --jobs $(nproc) on a server."
+        ),
     )
     p.add_argument(
         "--dry-run",
@@ -307,49 +313,32 @@ def _run(cmd: list[str], cwd: Path | None = None, env: dict | None = None) -> su
 def build_hw_point(hw: HwPoint, build_root: Path) -> tuple[Path, str]:
     """Compile the matmul sim for this hardware point. Returns (binary_path, log).
 
-    Uses a per-point out-of-tree build by running make in a temp dir layout
-    that mirrors kernel/. We invoke the existing kernel Makefile with
-    EXTRA_CXXFLAGS and an overridden build dir so per-point builds don't
-    collide when --jobs > 1.
+    Each hardware point gets its own private BUILDDIR via the make CLI override,
+    so multiple workers can compile concurrently without contending on the
+    shared kernel/build/ tree.
     """
-    point_dir = build_root / hw.tag
+    point_dir = (build_root / hw.tag).resolve()
+    point_dir.mkdir(parents=True, exist_ok=True)
     binary = point_dir / "matmul_sim"
 
-    # We let make handle its own build dir inside KERNEL_DIR but redirect BUILD_DIR.
-    # The kernel Makefile uses a hardcoded "build" dir; easiest portable approach
-    # is to copy the produced binary to point_dir after a serialized make.
-    # For --jobs > 1 we need isolation: do the make in a per-point symlink tree.
-    #
-    # Simpler and robust: run `make -j1` in the shared kernel dir under a lock,
-    # then mv build/matmul_sim into point_dir. For parallelism, use --jobs 1
-    # build-side but parallelize at the run step (runs dominate wall time).
-    #
-    # See runner logic below: parallel execution serializes builds.
     extra = hw.extra_cxxflags()
-    log_lines: list[str] = []
-
-    clean = _run(["make", "-s", "clean"], cwd=KERNEL_DIR)
-    log_lines.append(f"$ make clean\n{clean.stdout}{clean.stderr}")
-
     build = _run(
-        ["make", "matmul", f"EXTRA_CXXFLAGS={extra}"],
+        ["make", "matmul",
+         f"BUILDDIR={point_dir}",
+         f"EXTRA_CXXFLAGS={extra}"],
         cwd=KERNEL_DIR,
     )
-    log_lines.append(
-        f"$ make matmul EXTRA_CXXFLAGS='{extra}'\n{build.stdout}{build.stderr}"
+    log = (
+        f"$ make matmul BUILDDIR='{point_dir}' EXTRA_CXXFLAGS='{extra}'\n"
+        f"{build.stdout}{build.stderr}"
     )
-    if build.returncode != 0:
-        return binary, "\n".join(log_lines)
+    if build.returncode != 0 or not binary.exists():
+        if build.returncode == 0:
+            log += f"\nERROR: expected {binary} after build"
+        return binary, log
 
-    produced = KERNEL_DIR / "build" / "matmul_sim"
-    if not produced.exists():
-        log_lines.append(f"ERROR: expected {produced} after build")
-        return binary, "\n".join(log_lines)
-
-    point_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(produced, binary)
     os.chmod(binary, 0o755)
-    return binary, "\n".join(log_lines)
+    return binary, log
 
 
 def _parse_run_output(stdout: str) -> dict[str, object]:
@@ -428,67 +417,117 @@ def open_csv_writer(csv_path: Path, append: bool) -> tuple[csv.DictWriter, "obje
     return writer, f
 
 
-def execute_serial(
-    hw_points: list[HwPoint],
+def process_hw_point(
+    hw: HwPoint,
+    sweep_points: list[SweepPoint],
+    build_root: Path,
+    keep_build_dir: bool,
+) -> dict:
+    """Build one hardware point, run all its sweep points, return rows + log.
+
+    Designed to run inside a ProcessPoolExecutor worker; returns plain data
+    only (no open file handles) so results are picklable back to the parent.
+    """
+    rows: list[dict] = []
+    log_chunks: list[str] = []
+    failures = 0
+
+    binary, build_log = build_hw_point(hw, build_root)
+    log_chunks.append(build_log)
+    build_ok = 1 if binary.exists() else 0
+
+    if not build_ok:
+        for sp in sweep_points:
+            rows.append(row_for(sp, {}, 0.0, 0))
+            failures += 1
+    else:
+        for sp in sweep_points:
+            fields, wall = run_point(binary, sp)
+            rows.append(row_for(sp, fields, wall, 1))
+            if fields.get("verification_status") != "PASS":
+                failures += 1
+        if not keep_build_dir:
+            shutil.rmtree(build_root / hw.tag, ignore_errors=True)
+
+    return {
+        "tag": hw.tag,
+        "rows": rows,
+        "log": "\n".join(log_chunks),
+        "failures": failures,
+        "build_ok": build_ok,
+    }
+
+
+def execute_parallel(
     sweep_points: list[SweepPoint],
     existing: set[tuple],
     csv_path: Path,
     append: bool,
     build_root: Path,
     keep_build_dirs: bool,
+    jobs: int,
 ) -> int:
+    remaining_by_hw: dict[HwPoint, list[SweepPoint]] = {}
+    for sp in sweep_points:
+        if sp.key() in existing:
+            continue
+        remaining_by_hw.setdefault(sp.hw, []).append(sp)
+
+    if not remaining_by_hw:
+        print("[sweep] nothing to do -- all points already in CSV")
+        return 0
+
+    total = len(remaining_by_hw)
+    total_runs = sum(len(v) for v in remaining_by_hw.values())
+    print(
+        f"[sweep] {total} hardware points, {total_runs} sweep runs, "
+        f"jobs={jobs}",
+        flush=True,
+    )
+
     writer, fh = open_csv_writer(csv_path, append)
+    failures = 0
+    completed = 0
+    interrupted = False
+
     try:
-        remaining_by_hw: dict[HwPoint, list[SweepPoint]] = {}
-        for sp in sweep_points:
-            if sp.key() in existing:
-                continue
-            remaining_by_hw.setdefault(sp.hw, []).append(sp)
-
-        if not remaining_by_hw:
-            print("[sweep] nothing to do -- all points already in CSV")
-            return 0
-
-        failures = 0
-        for i, hw in enumerate(hw_points):
-            sps = remaining_by_hw.get(hw)
-            if not sps:
-                continue
-            print(
-                f"[sweep] hw {i+1}/{len(hw_points)} {hw.tag} "
-                f"({len(sps)} runs)",
-                flush=True,
-            )
-            binary, build_log = build_hw_point(hw, build_root)
-            build_ok = 1 if binary.exists() else 0
-            if not build_ok:
-                sys.stderr.write(build_log + "\n")
-                for sp in sps:
-                    row = row_for(sp, {}, 0.0, 0)
-                    writer.writerow(row)
+        with ProcessPoolExecutor(max_workers=jobs) as ex:
+            futures = {
+                ex.submit(
+                    process_hw_point, hw, sps, build_root, keep_build_dirs
+                ): hw
+                for hw, sps in remaining_by_hw.items()
+            }
+            try:
+                for fut in as_completed(futures):
+                    result = fut.result()
+                    for row in result["rows"]:
+                        writer.writerow(row)
                     fh.flush()
-                    failures += 1
-                continue
-            for sp in sps:
-                fields, wall = run_point(binary, sp)
-                row = row_for(sp, fields, wall, 1)
-                writer.writerow(row)
-                fh.flush()
-                status = fields.get("verification_status", "?")
-                cycles = fields.get("total_cycles", "?")
+                    failures += result["failures"]
+                    completed += 1
+                    if not result["build_ok"]:
+                        sys.stderr.write(result["log"] + "\n")
+                    print(
+                        f"[sweep] {completed}/{total} hw={result['tag']} "
+                        f"runs={len(result['rows'])} fail={result['failures']}",
+                        flush=True,
+                    )
+            except KeyboardInterrupt:
+                interrupted = True
                 print(
-                    f"  [run] {hw.tag} gemm={sp.gemm_m}x{sp.gemm_k}x{sp.gemm_n} "
-                    f"threads={sp.threads} cycles={cycles} verify={status} "
-                    f"wall={wall:.2f}s",
+                    "[sweep] interrupted -- shutting down workers; "
+                    "in-flight sims will finish before exit.",
+                    file=sys.stderr,
                     flush=True,
                 )
-                if status != "PASS":
-                    failures += 1
-            if not keep_build_dirs:
-                shutil.rmtree(build_root / hw.tag, ignore_errors=True)
-        return 0 if failures == 0 else 2
+                ex.shutdown(cancel_futures=True)
     finally:
         fh.close()
+
+    if interrupted:
+        return 130
+    return 0 if failures == 0 else 2
 
 
 def dry_run(
@@ -535,28 +574,18 @@ def main() -> int:
         dry_run(hw_points, sweep_points, existing)
         return 0
 
-    if args.jobs > 1:
-        # Parallel builds would need per-process working trees; keep it simple:
-        # run the build stage serially, but the biggest wall-time cost per
-        # hardware point is usually the run stage, which we could parallelize
-        # per binary. For now we leave --jobs as a placeholder that forces
-        # serial execution with a warning, since correctness > parallelism for
-        # this initial interface.
-        print(
-            "[sweep] warning: --jobs > 1 not yet implemented safely; "
-            "falling back to serial.",
-            file=sys.stderr,
-        )
+    if args.jobs < 1:
+        sys.exit("--jobs must be >= 1")
 
     append = bool(existing)
-    return execute_serial(
-        hw_points,
+    return execute_parallel(
         sweep_points,
         existing,
         csv_path,
         append=append,
         build_root=build_root,
         keep_build_dirs=args.keep_build_dirs,
+        jobs=args.jobs,
     )
 
 

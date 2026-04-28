@@ -271,9 +271,21 @@ invocation of `full_sweep.py` prints `nothing to do`.
 
 ## Notes
 
-- `--jobs N` (N > 1) is accepted but currently falls back to serial — parallel
-  execution needs per-worker source trees and will be wired up later.
-- Disk usage: each per-point build directory is ~5 MB. With cleanup on by
-  default, you never see more than one at a time.
+- `--jobs N` runs the sweep in parallel using `N` worker processes. Each
+  worker builds and runs **one hardware point at a time** in its own private
+  `BUILDDIR` under `kernel/matmul/.sweep_bin/<tag>/`, so workers never
+  contend on shared build state. Recommended for a server:
+
+  ```bash
+  python kernel/matmul/full_sweep.py --jobs $(nproc)
+  ```
+
+  CSV rows arrive in completion order (not input order) — `plot_sweep.py`
+  already filters/groups by columns, so order is not load-bearing.
+- Disk usage: peak ≈ `--jobs` × ~5 MB (~150 MB at `--jobs 30`). Per-point
+  build dirs are deleted as soon as that hardware point's runs finish.
+- `Ctrl+C` shuts the pool down cleanly: in-flight sims finish, pending
+  hardware points are cancelled, and the CSV is left consistent — re-run
+  the same command to resume.
 - The CSV is append-friendly — safe to run from multiple shells against
   disjoint `--output` paths simultaneously.
