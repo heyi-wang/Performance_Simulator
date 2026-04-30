@@ -159,6 +159,8 @@ python kernel/matmul/plot_sweep.py \
     --group-by <col1,col2,...> \
     --filter <key=val[|val],...> \
     [--log-x] [--log-y] \
+    [--3d --z <metric> --3d-style {scatter,surface,bar} [--log-z]] \
+    [--style {hierarchical,flat}] \
     --output <path.png>
 ```
 
@@ -168,23 +170,111 @@ python kernel/matmul/plot_sweep.py \
 - `key=v1|v2|v3` — keep rows where `key` is in `{v1, v2, v3}`.
 - Multiple keys are comma-separated: `--filter tile_m=16,gemm_m=1024,mat_count=1|2|4`.
 
-### Group-by
+### Group-by — hierarchical visual encoding (default)
 
-One series per unique tuple of the named columns. Empty = one combined series.
+In the default `--style hierarchical` mode, the columns in `--group-by` are
+mapped to visual channels in order:
+
+| Position | Visual channel | Effect |
+| --- | --- | --- |
+| 1st column | **Hue** | distinct base color per value |
+| 2nd column | **Brightness** | light → dark within that hue |
+| 3rd column | **Line style** | solid, dashed, dash-dot, dotted |
+| 4th+ column | **Marker shape** | o, s, ^, D, … |
+
+So `--group-by gemm_m,mat_count` puts every `gemm_m=1024` curve in shades of
+one color (e.g. blue), with brightness varying by `mat_count`. Pass
+`--style flat` to fall back to "one arbitrary color per series".
+
+### Auto-annotated fixed dimensions
+
+After filtering, any sweep parameter that is not on an axis or in
+`--group-by` but has a single unique value across the matched rows is
+listed below the plot, e.g.
+
+```
+Fixed: tile=16x32x64  ·  gemm=128x128x128  ·  vec_count=1  ·  vec_bytes=64
+```
+
+Pass `--no-fixed-annotation` to suppress.
+
+### 3D mode
+
+Pass `--3d` and supply a third axis via `--z`. In 3D mode, `--x` and `--y`
+are the two horizontal axes and `--z` is the metric (default
+`total_cycles`). Three rendering styles:
+
+- `--3d-style scatter` — markers in 3D, colored by `--group-by` (default).
+- `--3d-style surface` — `plot_trisurf` viridis surface with colorbar.
+- `--3d-style bar` — `bar3d` for coarse / categorical x and y.
+
+`--log-z` log-scales the vertical axis; `--log-x` / `--log-y` apply to the
+horizontal axes (note that 3D log scales in matplotlib can be fragile —
+prefer linear x / y when the values span a small range).
 
 ### Example plots
 
-**Threads vs cycles for different matrix-unit counts, at a fixed workload**
+**Hierarchical 2D — threads vs cycles, hue=`mat_latency`, brightness=`mat_count`**
 
 ```bash
 python kernel/matmul/plot_sweep.py \
-    --input kernel/matmul/full_sweep.csv \
+    --input kernel/matmul/demo_sweep.csv \
+    --x threads --y total_cycles \
+    --group-by mat_latency,mat_count \
+    --filter tile_m=8,tile_k=8,tile_n=8 \
+    --log-x --log-y \
+    --output kernel/matmul/demo_plots/demo_2d_hierarchical.png
+```
+
+Each `mat_latency` value gets one hue family; brightness varies with
+`mat_count` within each family. Sample output:
+[demo_plots/demo_2d_hierarchical.png](demo_plots/demo_2d_hierarchical.png).
+
+**Flat 2D — single grouping column**
+
+```bash
+python kernel/matmul/plot_sweep.py \
+    --input kernel/matmul/demo_sweep.csv \
     --x threads --y total_cycles \
     --group-by mat_count \
-    --filter tile_m=16,tile_k=32,tile_n=64,mat_latency=4,vec_count=4,vec_bytes=64,gemm_m=1024,gemm_k=1024,gemm_n=1024 \
+    --filter tile_m=8,mat_latency=4 \
     --log-x --log-y \
-    --output plots/threads_vs_cycles_by_mat_count.png
+    --output kernel/matmul/demo_plots/demo_2d_flat.png
 ```
+
+One distinct color per `mat_count`. Sample:
+[demo_plots/demo_2d_flat.png](demo_plots/demo_2d_flat.png).
+
+**3D scatter — `threads × mat_count × total_cycles`, color by `mat_latency`**
+
+```bash
+python kernel/matmul/plot_sweep.py \
+    --input kernel/matmul/demo_sweep.csv \
+    --x threads --y mat_count --z total_cycles \
+    --3d --3d-style scatter \
+    --group-by mat_latency \
+    --filter tile_m=16,tile_k=32,tile_n=64 \
+    --log-z \
+    --output kernel/matmul/demo_plots/demo_3d_scatter.png
+```
+
+Sample: [demo_plots/demo_3d_scatter.png](demo_plots/demo_3d_scatter.png).
+
+**3D surface — `plot_trisurf` viridis with colorbar**
+
+```bash
+python kernel/matmul/plot_sweep.py \
+    --input kernel/matmul/demo_sweep.csv \
+    --x threads --y mat_count --z total_cycles \
+    --3d --3d-style surface \
+    --filter tile_m=16,tile_k=32,tile_n=64,mat_latency=4 \
+    --log-z \
+    --output kernel/matmul/demo_plots/demo_3d_surface.png
+```
+
+Sample: [demo_plots/demo_3d_surface.png](demo_plots/demo_3d_surface.png).
+
+### More 2D examples
 
 **Tile size comparison at fixed 1024³ GEMM and 16 threads**
 
@@ -197,37 +287,13 @@ python kernel/matmul/plot_sweep.py \
     --output plots/tile_sweep.png
 ```
 
-**Matrix latency sensitivity — cycles vs latency, one line per mat_count**
-
-```bash
-python kernel/matmul/plot_sweep.py \
-    --input kernel/matmul/full_sweep.csv \
-    --x mat_latency --y total_cycles \
-    --group-by mat_count \
-    --filter tile_m=8,tile_k=8,tile_n=8,vec_count=4,vec_bytes=64,gemm_m=1024,gemm_k=1024,gemm_n=1024,threads=16 \
-    --log-x --log-y \
-    --output plots/latency_vs_cycles.png
-```
-
-**Vector datapath width sweep**
-
-```bash
-python kernel/matmul/plot_sweep.py \
-    --input kernel/matmul/full_sweep.csv \
-    --x vec_bytes --y total_cycles \
-    --group-by vec_count \
-    --filter tile_m=16,tile_k=32,tile_n=64,mat_latency=4,mat_count=4,gemm_m=1024,gemm_k=1024,gemm_n=1024,threads=16 \
-    --log-x \
-    --output plots/vec_bytes_vs_cycles.png
-```
-
-**Compare 7 GEMM shapes at fixed hardware, thread sweep**
+**Compare GEMM shapes at fixed hardware, thread sweep (hue=`gemm_m`, brightness=`gemm_n`)**
 
 ```bash
 python kernel/matmul/plot_sweep.py \
     --input kernel/matmul/full_sweep.csv \
     --x threads --y total_cycles \
-    --group-by gemm_m,gemm_k,gemm_n \
+    --group-by gemm_m,gemm_n \
     --filter tile_m=16,tile_k=32,tile_n=64,mat_latency=4,mat_count=4,vec_count=4,vec_bytes=64 \
     --log-x --log-y \
     --output plots/gemm_shapes_vs_threads.png
