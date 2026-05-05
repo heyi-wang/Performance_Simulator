@@ -19,6 +19,15 @@ struct WorkerPostProcessor
     virtual void run_post_mat(Worker &worker) = 0;
 };
 
+// Selects how `issue_stream` accounts for per-DMA scalar setup overhead.
+//   MatRow      — matmul phase: charge `dma_a_rows * dma_a_row_scalar` per
+//                 read DMA and `dma_c_rows * dma_c_row_scalar` per write
+//                 (one `dma.x` per matrix-tile row).
+//   VecPerCall  — reduction/quantization phase: each DMA carries one vector
+//                 worth of payload, so charge a single per-call cost from
+//                 `dma_vec_rd_scalar` / `dma_vec_wr_scalar`.
+enum class DmaScalarMode { MatRow, VecPerCall };
+
 // ============================================================
 // Worker — models one parallel compute thread
 //
@@ -60,6 +69,9 @@ struct Worker : sc_module
     uint64_t dma_a_row_scalar  = 0;
     uint64_t dma_b_row_scalar  = 0;
     uint64_t dma_c_row_scalar  = 0;
+    // Per-DMA scalar cost for vector-pipe DMAs (reduction / quantization).
+    uint64_t dma_vec_rd_scalar = 0;
+    uint64_t dma_vec_wr_scalar = 0;
     WorkerPostProcessor *post_processor = nullptr;
     sc_event *start_event = nullptr;
     sc_fifo<int> *completion_fifo = nullptr;
@@ -205,6 +217,7 @@ struct Worker : sc_module
                                 uint64_t a_row_cost,
                                 uint64_t b_row_cost,
                                 uint64_t c_row_cost);
+    void configure_dma_vec_cost(uint64_t rd_cost, uint64_t wr_cost);
     void issue_stream(uint64_t addr,
                       uint64_t call_count,
                       uint64_t svc_cycles,
@@ -216,7 +229,8 @@ struct Worker : sc_module
                       uint64_t &call_counter,
                       uint64_t *phase_counter = nullptr,
                       uint64_t max_inflight = 1,
-                      bool scalar_between_streams = false);
+                      bool scalar_between_streams = false,
+                      DmaScalarMode dma_scalar_mode = DmaScalarMode::MatRow);
     void issue_gemm_reuse_stream();
 
     void run();

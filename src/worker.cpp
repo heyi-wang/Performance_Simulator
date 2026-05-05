@@ -371,6 +371,12 @@ void Worker::configure_dma_row_cost(uint64_t a_rows,
     dma_c_row_scalar = c_row_cost;
 }
 
+void Worker::configure_dma_vec_cost(uint64_t rd_cost, uint64_t wr_cost)
+{
+    dma_vec_rd_scalar = rd_cost;
+    dma_vec_wr_scalar = wr_cost;
+}
+
 void Worker::issue_stream(uint64_t addr,
                           uint64_t call_count,
                           uint64_t svc_cycles,
@@ -382,7 +388,8 @@ void Worker::issue_stream(uint64_t addr,
                           uint64_t &call_counter,
                           uint64_t *phase_counter,
                           uint64_t max_inflight,
-                          bool scalar_between_streams)
+                          bool scalar_between_streams,
+                          DmaScalarMode dma_scalar_mode)
 {
     if (call_count == 0)
         return;
@@ -405,8 +412,18 @@ void Worker::issue_stream(uint64_t addr,
     };
 
     auto issue_read = [&]() {
-        if (dma_rd > 0 && dma_a_rows > 0 && dma_a_row_scalar > 0)
-            do_scalar(dma_a_rows * dma_a_row_scalar);
+        if (dma_rd > 0)
+        {
+            if (dma_scalar_mode == DmaScalarMode::MatRow)
+            {
+                if (dma_a_rows > 0 && dma_a_row_scalar > 0)
+                    do_scalar(dma_a_rows * dma_a_row_scalar);
+            }
+            else if (dma_vec_rd_scalar > 0)
+            {
+                do_scalar(dma_vec_rd_scalar);
+            }
+        }
         read_inflight.push_back(issue_dma_begin(false, dma_rd));
         ++reads_issued;
     };
@@ -449,8 +466,18 @@ void Worker::issue_stream(uint64_t addr,
             {
                 issue_end(*it);
                 it = accel_inflight.erase(it);
-                if (dma_wr > 0 && dma_c_rows > 0 && dma_c_row_scalar > 0)
-                    do_scalar(dma_c_rows * dma_c_row_scalar);
+                if (dma_wr > 0)
+                {
+                    if (dma_scalar_mode == DmaScalarMode::MatRow)
+                    {
+                        if (dma_c_rows > 0 && dma_c_row_scalar > 0)
+                            do_scalar(dma_c_rows * dma_c_row_scalar);
+                    }
+                    else if (dma_vec_wr_scalar > 0)
+                    {
+                        do_scalar(dma_vec_wr_scalar);
+                    }
+                }
                 write_inflight.push_back(issue_dma_begin(true, dma_wr));
                 progressed = true;
             }
@@ -627,7 +654,9 @@ void Worker::run()
                          vwr,
                          vec_calls,
                          nullptr,
-                         max_inflight_vec_reqs);
+                         max_inflight_vec_reqs,
+                         /*scalar_between_streams=*/false,
+                         DmaScalarMode::VecPerCall);
         }
 
         // Preserve the legacy behavior for the base simulator: mat_done marks

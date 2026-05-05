@@ -11,11 +11,11 @@
 // ============================================================
 
 #ifndef MAT_ACCEL_COUNT
-#define MAT_ACCEL_COUNT 4
+#define MAT_ACCEL_COUNT 2
 #endif
 
 #ifndef VEC_ACCEL_COUNT
-#define VEC_ACCEL_COUNT 8
+#define VEC_ACCEL_COUNT 4
 #endif
 
 #ifndef MEMORY_PARALLEL_SLOTS
@@ -108,3 +108,17 @@ static const uint64_t HW_VEC_SCALAR_OVERHEAD = VEC_SCALAR_OVERHEAD;
 static const uint64_t HW_DMA_A_ROW_SCALAR = DMA_A_ROW_SCALAR;
 static const uint64_t HW_DMA_B_ROW_SCALAR = DMA_B_ROW_SCALAR;
 static const uint64_t HW_DMA_C_ROW_SCALAR = DMA_C_ROW_SCALAR;
+
+// Per-DMA scalar instruction cost for vector-pipe DMA loads/stores.
+// Used by the reduction/quantization phase, which streams one vector per DMA
+// rather than assembling matrix-tile rows; the per-row matmul-phase model
+// above does not apply.
+#ifndef DMA_VEC_RD_SCALAR
+#define DMA_VEC_RD_SCALAR 8
+#endif
+#ifndef DMA_VEC_WR_SCALAR
+#define DMA_VEC_WR_SCALAR 8
+#endif
+
+static const uint64_t HW_DMA_VEC_RD_SCALAR = DMA_VEC_RD_SCALAR;
+static const uint64_t HW_DMA_VEC_WR_SCALAR = DMA_VEC_WR_SCALAR;

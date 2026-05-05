@@ -94,6 +94,7 @@ MatmulTop::MatmulTop(sc_module_name nm,
                                   HW_DMA_A_ROW_SCALAR,
                                   HW_DMA_B_ROW_SCALAR,
                                   HW_DMA_C_ROW_SCALAR);
+        w->configure_dma_vec_cost(HW_DMA_VEC_RD_SCALAR, HW_DMA_VEC_WR_SCALAR);
         workers.push_back(w);
         if (post_processor)
             active_workers.push_back(w);

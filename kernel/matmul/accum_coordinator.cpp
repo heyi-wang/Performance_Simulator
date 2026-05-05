@@ -251,7 +251,9 @@ void AccumCoordinator::run_one_pair(Worker &worker,
                         accum_wr_bytes,
                         worker.vec_calls,
                         &worker.accum_vec_calls,
-                        worker.max_inflight_vec_reqs);
+                        worker.max_inflight_vec_reqs,
+                        /*scalar_between_streams=*/false,
+                        DmaScalarMode::VecPerCall);
     worker.reduction_pairs++;
 
     sc_time end_time = sc_time_stamp();
@@ -293,7 +295,9 @@ void AccumCoordinator::run_final_quant(Worker &worker)
                         quant_wr_bytes,
                         worker.vec_calls,
                         &worker.quant_vec_calls,
-                        worker.max_inflight_vec_reqs);
+                        worker.max_inflight_vec_reqs,
+                        /*scalar_between_streams=*/false,
+                        DmaScalarMode::VecPerCall);
     WorkerSnapshot after = snapshot_worker(worker);
 
     accumulate_worker_delta(before, after);

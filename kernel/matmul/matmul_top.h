@@ -37,10 +37,13 @@ struct MatmulRuntimeConfig
     uint64_t memory_parallel_slots = MEMORY_PARALLEL_SLOTS_CFG;
 
     uint64_t l1_base_lat  = 1;
-    uint64_t l1_bw        = 256;
+    // L1 bandwidth aligned with the vector accelerator datapath: a vector-wide
+    // transfer is delivered into the vector accumulator in 1 cycle. The matrix
+    // accelerator's L1 load/store cost is derived from this BW (memory.h:32-35).
+    uint64_t l1_bw        = VECTOR_ACC_CAP;
     uint64_t l1_slots     = 4;
     uint64_t dma_base_lat = 10;
-    uint64_t dma_bw       = 64;
+    uint64_t dma_bw       = l1_bw / 2;
     uint64_t dma_slots    = 8;
     size_t mat_queue_cap_value =
         std::max(HW_ACC_QUEUE_DEPTH,
