@@ -39,6 +39,7 @@ struct AcceleratorSummaryRow
     std::string occupancy_utilization;
     std::string read_bytes;
     std::string write_bytes;
+    std::string registers;
 };
 
 inline std::string na()
@@ -194,6 +195,7 @@ inline Table make_accelerator_summary_table(
         "Occupancy Utilization [%]",
         "Read Bytes [bytes]",
         "Write Bytes [bytes]",
+        "Registers [tiles]",
     };
 
     for (const auto &row : rows)
@@ -210,6 +212,7 @@ inline Table make_accelerator_summary_table(
             row.occupancy_utilization,
             row.read_bytes,
             row.write_bytes,
+            row.registers,
         });
     }
 
@@ -245,6 +248,7 @@ inline std::vector<AcceleratorSummaryRow> make_per_instance_accel_rows(
             fmt_percent(occ_util),
             na(),
             na(),
+            inst.register_count > 0 ? fmt_u64(inst.register_count) : na(),
         });
     }
 

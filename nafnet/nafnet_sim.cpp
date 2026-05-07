@@ -680,6 +680,7 @@ int sc_main(int argc, char *argv[])
                 occupancy(totals.mat_pool.occupied_cycles, totals.mat_pool.instances)) : report::na(),
             report::na(),
             report::na(),
+            report::na(),
         },
         {
             "Vector Accelerator",
@@ -693,6 +694,7 @@ int sc_main(int argc, char *argv[])
                 utilization(totals.vec_pool.busy_cycles, totals.vec_pool.instances)) : report::na(),
             totals.vec_pool.present ? report::fmt_percent(
                 occupancy(totals.vec_pool.occupied_cycles, totals.vec_pool.instances)) : report::na(),
+            report::na(),
             report::na(),
             report::na(),
         },

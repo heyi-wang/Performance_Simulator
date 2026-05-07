@@ -14,11 +14,11 @@
 
 struct MatmulRuntimeConfig
 {
+    static constexpr uint64_t per_worker_register_count = 4;
+
     int thread_count = MatmulConfig::default_thread_count;
     int mat_accel_count = MAT_ACCEL_COUNT;
     int vec_accel_count = VEC_ACCEL_COUNT;
-    uint64_t accumulator_register_count =
-        MatmulConfig::default_accumulator_register_count;
 
     uint64_t workload_n = MatmulConfig::workload_n;
     uint64_t workload_h = MatmulConfig::workload_h;
@@ -59,16 +59,12 @@ struct MatmulRuntimeConfig
 
     static MatmulRuntimeConfig defaults(int threads = MatmulConfig::default_thread_count,
                                         int mat_accels = MAT_ACCEL_COUNT,
-                                        int vec_accels = VEC_ACCEL_COUNT,
-                                        uint64_t accumulator_registers =
-                                            MatmulConfig::default_accumulator_register_count)
+                                        int vec_accels = VEC_ACCEL_COUNT)
     {
         MatmulRuntimeConfig cfg;
         cfg.thread_count = std::max(threads, 1);
         cfg.mat_accel_count = std::max(mat_accels, 1);
         cfg.vec_accel_count = std::max(vec_accels, 1);
-        cfg.accumulator_register_count =
-            std::max<uint64_t>(accumulator_registers, 1);
         cfg.mat_queue_cap_value =
             std::max(HW_ACC_QUEUE_DEPTH,
                      static_cast<size_t>(cfg.mat_accel_count * 4));
@@ -150,7 +146,7 @@ struct MatmulRuntimeConfig
     }
     uint64_t gemm_m_batches() const
     {
-        return ceil_div_u64(gemm_tile_m(), accumulator_register_count);
+        return ceil_div_u64(gemm_tile_m(), per_worker_register_count);
     }
     uint64_t local_output_tiles_for_thread(int tid) const
     {
@@ -260,7 +256,7 @@ struct MatmulSimulationStats
 struct MatmulTop : sc_module
 {
     MatmulRuntimeConfig cfg;
-    AcceleratorPool mat_acc;
+    std::unique_ptr<AcceleratorPool> mat_acc;
     AcceleratorPool vec_acc;
     Interconnect    noc;
     L1L2Memory      memory;

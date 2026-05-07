@@ -12,7 +12,6 @@ MatmulTop::MatmulTop(sc_module_name nm,
                      sc_event *done_event_)
     : sc_module(nm),
       cfg(cfg_),
-      mat_acc("mat_acc", cfg.mat_accel_count, cfg.mat_acc_queue_cap()),
       vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap()),
       noc("noc"),
       memory("memory",
@@ -24,13 +23,31 @@ MatmulTop::MatmulTop(sc_module_name nm,
              cfg.dma_slots),
       done_event(done_event_)
 {
+    // Static round-robin pinning: worker i -> matrix accelerator (i % N).
+    // Per-accelerator register count = 4 * threads pinned to that accelerator.
+    std::vector<int> worker_to_accel(static_cast<size_t>(cfg.thread_count));
+    for (int i = 0; i < cfg.thread_count; ++i)
+        worker_to_accel[static_cast<size_t>(i)] = i % cfg.mat_accel_count;
+
+    std::vector<uint64_t> regs_per_accel(static_cast<size_t>(cfg.mat_accel_count), 0);
+    for (int i = 0; i < cfg.thread_count; ++i)
+        regs_per_accel[static_cast<size_t>(worker_to_accel[static_cast<size_t>(i)])] +=
+            MatmulRuntimeConfig::per_worker_register_count;
+
+    mat_acc = std::make_unique<AcceleratorPool>(
+        "mat_acc",
+        static_cast<size_t>(cfg.mat_accel_count),
+        cfg.mat_acc_queue_cap(),
+        std::move(worker_to_accel),
+        std::move(regs_per_accel));
+
     // Bind accelerators and memory to the interconnect
-    noc.to_mat.bind(mat_acc.tgt);
+    noc.to_mat.bind(mat_acc->tgt);
     noc.to_vec.bind(vec_acc.tgt);
     noc.to_mem.bind(memory.tgt);
 
     // Each physical accelerator instance reaches memory through the interconnect.
-    for (auto &unit : mat_acc.units)
+    for (auto &unit : mat_acc->units)
         unit->to_mem.bind(noc.tgt);
     for (auto &unit : vec_acc.units)
         unit->to_mem.bind(noc.tgt);
@@ -87,7 +104,7 @@ MatmulTop::MatmulTop(sc_module_name nm,
         w->configure_gemm_reuse(cfg.gemm_tile_m(),
                                 cfg.gemm_tile_n(),
                                 cfg.local_tile_k_for_thread(i),
-                                cfg.accumulator_register_count);
+                                MatmulRuntimeConfig::per_worker_register_count);
         w->configure_dma_row_cost(MATMUL_M,
                                   MATMUL_K,
                                   MATMUL_M,
@@ -137,10 +154,10 @@ MatmulSimulationStats MatmulTop::collect_stats() const
 
     stats.total_macs =
         cfg.gemm_m() * cfg.gemm_k() * cfg.gemm_n();
-    stats.mat_req_total = mat_acc.req_count_total();
-    stats.mat_busy_total = mat_acc.busy_cycles_total();
-    stats.mat_occupied_total = mat_acc.occupied_cycles_total();
-    stats.mat_qwait_total = mat_acc.queue_wait_cycles_total();
+    stats.mat_req_total = mat_acc->req_count_total();
+    stats.mat_busy_total = mat_acc->busy_cycles_total();
+    stats.mat_occupied_total = mat_acc->occupied_cycles_total();
+    stats.mat_qwait_total = mat_acc->queue_wait_cycles_total();
     stats.vec_req_total = vec_acc.req_count_total();
     stats.expected_mat_req_total = 0;
     for (int tid = 0; tid < cfg.thread_count; ++tid)
@@ -208,7 +225,7 @@ MatmulSimulationStats MatmulTop::collect_stats() const
 
     const double total_elapsed = static_cast<double>(stats.total_elapsed);
     const double mat_capacity =
-        total_elapsed * static_cast<double>(mat_acc.instance_count());
+        total_elapsed * static_cast<double>(mat_acc->instance_count());
     const double vec_capacity =
         total_elapsed * static_cast<double>(vec_acc.instance_count());
 
@@ -312,7 +329,7 @@ void MatmulTop::print_report(std::ostream &os) const
         {"Workers [count]", report::fmt_int(cfg.thread_count)},
         {"Matrix Accelerators [count]", report::fmt_int(cfg.mat_accel_count)},
         {"Vector Accelerators [count]", report::fmt_int(cfg.vec_accel_count)},
-        {"C Accumulator Registers [tiles]", report::fmt_u64(cfg.accumulator_register_count)},
+        {"Per-Worker Accumulator Registers [tiles]", report::fmt_u64(MatmulRuntimeConfig::per_worker_register_count)},
         {"Matrix Accelerator Tile", "[" + report::fmt_u64(MATMUL_M) + " x " +
                                      report::fmt_u64(MATMUL_K) + " x " +
                                      report::fmt_u64(MATMUL_N) + "]"},
@@ -347,9 +364,10 @@ void MatmulTop::print_report(std::ostream &os) const
         report::fmt_percent(stats.mat_occupancy),
         report::na(),
         report::na(),
+        report::na(),
     });
     for (auto &r : report::make_per_instance_accel_rows(
-             "Matrix Accelerator", mat_acc.per_instance_stats(), stats.total_elapsed))
+             "Matrix Accelerator", mat_acc->per_instance_stats(), stats.total_elapsed))
         accel_rows.push_back(std::move(r));
 
     accel_rows.push_back({
@@ -362,6 +380,7 @@ void MatmulTop::print_report(std::ostream &os) const
         report::fmt_u64(stats.vec_occupied_total),
         report::fmt_percent(stats.vec_compute_util),
         report::fmt_percent(stats.vec_occupancy),
+        report::na(),
         report::na(),
         report::na(),
     });
