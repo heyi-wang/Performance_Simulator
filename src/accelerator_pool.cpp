@@ -12,9 +12,15 @@ void AcceleratorPool::build_units(size_t count)
 
     for (size_t i = 0; i < count; ++i)
     {
+        // In pipelined mode, the pool owns upstream admission/backpressure.
+        // Give each unit enough internal room for any request the pool has
+        // already admitted, so the same GP is not parked in both layers.
+        const size_t per_unit_cap =
+            unit_pipeline ? std::max<size_t>(queue_capacity, 1) : 1;
         units.push_back(std::make_unique<AcceleratorTLM>(
             sc_gen_unique_name("accel_unit"),
-            1));
+            per_unit_cap,
+            unit_pipeline));
         to_units.push_back(
             std::make_unique<tlm_utils::simple_initiator_socket_tagged<AcceleratorPool>>(
                 sc_gen_unique_name("to_unit")));
@@ -25,10 +31,12 @@ void AcceleratorPool::build_units(size_t count)
 
 AcceleratorPool::AcceleratorPool(sc_module_name name,
                                  size_t instance_count_,
-                                 size_t queue_capacity_)
+                                 size_t queue_capacity_,
+                                 bool   enable_unit_pipeline)
     : sc_module(name),
       tgt("tgt"),
-      queue_capacity(queue_capacity_)
+      queue_capacity(queue_capacity_),
+      unit_pipeline(enable_unit_pipeline)
 {
     tgt.register_nb_transport_fw(this, &AcceleratorPool::nb_transport_fw);
     SC_THREAD(dispatch_thread);
@@ -45,6 +53,7 @@ AcceleratorPool::AcceleratorPool(sc_module_name name,
     : sc_module(name),
       tgt("tgt"),
       queue_capacity(per_unit_capacity_),
+      unit_pipeline(true),
       per_accel_mode(true),
       worker_to_accel_map(std::move(worker_to_accel)),
       per_unit_register_count(std::move(per_unit_registers))
@@ -172,20 +181,41 @@ tlm_sync_enum AcceleratorPool::nb_transport_bw_unit(int id,
 
 void AcceleratorPool::dispatch_thread()
 {
+    size_t rr_idx = 0;
     while (true)
     {
-        while (q.empty() || !has_free_unit())
-            wait(q_changed);
+        if (unit_pipeline)
+        {
+            while (q.empty())
+                wait(q_changed);
+        }
+        else
+        {
+            while (q.empty() || !has_free_unit())
+                wait(q_changed);
+        }
 
         while (!q.empty())
         {
-            int unit_id = find_free_unit();
-            if (unit_id < 0)
-                break;
+            int unit_id = -1;
+            if (unit_pipeline)
+            {
+                // Round-robin across pipelined units; their internal cap
+                // absorbs back-to-back dispatches without TLM_ACCEPTED.
+                unit_id = static_cast<int>(rr_idx % units.size());
+                rr_idx++;
+            }
+            else
+            {
+                unit_id = find_free_unit();
+                if (unit_id < 0)
+                    break;
+            }
 
             Entry e = q.front();
             q.pop_front();
-            unit_busy[static_cast<size_t>(unit_id)] = true;
+            if (!unit_pipeline)
+                unit_busy[static_cast<size_t>(unit_id)] = true;
 
             ReqExt *ext = nullptr;
             e.gp->get_extension(ext);
@@ -201,9 +231,11 @@ void AcceleratorPool::dispatch_thread()
 
             if (status == TLM_ACCEPTED)
             {
-                // The pool only dispatches to known-free units, so this should not happen.
-                // If it does, requeue the request and try again later.
-                unit_busy[static_cast<size_t>(unit_id)] = false;
+                // Either a serial unit returned ACCEPTED (shouldn't happen
+                // because we gate on unit_busy) or a pipelined unit's cap
+                // is temporarily full. In both cases requeue and retry.
+                if (!unit_pipeline)
+                    unit_busy[static_cast<size_t>(unit_id)] = false;
                 q.push_front(e);
                 q_changed.notify(SC_ZERO_TIME);
                 break;
@@ -218,12 +250,24 @@ void AcceleratorPool::per_unit_dispatch_thread(int unit_id)
     size_t uid = static_cast<size_t>(unit_id);
     while (true)
     {
-        while (per_unit_q[uid].empty() || unit_busy[uid])
-            wait(*per_unit_q_changed[uid]);
+        // Pipelined units are dispatched as fast as the queue has work
+        // (the unit's cap absorbs concurrent in-flight requests).
+        // Non-pipelined units serialize on `unit_busy`.
+        if (unit_pipeline)
+        {
+            while (per_unit_q[uid].empty())
+                wait(*per_unit_q_changed[uid]);
+        }
+        else
+        {
+            while (per_unit_q[uid].empty() || unit_busy[uid])
+                wait(*per_unit_q_changed[uid]);
+        }
 
         Entry e = per_unit_q[uid].front();
         per_unit_q[uid].pop_front();
-        unit_busy[uid] = true;
+        if (!unit_pipeline)
+            unit_busy[uid] = true;
 
         ReqExt *ext = nullptr;
         e.gp->get_extension(ext);
@@ -239,9 +283,18 @@ void AcceleratorPool::per_unit_dispatch_thread(int unit_id)
 
         if (status == TLM_ACCEPTED)
         {
-            unit_busy[uid] = false;
+            // Unit's cap is full -- requeue and wait for it to drain
+            // (nb_transport_bw_unit notifies on BEGIN_RESP).
             per_unit_q[uid].push_front(e);
-            per_unit_q_changed[uid]->notify(SC_ZERO_TIME);
+            if (unit_pipeline)
+            {
+                wait(*per_unit_q_changed[uid]);
+            }
+            else
+            {
+                unit_busy[uid] = false;
+                per_unit_q_changed[uid]->notify(SC_ZERO_TIME);
+            }
         }
     }
 }

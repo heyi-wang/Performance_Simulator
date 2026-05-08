@@ -39,7 +39,7 @@
 #endif
 
 #ifndef ACC_QUEUE_DEPTH
-#define ACC_QUEUE_DEPTH 32
+#define ACC_QUEUE_DEPTH 64
 #endif
 
 static const int MAT_ACCEL_COUNT_CFG = MAT_ACCEL_COUNT;
@@ -96,13 +96,13 @@ static const uint64_t HW_VEC_SCALAR_OVERHEAD = VEC_SCALAR_OVERHEAD;
 // One `dma.x` per A/B/C row; values derived from the RISC-V codegen of
 // kernel/Conv2d.h (see kernel/test_conv2d_dwarf_o2.asm, 1 insn = 1 cycle).
 #ifndef DMA_A_ROW_SCALAR
-#define DMA_A_ROW_SCALAR 10
+#define DMA_A_ROW_SCALAR 1
 #endif
 #ifndef DMA_B_ROW_SCALAR
-#define DMA_B_ROW_SCALAR 20
+#define DMA_B_ROW_SCALAR 1
 #endif
 #ifndef DMA_C_ROW_SCALAR
-#define DMA_C_ROW_SCALAR 10
+#define DMA_C_ROW_SCALAR 1
 #endif
 
 static const uint64_t HW_DMA_A_ROW_SCALAR = DMA_A_ROW_SCALAR;
@@ -114,10 +114,10 @@ static const uint64_t HW_DMA_C_ROW_SCALAR = DMA_C_ROW_SCALAR;
 // rather than assembling matrix-tile rows; the per-row matmul-phase model
 // above does not apply.
 #ifndef DMA_VEC_RD_SCALAR
-#define DMA_VEC_RD_SCALAR 8
+#define DMA_VEC_RD_SCALAR 1
 #endif
 #ifndef DMA_VEC_WR_SCALAR
-#define DMA_VEC_WR_SCALAR 8
+#define DMA_VEC_WR_SCALAR 1
 #endif
 
 static const uint64_t HW_DMA_VEC_RD_SCALAR = DMA_VEC_RD_SCALAR;

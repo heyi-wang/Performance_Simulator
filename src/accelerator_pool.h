@@ -38,6 +38,11 @@ struct AcceleratorPool : sc_module
 
     size_t queue_capacity = 0;
 
+    // Whether to construct each AcceleratorTLM unit with the 3-stage
+    // load/compute/write pipeline enabled. Default false preserves the
+    // legacy serial behavior for every kernel that does not opt in.
+    bool unit_pipeline = false;
+
     // Per-accel pinned mode state (populated only when per_accel_mode)
     bool per_accel_mode = false;
     std::vector<int>      worker_to_accel_map;
@@ -50,10 +55,14 @@ struct AcceleratorPool : sc_module
 
     SC_HAS_PROCESS(AcceleratorPool);
 
-    // Shared-FIFO ctor (unchanged)
-    AcceleratorPool(sc_module_name name, size_t instance_count, size_t queue_capacity_);
+    // Shared-FIFO ctor. enable_unit_pipeline defaults to false so that
+    // every existing kernel call site retains current serial behavior.
+    AcceleratorPool(sc_module_name name,
+                    size_t instance_count,
+                    size_t queue_capacity_,
+                    bool   enable_unit_pipeline = false);
 
-    // Per-accel pinned ctor
+    // Per-accel pinned ctor (matmul matrix pool); always pipelines its units.
     AcceleratorPool(sc_module_name name,
                     size_t instance_count,
                     size_t per_unit_capacity,

@@ -4,17 +4,27 @@
 
 SC_HAS_PROCESS(AcceleratorTLM);
 
-AcceleratorTLM::AcceleratorTLM(sc_module_name name, size_t cap)
+AcceleratorTLM::AcceleratorTLM(sc_module_name name, size_t cap, bool enable_pipeline)
     : sc_module(name),
       tgt("tgt"),
       to_mem("to_mem"),
       peq("peq"),
+      pipeline_enabled(enable_pipeline),
       queue_capacity(cap)
 {
     tgt.register_nb_transport_fw(this, &AcceleratorTLM::nb_transport_fw);
     to_mem.register_nb_transport_bw(this, &AcceleratorTLM::nb_transport_bw_mem);
     SC_THREAD(peq_thread);
-    SC_THREAD(service_thread);
+    if (pipeline_enabled)
+    {
+        SC_THREAD(load_thread);
+        SC_THREAD(compute_thread);
+        SC_THREAD(write_thread);
+    }
+    else
+    {
+        SC_THREAD(service_thread);
+    }
 }
 
 tlm_sync_enum AcceleratorTLM::nb_transport_fw(tlm_generic_payload &gp,
@@ -172,29 +182,150 @@ void AcceleratorTLM::service_thread()
         if (busy_cb)
             busy_cb((uint64_t)(sc_time_stamp() / CYCLE), false);
 
-        e.gp->set_response_status(TLM_OK_RESPONSE);
+        complete_request(e);
+    }
+}
 
-        // Release the admitted slot or hand it to the next stalled request.
-        if (!stall_fifo.empty())
-        {
-            tlm_generic_payload *next_gp = stall_fifo.front();
-            stall_fifo.pop_front();
-            peq.notify(*next_gp, SC_ZERO_TIME);
+void AcceleratorTLM::complete_request(Entry &e)
+{
+    e.gp->set_response_status(TLM_OK_RESPONSE);
 
-            // Send the deferred END_REQ back to the worker so that
-            // issue_begin (which is blocked waiting for admit_ev) unblocks.
-            tlm_phase end_req_phase = END_REQ;
-            sc_time   end_req_delay = SC_ZERO_TIME;
-            tgt->nb_transport_bw(*next_gp, end_req_phase, end_req_delay);
-            // admitted stays the same: the slot is reused by next_gp.
-        }
-        else
-        {
-            --admitted;
-        }
+    // Release the admitted slot or hand it to the next stalled request.
+    if (!stall_fifo.empty())
+    {
+        tlm_generic_payload *next_gp = stall_fifo.front();
+        stall_fifo.pop_front();
+        peq.notify(*next_gp, SC_ZERO_TIME);
 
-        tlm_phase phase = BEGIN_RESP;
-        sc_time   delay = SC_ZERO_TIME;
-        tgt->nb_transport_bw(*e.gp, phase, delay);
+        // Send the deferred END_REQ back to the worker so that
+        // issue_begin (which is blocked waiting for admit_ev) unblocks.
+        tlm_phase end_req_phase = END_REQ;
+        sc_time   end_req_delay = SC_ZERO_TIME;
+        tgt->nb_transport_bw(*next_gp, end_req_phase, end_req_delay);
+        // admitted stays the same: the slot is reused by next_gp.
+    }
+    else
+    {
+        --admitted;
+    }
+
+    tlm_phase phase = BEGIN_RESP;
+    sc_time   delay = SC_ZERO_TIME;
+    tgt->nb_transport_bw(*e.gp, phase, delay);
+}
+
+// ============================================================
+// Pipelined-mode stage threads
+//   load_thread   : pop from q,        mem_access(read,  rd_bytes),  push loaded_q
+//   compute_thread: pop from loaded_q, wait(svc cycles),             push computed_q
+//   write_thread  : pop from computed_q, mem_access(write, wr_bytes), BEGIN_RESP
+// Inter-stage queues are capacity-1, so each producer waits when the
+// downstream queue is full -- this gives "exactly one tile ahead".
+// ============================================================
+
+void AcceleratorTLM::stage_enter()
+{
+    if (pipeline_active_stages == 0)
+        pipeline_busy_start = sc_time_stamp();
+    ++pipeline_active_stages;
+}
+
+void AcceleratorTLM::stage_exit()
+{
+    --pipeline_active_stages;
+    if (pipeline_active_stages == 0)
+    {
+        occupied_cycles +=
+            static_cast<uint64_t>((sc_time_stamp() - pipeline_busy_start) / CYCLE);
+    }
+}
+
+void AcceleratorTLM::load_thread()
+{
+    while (true)
+    {
+        while (q.empty() || !loaded_q.empty())
+            wait(q_nonempty | loaded_q_changed);
+
+        Entry e = q.front();
+        q.pop_front();
+
+        ReqExt *ext = nullptr;
+        e.gp->get_extension(ext);
+
+        e.t_load_start = sc_time_stamp();
+        uint64_t qwait =
+            static_cast<uint64_t>((e.t_load_start - e.enqueue_time) / CYCLE);
+        if (ext)
+            ext->accel_qwait_cycles += qwait;
+        queue_wait_cycles += qwait;
+        req_count         += 1;
+
+        stage_enter();
+        if (busy_cb)
+            busy_cb(static_cast<uint64_t>(sc_time_stamp() / CYCLE), true);
+
+        mem_access(false, ext ? ext->rd_bytes : 0);
+        e.t_load_end = sc_time_stamp();
+
+        loaded_q.push_back(e);
+        loaded_q_changed.notify(SC_ZERO_TIME);
+    }
+}
+
+void AcceleratorTLM::compute_thread()
+{
+    while (true)
+    {
+        while (loaded_q.empty() || !computed_q.empty())
+            wait(loaded_q_changed | computed_q_changed);
+
+        Entry e = loaded_q.front();
+        loaded_q.pop_front();
+        loaded_q_changed.notify(SC_ZERO_TIME);
+
+        ReqExt *ext = nullptr;
+        e.gp->get_extension(ext);
+        uint64_t svc = ext ? ext->cycles : 0;
+
+        e.t_compute_start = sc_time_stamp();
+        busy_cycles += svc;
+        if (svc > 0)
+            wait(svc * CYCLE);
+        e.t_compute_end = sc_time_stamp();
+
+        computed_q.push_back(e);
+        computed_q_changed.notify(SC_ZERO_TIME);
+    }
+}
+
+void AcceleratorTLM::write_thread()
+{
+    while (true)
+    {
+        while (computed_q.empty())
+            wait(computed_q_changed);
+
+        Entry e = computed_q.front();
+        computed_q.pop_front();
+        computed_q_changed.notify(SC_ZERO_TIME);
+
+        ReqExt *ext = nullptr;
+        e.gp->get_extension(ext);
+
+        e.t_write_start = sc_time_stamp();
+        mem_access(true, ext ? ext->wr_bytes : 0);
+        e.t_write_end = sc_time_stamp();
+
+        if (ext)
+            ext->mem_cycles +=
+                static_cast<uint64_t>(((e.t_load_end - e.t_load_start) +
+                                       (e.t_write_end - e.t_write_start)) / CYCLE);
+
+        if (busy_cb)
+            busy_cb(static_cast<uint64_t>(sc_time_stamp() / CYCLE), false);
+        stage_exit();
+
+        complete_request(e);
     }
 }

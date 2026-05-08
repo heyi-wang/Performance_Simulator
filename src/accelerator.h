@@ -24,10 +24,27 @@ struct AcceleratorTLM : sc_module
     {
         tlm_generic_payload *gp = nullptr;
         sc_time              enqueue_time;
+        sc_time              t_load_start;
+        sc_time              t_load_end;
+        sc_time              t_compute_start;
+        sc_time              t_compute_end;
+        sc_time              t_write_start;
+        sc_time              t_write_end;
     };
 
     std::deque<Entry> q;
     sc_event          q_nonempty;
+
+    // Pipelined-mode inter-stage queues (capacity 1).
+    bool                pipeline_enabled = false;
+    std::deque<Entry>   loaded_q;
+    std::deque<Entry>   computed_q;
+    sc_event            loaded_q_changed;
+    sc_event            computed_q_changed;
+
+    // Wall-time tracking of "any stage in flight" used by pipelined mode.
+    int       pipeline_active_stages = 0;
+    sc_time   pipeline_busy_start;
 
     // Backpressure: requests that arrived when the queue was full.
     // Each GP here is waiting for a deferred END_REQ to be sent back.
@@ -56,7 +73,7 @@ struct AcceleratorTLM : sc_module
 
     SC_HAS_PROCESS(AcceleratorTLM);
 
-    AcceleratorTLM(sc_module_name name, size_t cap);
+    AcceleratorTLM(sc_module_name name, size_t cap, bool enable_pipeline = false);
 
     tlm_sync_enum nb_transport_fw(tlm_generic_payload &gp,
                                   tlm_phase &phase,
@@ -71,4 +88,17 @@ struct AcceleratorTLM : sc_module
 
     void peq_thread();
     void service_thread();
+
+    // Pipelined-mode stage threads.
+    void load_thread();
+    void compute_thread();
+    void write_thread();
+
+    // Helpers for pipelined-mode "any stage active" wall-time tracking.
+    void stage_enter();
+    void stage_exit();
+
+    // Tail-end completion path shared by service_thread and write_thread:
+    // sends BEGIN_RESP, drains stall_fifo / decrements admitted.
+    void complete_request(Entry &e);
 };
