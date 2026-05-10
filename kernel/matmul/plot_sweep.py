@@ -24,6 +24,18 @@ In 2D mode, --group-by columns are mapped to visual channels in order:
         --filter tile_m=16,tile_k=32,tile_n=64,mat_latency=4,gemm_m=1024,vec_count=1,vec_bytes=64 \\
         --log-z --output /tmp/demo3d.png
 
+Stacked-bar mode (--bar):
+    python3 kernel/matmul/plot_sweep.py \\
+        --input kernel/matmul/full_sweep.csv \\
+        --bar --x threads \\
+        --filter tile_m=8,mat_count=1,dma_base_lat=8 \\
+        --output /tmp/demo_bar.png
+
+In --bar mode the bar height is total_cycles and each bar is partitioned
+into mat / vec / DMA / scalar / stall fractions. One bar per --x value;
+--filter must narrow the input so each x maps to a single row. --group-by
+is ignored in bar mode.
+
 Filters accept comma-separated key=val pairs; values can be lists with '|'
 (e.g. mat_count=1|2|4). Sweep parameters that are not on an axis or in
 --group-by but have a single unique value across the filtered rows are
@@ -51,8 +63,13 @@ except ImportError:
 NUMERIC_COLUMNS = {
     "tile_m", "tile_k", "tile_n",
     "mat_latency", "mat_count", "vec_count", "vec_bytes",
-    "gemm_m", "gemm_k", "gemm_n", "threads",
+    "gemm_m", "gemm_k", "gemm_n", "threads", "dma_base_lat",
     "total_cycles", "actual_mat_accels", "actual_vec_accels",
+    "slowest_worker_tid",
+    "mat_util_pct", "vec_util_pct",
+    "mat_cycle_fraction_pct", "vec_cycle_fraction_pct",
+    "dma_cycle_fraction_pct", "scalar_cycle_fraction_pct",
+    "stall_cycle_fraction_pct",
     "wall_seconds", "build_ok", "run_ok",
 }
 
@@ -94,6 +111,14 @@ HUE_PALETTE = [
 ]
 LINE_STYLES = ["-", "--", "-.", ":"]
 MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*", "<", ">"]
+
+FRACTION_COLUMNS = [
+    ("mat_cycle_fraction_pct",    "Mat",    "#1f77b4", "//"),
+    ("vec_cycle_fraction_pct",    "Vec",    "#2ca02c", "\\\\"),
+    ("dma_cycle_fraction_pct",    "DMA",    "#ff7f0e", "xx"),
+    ("scalar_cycle_fraction_pct", "Scalar", "#9467bd", ".."),
+    ("stall_cycle_fraction_pct",  "Stall",  "#d62728", "++"),
+]
 
 
 def parse_filter(spec: str) -> dict[str, list[str]]:
@@ -314,6 +339,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="3D rendering style.",
     )
     p.add_argument(
+        "--bar", action="store_true",
+        help=(
+            "Render a stacked bar chart: bar height = total_cycles, each bar "
+            "split into mat/vec/DMA/scalar/stall fractions. One bar per --x "
+            "value; --filter must narrow input to one row per x. "
+            "--group-by is ignored. Mutually exclusive with --3d."
+        ),
+    )
+    p.add_argument(
         "--no-fixed-annotation", action="store_true",
         help="Suppress the auto-generated 'Fixed: ...' line below the plot.",
     )
@@ -532,6 +566,85 @@ def render_3d(
     return fig
 
 
+def render_bar(
+    rows: list[dict],
+    args: argparse.Namespace,
+    fixed_text: str,
+) -> "plt.Figure":
+    by_x: dict[object, dict] = {}
+    for row in rows:
+        xv = coerce(args.x, row.get(args.x, ""))
+        if xv is None:
+            continue
+        if xv in by_x:
+            sys.exit(
+                f"--bar: multiple rows share {args.x}={xv}; "
+                f"narrow --filter so each x maps to one row."
+            )
+        by_x[xv] = row
+
+    if not by_x:
+        sys.exit("No rows with a valid --x value after filtering.")
+
+    numeric = all(isinstance(v, (int, float)) for v in by_x.keys())
+    if numeric:
+        xs = sorted(by_x.keys(), key=float)
+    else:
+        xs = sorted(by_x.keys(), key=str)
+
+    if numeric and len(xs) > 1:
+        gap = min((b - a) for a, b in zip(xs, xs[1:]))
+        width = 0.7 * gap if gap > 0 else 0.7
+    else:
+        width = 0.7
+
+    fig, ax = plt.subplots(figsize=(10.5, 6.4))
+    bottoms = [0.0] * len(xs)
+    for col, label, color, hatch in FRACTION_COLUMNS:
+        seg = []
+        for x in xs:
+            row = by_x[x]
+            tot = coerce("total_cycles", row.get("total_cycles", "")) or 0.0
+            frac = coerce(col, row.get(col, "")) or 0.0
+            seg.append(float(tot) * float(frac) / 100.0)
+        ax.bar(
+            xs, seg, width=width, bottom=bottoms,
+            color=color, alpha=0.55, edgecolor=color, linewidth=0.6,
+            hatch=hatch, label=label,
+        )
+        bottoms = [b + s for b, s in zip(bottoms, seg)]
+
+    if numeric:
+        try:
+            ax.set_xticks(xs)
+            ax.get_xaxis().set_major_formatter(plt.ScalarFormatter())
+        except Exception:
+            pass
+    if args.log_x and numeric:
+        ax.set_xscale("log", base=2)
+    if args.log_y:
+        ax.set_yscale("log", base=10)
+
+    ax.set_xlabel(label_for(args.x, args.log_x))
+    ax.set_ylabel(label_for("total_cycles", args.log_y))
+    if args.title:
+        ax.set_title(args.title)
+    else:
+        ax.set_title(
+            f"Cycle breakdown  vs  {AXIS_LABELS.get(args.x, args.x)}"
+        )
+
+    ax.grid(True, axis="y", which="major", linestyle="-", linewidth=0.45, alpha=0.4)
+    ax.grid(True, axis="y", which="minor", linestyle=":", linewidth=0.35, alpha=0.25)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    ax.legend(title="Category", frameon=False, ncol=1)
+
+    finish_figure(fig, args, fixed_text)
+    return fig
+
+
 def set_title(ax, args: argparse.Namespace, group_cols: list[str], three_d: bool) -> None:
     if args.title:
         ax.set_title(args.title)
@@ -587,15 +700,20 @@ def main() -> int:
     if not rows:
         sys.exit("No rows match the filter.")
 
+    if args.bar and args.three_d:
+        sys.exit("--bar and --3d are mutually exclusive.")
+
     used_cols = {args.x, *group_cols}
     if args.three_d:
         used_cols |= {args.y, args.z}
-    else:
+    elif not args.bar:
         used_cols.add(args.y)
     fixed_text = collect_fixed_dims(rows, used_cols, filters)
 
     if args.three_d:
         fig = render_3d(rows, args, group_cols, fixed_text)
+    elif args.bar:
+        fig = render_bar(rows, args, fixed_text)
     else:
         series: dict[tuple, list[tuple]] = defaultdict(list)
         for row in rows:

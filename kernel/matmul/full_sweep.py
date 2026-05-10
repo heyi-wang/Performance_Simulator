@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full 7-dimensional parametric sweep driver for the matmul simulator.
+"""Full 8-dimensional parametric sweep driver for the matmul simulator.
 
 Dimensions (see kernel/matmul/Parametric_Sweep.md):
     - tile size       : MATMUL_M x MATMUL_K x MATMUL_N       (compile-time)
@@ -9,6 +9,7 @@ Dimensions (see kernel/matmul/Parametric_Sweep.md):
     - vector bytes    : VECTOR_ACC_CAP                       (compile-time)
     - gemm shape      : --gemm-m/--gemm-k/--gemm-n           (runtime CLI)
     - threads         : --threads                            (runtime CLI)
+    - dma base lat    : --dma-base-lat                       (runtime CLI)
 
 The 5 compile-time parameters define a "hardware point". Each unique hardware
 point is built once into its own per-point BUILDDIR under
@@ -57,6 +58,38 @@ ACCEL_COUNT_RE = re.compile(
     r"^(Matrix|Vector) Accelerators\s*\[count\]\s*:\s*(\d+)$",
     re.MULTILINE,
 )
+SLOWEST_TID_RE = re.compile(
+    r"^Critical-Path Worker\s*\[tid\]\s*:\s*(-?\d+)$",
+    re.MULTILINE,
+)
+MAT_UTIL_RE = re.compile(
+    r"^Mat Pool Utilization\s*\[%\]\s*:\s*([\d.]+)\s*%$",
+    re.MULTILINE,
+)
+VEC_UTIL_RE = re.compile(
+    r"^Vec Pool Utilization\s*\[%\]\s*:\s*([\d.]+)\s*%$",
+    re.MULTILINE,
+)
+MAT_FRACTION_RE = re.compile(
+    r"^Mat Cycle Fraction\s*\[%\]\s*:\s*([\d.]+)\s*%$",
+    re.MULTILINE,
+)
+VEC_FRACTION_RE = re.compile(
+    r"^Vec Cycle Fraction\s*\[%\]\s*:\s*([\d.]+)\s*%$",
+    re.MULTILINE,
+)
+DMA_FRACTION_RE = re.compile(
+    r"^DMA Cycle Fraction\s*\[%\]\s*:\s*([\d.]+)\s*%$",
+    re.MULTILINE,
+)
+SCALAR_FRACTION_RE = re.compile(
+    r"^Scalar Cycle Fraction\s*\[%\]\s*:\s*([\d.]+)\s*%$",
+    re.MULTILINE,
+)
+STALL_FRACTION_RE = re.compile(
+    r"^Stall Cycle Fraction\s*\[%\]\s*:\s*([\d.]+)\s*%$",
+    re.MULTILINE,
+)
 
 # Defaults from kernel/matmul/Parametric_Sweep.md.
 DEFAULT_TILES: list[tuple[int, int, int]] = [
@@ -79,19 +112,25 @@ DEFAULT_GEMM_SHAPES: list[tuple[int, int, int]] = [
     (1024, 4096, 1024),
 ]
 DEFAULT_THREADS: list[int] = [1, 2, 4, 8, 16, 32, 64]
+DEFAULT_DMA_BASE_LATS: list[int] = [4, 8, 16, 32]
 
 CSV_FIELDS = [
     "tile_m", "tile_k", "tile_n",
     "mat_latency", "mat_count", "vec_count", "vec_bytes",
-    "gemm_m", "gemm_k", "gemm_n", "threads",
+    "gemm_m", "gemm_k", "gemm_n", "threads", "dma_base_lat",
     "total_cycles", "verification_status",
     "actual_mat_accels", "actual_vec_accels",
+    "slowest_worker_tid",
+    "mat_util_pct", "vec_util_pct",
+    "mat_cycle_fraction_pct", "vec_cycle_fraction_pct",
+    "dma_cycle_fraction_pct", "scalar_cycle_fraction_pct",
+    "stall_cycle_fraction_pct",
     "wall_seconds", "build_ok", "run_ok",
 ]
 KEY_FIELDS = [
     "tile_m", "tile_k", "tile_n",
     "mat_latency", "mat_count", "vec_count", "vec_bytes",
-    "gemm_m", "gemm_k", "gemm_n", "threads",
+    "gemm_m", "gemm_k", "gemm_n", "threads", "dma_base_lat",
 ]
 
 
@@ -133,13 +172,15 @@ class SweepPoint:
     gemm_k: int
     gemm_n: int
     threads: int
+    dma_base_lat: int
 
     def key(self) -> tuple:
         return (
             self.hw.tile_m, self.hw.tile_k, self.hw.tile_n,
             self.hw.mat_latency, self.hw.mat_count,
             self.hw.vec_count, self.hw.vec_bytes,
-            self.gemm_m, self.gemm_k, self.gemm_n, self.threads,
+            self.gemm_m, self.gemm_k, self.gemm_n,
+            self.threads, self.dma_base_lat,
         )
 
 
@@ -236,6 +277,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated thread counts. Default: 1,2,4,8,16,32,64.",
     )
     p.add_argument(
+        "--dma-base-lats",
+        type=lambda v: _parse_int_list(v, "--dma-base-lats"),
+        default=DEFAULT_DMA_BASE_LATS,
+        help=(
+            "Comma-separated --dma-base-lat values (the 'L2 access latency' "
+            "knob from Parametric_Sweep.md, mapped to cfg.dma_base_lat). "
+            "Default: 4,8,16,32."
+        ),
+    )
+    p.add_argument(
         "--output",
         default=str(DEFAULT_CSV),
         help=f"Output CSV path. Default: {DEFAULT_CSV}.",
@@ -284,11 +335,13 @@ def iter_hw_points(args: argparse.Namespace) -> list[HwPoint]:
 
 
 def iter_sweep_points(args: argparse.Namespace, hw_points: list[HwPoint]) -> list[SweepPoint]:
-    runtime_grid = list(product(args.gemm_shapes, args.threads_list))
+    runtime_grid = list(product(
+        args.gemm_shapes, args.threads_list, args.dma_base_lats
+    ))
     points: list[SweepPoint] = []
     for hw in hw_points:
-        for (gm, gk, gn), th in runtime_grid:
-            points.append(SweepPoint(hw, gm, gk, gn, th))
+        for (gm, gk, gn), th, dma_lat in runtime_grid:
+            points.append(SweepPoint(hw, gm, gk, gn, th, dma_lat))
     return points
 
 
@@ -347,6 +400,14 @@ def _parse_run_output(stdout: str) -> dict[str, object]:
         "verification_status": "",
         "actual_mat_accels": "",
         "actual_vec_accels": "",
+        "slowest_worker_tid": "",
+        "mat_util_pct": "",
+        "vec_util_pct": "",
+        "mat_cycle_fraction_pct": "",
+        "vec_cycle_fraction_pct": "",
+        "dma_cycle_fraction_pct": "",
+        "scalar_cycle_fraction_pct": "",
+        "stall_cycle_fraction_pct": "",
     }
     m = TOTAL_ELAPSED_RE.search(stdout)
     if m:
@@ -359,6 +420,22 @@ def _parse_run_output(stdout: str) -> dict[str, object]:
             out["actual_mat_accels"] = int(count)
         else:
             out["actual_vec_accels"] = int(count)
+
+    tid = SLOWEST_TID_RE.search(stdout)
+    if tid:
+        out["slowest_worker_tid"] = int(tid.group(1))
+    for key, pattern in (
+        ("mat_util_pct", MAT_UTIL_RE),
+        ("vec_util_pct", VEC_UTIL_RE),
+        ("mat_cycle_fraction_pct", MAT_FRACTION_RE),
+        ("vec_cycle_fraction_pct", VEC_FRACTION_RE),
+        ("dma_cycle_fraction_pct", DMA_FRACTION_RE),
+        ("scalar_cycle_fraction_pct", SCALAR_FRACTION_RE),
+        ("stall_cycle_fraction_pct", STALL_FRACTION_RE),
+    ):
+        match = pattern.search(stdout)
+        if match:
+            out[key] = float(match.group(1))
     return out
 
 
@@ -369,6 +446,7 @@ def run_point(binary: Path, sp: SweepPoint) -> tuple[dict[str, object], float]:
         "--gemm-m", str(sp.gemm_m),
         "--gemm-k", str(sp.gemm_k),
         "--gemm-n", str(sp.gemm_n),
+        "--dma-base-lat", str(sp.dma_base_lat),
     ]
     start = time.monotonic()
     proc = _run(cmd)
@@ -397,10 +475,19 @@ def row_for(sp: SweepPoint, fields: dict[str, object], wall: float, build_ok: in
         "gemm_k": sp.gemm_k,
         "gemm_n": sp.gemm_n,
         "threads": sp.threads,
+        "dma_base_lat": sp.dma_base_lat,
         "total_cycles": fields.get("total_cycles", ""),
         "verification_status": fields.get("verification_status", ""),
         "actual_mat_accels": fields.get("actual_mat_accels", ""),
         "actual_vec_accels": fields.get("actual_vec_accels", ""),
+        "slowest_worker_tid": fields.get("slowest_worker_tid", ""),
+        "mat_util_pct": fields.get("mat_util_pct", ""),
+        "vec_util_pct": fields.get("vec_util_pct", ""),
+        "mat_cycle_fraction_pct": fields.get("mat_cycle_fraction_pct", ""),
+        "vec_cycle_fraction_pct": fields.get("vec_cycle_fraction_pct", ""),
+        "dma_cycle_fraction_pct": fields.get("dma_cycle_fraction_pct", ""),
+        "scalar_cycle_fraction_pct": fields.get("scalar_cycle_fraction_pct", ""),
+        "stall_cycle_fraction_pct": fields.get("stall_cycle_fraction_pct", ""),
         "wall_seconds": f"{wall:.3f}",
         "build_ok": build_ok,
         "run_ok": fields.get("run_ok", 0),
@@ -549,7 +636,8 @@ def dry_run(
                 continue
             print(
                 f"    run: matmul_sim --threads {sp.threads} "
-                f"--gemm-m {sp.gemm_m} --gemm-k {sp.gemm_k} --gemm-n {sp.gemm_n}"
+                f"--gemm-m {sp.gemm_m} --gemm-k {sp.gemm_k} "
+                f"--gemm-n {sp.gemm_n} --dma-base-lat {sp.dma_base_lat}"
             )
             shown += 1
             if shown >= 6:

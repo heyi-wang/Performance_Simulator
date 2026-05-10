@@ -325,6 +325,43 @@ python kernel/matmul/plot_sweep.py \
     --output plots/gemm_shapes_vs_threads.png
 ```
 
+### Stacked bar — cycle breakdown
+
+`--bar` produces a stacked bar chart where every bar's height equals
+`total_cycles` and the bar is partitioned into the five `*_cycle_fraction_pct`
+categories (mat / vec / DMA / scalar / stall). Because the fractions sum to
+100 by construction, the segments stack exactly to the bar height.
+
+```bash
+python kernel/matmul/plot_sweep.py \
+    --input kernel/matmul/full_sweep.csv \
+    --bar --x <column> \
+    --filter <key=val,...> \
+    [--log-x] [--log-y] \
+    --output <path.png>
+```
+
+- One bar per unique value of `--x`. `--filter` must narrow the input so
+  every `--x` value maps to **exactly one row** — if two rows collide, the
+  script aborts with `--bar: multiple rows share <x>=<v>; narrow --filter
+  so each x maps to one row.`
+- `--group-by` is ignored in bar mode (would imply clustered bars; not
+  supported).
+- `--bar` and `--3d` are mutually exclusive.
+
+Example (one bar per `threads` value at fixed hardware / GEMM / DMA latency):
+
+```bash
+python kernel/matmul/plot_sweep.py \
+    --input kernel/matmul/full_sweep.csv \
+    --bar --x threads \
+    --filter tile_m=8,mat_count=1,dma_base_lat=8 \
+    --output kernel/matmul/demo_plots/demo_bar.png
+```
+
+Sample output: [demo_plots/demo_bar.png](demo_plots/demo_bar.png). Bar height
+= `total_cycles`; segment height = `total_cycles × fraction_pct / 100`.
+
 ### Drop failed rows
 
 ```bash
@@ -357,13 +394,20 @@ python kernel/matmul/plot_sweep.py \
     --group-by mat_count,dma_base_lat \
     --filter tile_m=8,gemm_m=128 \
     --output /tmp/smoke.png --log-x
+
+python kernel/matmul/plot_sweep.py \
+    --input kernel/matmul/full_sweep.csv \
+    --bar --x threads \
+    --filter tile_m=8,mat_count=1,dma_base_lat=8 \
+    --output /tmp/smoke_bar.png
 ```
 
 Expect: 8 CSV rows all `PASS`, every row's
 `mat_cycle_fraction_pct + vec_cycle_fraction_pct + dma_cycle_fraction_pct +
-scalar_cycle_fraction_pct + stall_cycle_fraction_pct == 100`, PNG rendered
-to `/tmp/smoke.png`, a second invocation of `full_sweep.py` prints
-`nothing to do`.
+scalar_cycle_fraction_pct + stall_cycle_fraction_pct == 100`, PNGs rendered
+to `/tmp/smoke.png` (2D) and `/tmp/smoke_bar.png` (stacked bar with 2 bars,
+each split into 5 categories), and a second invocation of `full_sweep.py`
+prints `nothing to do`.
 
 ## Notes
 
