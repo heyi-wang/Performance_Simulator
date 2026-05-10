@@ -33,19 +33,22 @@ From [config/hardware_config.h](../../config/hardware_config.h):
 
 | Phase | Mode | Cost per read DMA | Cost per write DMA | Source |
 |-------|------|-------------------|--------------------|--------|
-| Matmul (matrix tiles) | `MatRow` | `dma_a_rows × HW_DMA_A_ROW_SCALAR` | `dma_c_rows × HW_DMA_C_ROW_SCALAR` | one `dma.x` per matrix-tile row |
+| Matmul (matrix tiles) | `MatRow` | `HW_DMA_A_TILE_SCALAR` (per A tile DMA) | `dma_c_rows × HW_DMA_C_ROW_SCALAR` (one `dma.x` per C row) | A is one tile DMA; C still streams row-by-row |
 | Reduction / quantization (vector pipe) | `VecPerCall` | `HW_DMA_VEC_RD_SCALAR` | `HW_DMA_VEC_WR_SCALAR` | one DMA carries one vector-wide payload |
 
-The matmul phase additionally charges `dma_b_rows × HW_DMA_B_ROW_SCALAR`
-once per K-tile inside [worker.cpp](../../src/worker.cpp)
-(`issue_gemm_reuse_stream`).
+The matmul phase additionally charges `HW_DMA_B_TILE_SCALAR` once per K-tile
+inside [worker.cpp](../../src/worker.cpp) (`issue_gemm_reuse_stream`) for the
+single B-tile DMA. The per-tile load model is the canonical strategy for
+matrix-tile DMAs going forward (any future kernel modeling matrix-tile loads
+should reuse it rather than re-introducing per-row load accounting).
 
 Defaults in `hardware_config.h`:
-`HW_DMA_A_ROW_SCALAR=20`, `HW_DMA_B_ROW_SCALAR=50`, `HW_DMA_C_ROW_SCALAR=20`,
-`HW_DMA_VEC_RD_SCALAR=8`, `HW_DMA_VEC_WR_SCALAR=8`. All `#ifndef`-guarded.
+`HW_DMA_A_TILE_SCALAR=20`, `HW_DMA_B_TILE_SCALAR=20`, `HW_DMA_C_ROW_SCALAR=1`,
+`HW_DMA_VEC_RD_SCALAR=1`, `HW_DMA_VEC_WR_SCALAR=1`. All `#ifndef`-guarded.
 
-Workers receive both costs from [matmul_top.cpp](matmul_top.cpp) via
-`configure_dma_row_cost(...)` and `configure_dma_vec_cost(...)`.
+Workers receive these costs from [matmul_top.cpp](matmul_top.cpp) via
+`configure_dma_tile_load_cost(...)`, `configure_dma_c_row_cost(...)`, and
+`configure_dma_vec_cost(...)`.
 
 ## Communication model
 Unchanged from project baseline: TLM-2.0 non-blocking only;
@@ -95,6 +98,15 @@ Exit code 2 indicates verification or req-count mismatch.
 [sweep_workers.py](sweep_workers.py),
 [hardware_sweep.py](hardware_sweep.py) drive parameter sweeps via `-D`
 overrides on the compile line; results emitted as CSV.
+
+[full_sweep.py](full_sweep.py) covers the full eight-dimensional spec from
+[Parametric_Sweep.md](Parametric_Sweep.md): five compile-time dims
+(`MATMUL_M/K/N`, `MATMUL_ACC_CYCLE`, `MAT_ACCEL_COUNT`, `VEC_ACCEL_COUNT`,
+`VECTOR_ACC_CAP`) and three runtime dims (GEMM size, `--threads`,
+`--dma-base-lat`). The CSV stores every sweep dim as a column plus per-class
+cycle fractions (mat / vec / DMA / scalar / stall, summing to 100% on the
+critical-path worker) and pool-level utilization. See
+[Parametric_Sweep_HOWTO.md](Parametric_Sweep_HOWTO.md) for the runbook.
 
 ## Constraints
 - Do not change the simulator structure or modeling strategy unless

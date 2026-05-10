@@ -12,7 +12,7 @@ MatmulTop::MatmulTop(sc_module_name nm,
                      sc_event *done_event_)
     : sc_module(nm),
       cfg(cfg_),
-      vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap(), /*enable_unit_pipeline=*/true),
+      vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap(), /*enable_unit_pipeline=*/false),
       noc("noc"),
       memory("memory",
              cfg.l1_base_lat,
@@ -137,10 +137,15 @@ MatmulSimulationStats MatmulTop::collect_stats() const
     const uint64_t quant_rd_bytes = cfg.gemm_quant_rd_bytes();
     const uint64_t quant_wr_bytes = cfg.gemm_quant_wr_bytes();
 
+    const Worker *slowest = nullptr;
     for (const auto *w : workers)
     {
         stats.max_mat_elapsed = std::max(stats.max_mat_elapsed, w->mat_elapsed_cycles);
-        stats.total_elapsed = std::max(stats.total_elapsed, w->elapsed_cycles);
+        if (w->elapsed_cycles > stats.total_elapsed)
+        {
+            stats.total_elapsed = w->elapsed_cycles;
+            slowest = w;
+        }
         stats.total_worker_stall += w->stall_cycles;
     }
 
@@ -240,6 +245,45 @@ MatmulSimulationStats MatmulTop::collect_stats() const
             static_cast<double>(stats.vec_occupied_total) / vec_capacity * 100.0;
         stats.vec_compute_util =
             static_cast<double>(stats.vec_busy_total) / vec_capacity * 100.0;
+    }
+
+    if (slowest != nullptr && stats.total_elapsed > 0)
+    {
+        // Per-category cycle counts attributed to the critical-path worker.
+        // These can overlap on the wall-clock timeline when phases pipeline
+        // (e.g. scalar work runs while a mat request is in service), so the
+        // raw cycles sum may exceed total_elapsed. The fractions below are
+        // therefore normalized by the total categorized cycles, not by
+        // total_elapsed, so the five categories sum to exactly 100%.
+        const uint64_t mat_service =
+            slowest->mat_calls * slowest->mat_cycles;
+        const uint64_t vec_service = slowest->vec_service_cycles;
+        const uint64_t service_total = mat_service + vec_service;
+        const uint64_t scalar_cycles =
+            (slowest->compute_cycles >= service_total)
+                ? (slowest->compute_cycles - service_total)
+                : 0;
+        const uint64_t dma_cycles   = slowest->mem_cycles_accum;
+        const uint64_t stall_cycles = slowest->stall_cycles;
+
+        stats.slowest_worker_tid    = slowest->tid;
+        stats.slowest_mat_cycles    = mat_service;
+        stats.slowest_vec_cycles    = vec_service;
+        stats.slowest_dma_cycles    = dma_cycles;
+        stats.slowest_scalar_cycles = scalar_cycles;
+        stats.slowest_stall_cycles  = stall_cycles;
+
+        const uint64_t total_categorized =
+            mat_service + vec_service + dma_cycles + scalar_cycles + stall_cycles;
+        if (total_categorized > 0)
+        {
+            const double denom = static_cast<double>(total_categorized);
+            stats.mat_cycle_fraction    = mat_service    / denom * 100.0;
+            stats.vec_cycle_fraction    = vec_service    / denom * 100.0;
+            stats.dma_cycle_fraction    = dma_cycles     / denom * 100.0;
+            stats.scalar_cycle_fraction = scalar_cycles  / denom * 100.0;
+            stats.stall_cycle_fraction  = stall_cycles   / denom * 100.0;
+        }
     }
 
     stats.verification_passed =
@@ -426,6 +470,14 @@ void MatmulTop::print_report(std::ostream &os) const
         {"Throughput @ 1 GHz [GFLOPS]", report::fmt_double(stats.gflops)},
         {"Average Memory Bandwidth [bytes/cycle]", report::fmt_rate(stats.mem_bw, "bytes/cycle")},
         {"Post-Mat Stall Cycles [cycles]", report::fmt_u64(stats.coordinator_stall)},
+        {"Mat Pool Utilization [%]",  report::fmt_percent(stats.mat_compute_util)},
+        {"Vec Pool Utilization [%]",  report::fmt_percent(stats.vec_compute_util)},
+        {"Critical-Path Worker [tid]", report::fmt_int(stats.slowest_worker_tid)},
+        {"Mat Cycle Fraction [%]",    report::fmt_percent(stats.mat_cycle_fraction)},
+        {"Vec Cycle Fraction [%]",    report::fmt_percent(stats.vec_cycle_fraction)},
+        {"DMA Cycle Fraction [%]",    report::fmt_percent(stats.dma_cycle_fraction)},
+        {"Scalar Cycle Fraction [%]", report::fmt_percent(stats.scalar_cycle_fraction)},
+        {"Stall Cycle Fraction [%]",  report::fmt_percent(stats.stall_cycle_fraction)},
     });
 
     report::print_section_title(os, "Verification");

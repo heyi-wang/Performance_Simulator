@@ -1,13 +1,13 @@
 # Parametric Sweep — How to Run
 
-Practical guide for driving the 7-dimensional matmul sweep defined in
+Practical guide for driving the 8-dimensional matmul sweep defined in
 [Parametric_Sweep.md](Parametric_Sweep.md).
 
 ## Scripts
 
 | File | Purpose |
 | --- | --- |
-| [full_sweep.py](full_sweep.py)   | Runs the sweep: compiles one simulator binary per hardware point, executes each `(gemm_shape, threads)` run, streams rows into a CSV. |
+| [full_sweep.py](full_sweep.py)   | Runs the sweep: compiles one simulator binary per hardware point, executes each `(gemm_shape, threads, dma_base_lat)` run, streams rows into a CSV. |
 | [plot_sweep.py](plot_sweep.py)   | Reads the CSV, filters and groups rows, renders a PNG. |
 | [requirements.txt](requirements.txt) | Python deps (only `matplotlib`). |
 
@@ -22,8 +22,9 @@ Practical guide for driving the 7-dimensional matmul sweep defined in
 | `--vec-bytes`     | `16,32,64,128,256` | compile-time (`VECTOR_ACC_CAP`) |
 | `--gemm-shapes`   | `128x128x128, 1024x1024x1024, 1024x128x1024, 128x1024x128, 4096x4096x4096, 4096x1024x4096, 1024x4096x1024` | runtime CLI (`--gemm-m/k/n`) |
 | `--threads-list`  | `1,2,4,8,16,32,64` | runtime CLI (`--threads`) |
+| `--dma-base-lats` | `4,8,16,32` | runtime CLI (`--dma-base-lat`) — proxy for the spec's "L2 access latency", maps to `cfg.dma_base_lat`. |
 
-Full default grid = 4 × 6 × 4 × 4 × 5 × 7 × 7 = **94 080 points**, requiring
+Full default grid = 4 × 6 × 4 × 4 × 5 × 7 × 7 × 4 = **376 320 points**, requiring
 **1 920 rebuilds** (one per unique combination of the 5 compile-time dims).
 
 ## One-time setup
@@ -63,7 +64,7 @@ sample build/run commands.
 
 ### Resuming
 
-The CSV is keyed by the 11 parameter columns. Re-running with the same flags
+The CSV is keyed by the 12 parameter columns. Re-running with the same flags
 skips any row already present; only missing rows are computed.
 
 ```bash
@@ -86,8 +87,20 @@ python kernel/matmul/full_sweep.py \
     --mat-counts 4 \
     --vec-counts 4 \
     --vec-bytes 64 \
-    --gemm-shapes 1024x1024x1024
+    --gemm-shapes 1024x1024x1024 \
+    --dma-base-lats 8
 # threads-list defaults to 1,2,4,8,16,32,64
+```
+
+### DMA latency sweep (the L2 access latency dimension)
+
+```bash
+python kernel/matmul/full_sweep.py \
+    --tile-sizes 8x8x8 --mat-latencies 4 --mat-counts 4 \
+    --vec-counts 4 --vec-bytes 64 \
+    --gemm-shapes 1024x1024x1024 \
+    --threads-list 16 \
+    --dma-base-lats 4,8,16,32
 ```
 
 ### Two dimensions — e.g. vary matrix count × vector count at fixed everything else
@@ -137,16 +150,29 @@ metrics side by side:
 ```
 tile_m, tile_k, tile_n,
 mat_latency, mat_count, vec_count, vec_bytes,
-gemm_m, gemm_k, gemm_n, threads,
+gemm_m, gemm_k, gemm_n, threads, dma_base_lat,
 total_cycles, verification_status,
 actual_mat_accels, actual_vec_accels,
+slowest_worker_tid,
+mat_util_pct, vec_util_pct,
+mat_cycle_fraction_pct, vec_cycle_fraction_pct,
+dma_cycle_fraction_pct, scalar_cycle_fraction_pct,
+stall_cycle_fraction_pct,
 wall_seconds, build_ok, run_ok
 ```
 
-- The 11 leading columns are the **key**; `(key, metric)` pairs are what
+- The 12 leading columns are the **key**; `(key, metric)` pairs are what
   `plot_sweep.py` projects against.
 - `verification_status` is `PASS` when the simulator's golden check agrees
   with request counts.
+- `mat_util_pct` / `vec_util_pct` are pool-level accelerator utilization
+  (`busy / (elapsed × pool_size) × 100`).
+- `slowest_worker_tid` identifies the critical-path worker (the one whose
+  `elapsed_cycles == total_cycles`); the five `*_cycle_fraction_pct` columns
+  describe that worker's timeline. They sum to **100% by construction** — mat
+  service, scalar work, and DMA wait can overlap on the wall-clock timeline
+  due to pipelining, so the raw cycle counts are normalized by their sum
+  (not by `total_cycles`) and reported as proportions of categorized work.
 - `build_ok` / `run_ok` are `0`/`1`; filter on `build_ok=1,run_ok=1` when
   plotting to drop failed points.
 
@@ -309,7 +335,7 @@ Equivalent to adding `verification_status=PASS` to `--filter`.
 
 ## Smoke test (end-to-end sanity)
 
-4 points, ~1 s total — use this to check that the interface still works after
+8 points, ~2 s total — use this to check that the interface still works after
 touching any sweep code:
 
 ```bash
@@ -322,18 +348,22 @@ python kernel/matmul/full_sweep.py \
     --vec-counts 1 \
     --vec-bytes 64 \
     --gemm-shapes 128x128x128 \
-    --threads-list 1,4
+    --threads-list 1,4 \
+    --dma-base-lats 8,32
 
 python kernel/matmul/plot_sweep.py \
     --input kernel/matmul/full_sweep.csv \
     --x threads --y total_cycles \
-    --group-by mat_count \
+    --group-by mat_count,dma_base_lat \
     --filter tile_m=8,gemm_m=128 \
     --output /tmp/smoke.png --log-x
 ```
 
-Expect: 4 CSV rows all `PASS`, PNG rendered to `/tmp/smoke.png`, a second
-invocation of `full_sweep.py` prints `nothing to do`.
+Expect: 8 CSV rows all `PASS`, every row's
+`mat_cycle_fraction_pct + vec_cycle_fraction_pct + dma_cycle_fraction_pct +
+scalar_cycle_fraction_pct + stall_cycle_fraction_pct == 100`, PNG rendered
+to `/tmp/smoke.png`, a second invocation of `full_sweep.py` prints
+`nothing to do`.
 
 ## Notes
 

@@ -65,7 +65,7 @@ static const size_t HW_ACC_QUEUE_DEPTH = ACC_QUEUE_DEPTH;
 #define MATMUL_N 8
 #endif
 #ifndef MATMUL_ACC_CYCLE
-#define MATMUL_ACC_CYCLE 1
+#define MATMUL_ACC_CYCLE 8
 #endif
 
 // Vector accelerator throughput (in bytes per cycle) and timing.

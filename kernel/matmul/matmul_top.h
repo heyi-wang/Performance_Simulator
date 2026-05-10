@@ -236,6 +236,23 @@ struct MatmulSimulationStats
     double vec_compute_util = 0.0;
     double mem_bw = 0.0;
     bool verification_passed = false;
+
+    // Critical-path (slowest) worker breakdown. The five *_cycles fields
+    // partition that worker's elapsed timeline so the corresponding
+    // *_fraction fields sum to exactly 100.0%. The "stall" bucket absorbs
+    // any non-mat/vec/dma/scalar time (backpressure stalls, queue waits,
+    // scheduling gaps).
+    int      slowest_worker_tid       = -1;
+    uint64_t slowest_mat_cycles       = 0;
+    uint64_t slowest_vec_cycles       = 0;
+    uint64_t slowest_dma_cycles       = 0;
+    uint64_t slowest_scalar_cycles    = 0;
+    uint64_t slowest_stall_cycles     = 0;
+    double   mat_cycle_fraction       = 0.0;
+    double   vec_cycle_fraction       = 0.0;
+    double   dma_cycle_fraction       = 0.0;
+    double   scalar_cycle_fraction    = 0.0;
+    double   stall_cycle_fraction     = 0.0;
 };
 
 // ============================================================

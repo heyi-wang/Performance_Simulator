@@ -9,12 +9,14 @@ static bool parse_args(int argc,
                        int &thread_count,
                        uint64_t &gemm_m,
                        uint64_t &gemm_k,
-                       uint64_t &gemm_n)
+                       uint64_t &gemm_n,
+                       int64_t &dma_base_lat)
 {
     thread_count = MatmulConfig::default_thread_count;
     gemm_m = MatmulConfig::gemm_m;
     gemm_k = MatmulConfig::gemm_k;
     gemm_n = MatmulConfig::gemm_n;
+    dma_base_lat = -1;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -27,6 +29,15 @@ static bool parse_args(int argc,
                 return false;
             }
             thread_count = std::max(std::stoi(argv[++i]), 1);
+        }
+        else if (arg == "--dma-base-lat")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for --dma-base-lat\n";
+                return false;
+            }
+            dma_base_lat = std::max<int64_t>(std::stoll(argv[++i]), 0);
         }
         else if (arg == "--gemm-m")
         {
@@ -59,7 +70,8 @@ static bool parse_args(int argc,
         {
             std::cout << "Usage: " << argv[0]
                       << " [--threads N]"
-                      << " [--gemm-m M] [--gemm-k K] [--gemm-n N]\n";
+                      << " [--gemm-m M] [--gemm-k K] [--gemm-n N]"
+                      << " [--dma-base-lat N]\n";
             return false;
         }
         else
@@ -78,18 +90,22 @@ int sc_main(int argc, char *argv[])
     uint64_t gemm_m = MatmulConfig::gemm_m;
     uint64_t gemm_k = MatmulConfig::gemm_k;
     uint64_t gemm_n = MatmulConfig::gemm_n;
+    int64_t dma_base_lat = -1;
     if (!parse_args(argc,
                     argv,
                     thread_count,
                     gemm_m,
                     gemm_k,
-                    gemm_n))
+                    gemm_n,
+                    dma_base_lat))
         return (argc > 1) ? 1 : 0;
 
     MatmulRuntimeConfig cfg =
         MatmulRuntimeConfig::defaults(thread_count,
                                       MAT_ACCEL_COUNT,
                                       VEC_ACCEL_COUNT);
+    if (dma_base_lat >= 0)
+        cfg.dma_base_lat = static_cast<uint64_t>(dma_base_lat);
     cfg.workload_n = 1;
     cfg.workload_h = gemm_m;
     cfg.workload_w = 1;
