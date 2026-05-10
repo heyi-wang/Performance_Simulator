@@ -105,12 +105,9 @@ MatmulTop::MatmulTop(sc_module_name nm,
                                 cfg.gemm_tile_n(),
                                 cfg.local_tile_k_for_thread(i),
                                 MatmulRuntimeConfig::per_worker_register_count);
-        w->configure_dma_row_cost(MATMUL_M,
-                                  MATMUL_K,
-                                  MATMUL_M,
-                                  HW_DMA_A_ROW_SCALAR,
-                                  HW_DMA_B_ROW_SCALAR,
-                                  HW_DMA_C_ROW_SCALAR);
+        w->configure_dma_tile_load_cost(HW_DMA_A_TILE_SCALAR,
+                                        HW_DMA_B_TILE_SCALAR);
+        w->configure_dma_c_row_cost(MATMUL_M, HW_DMA_C_ROW_SCALAR);
         w->configure_dma_vec_cost(HW_DMA_VEC_RD_SCALAR, HW_DMA_VEC_WR_SCALAR);
         workers.push_back(w);
         if (post_processor)

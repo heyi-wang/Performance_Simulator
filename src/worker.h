@@ -20,9 +20,12 @@ struct WorkerPostProcessor
 };
 
 // Selects how `issue_stream` accounts for per-DMA scalar setup overhead.
-//   MatRow      — matmul phase: charge `dma_a_rows * dma_a_row_scalar` per
-//                 read DMA and `dma_c_rows * dma_c_row_scalar` per write
-//                 (one `dma.x` per matrix-tile row).
+//   MatRow      — matmul phase: A/B reads charge a single per-tile cost
+//                 (`dma_a_tile_scalar` / `dma_b_tile_scalar`); C writes
+//                 charge `dma_c_rows * dma_c_row_scalar` per DMA. The
+//                 per-tile load model is the project-wide strategy for
+//                 matrix-tile DMAs; B's tile-load cost is applied inside
+//                 `issue_gemm_reuse_stream`.
 //   VecPerCall  — reduction/quantization phase: each DMA carries one vector
 //                 worth of payload, so charge a single per-call cost from
 //                 `dma_vec_rd_scalar` / `dma_vec_wr_scalar`.
@@ -61,13 +64,14 @@ struct Worker : sc_module
     uint64_t gemm_k_tiles = 0;
     uint64_t accumulator_register_count = 1;
 
-    // Per-row scalar cost for DMA descriptor setup. When rows == 0 the cost
-    // is disabled, preserving behavior for kernels that don't model this.
-    uint64_t dma_a_rows        = 0;
-    uint64_t dma_b_rows        = 0;
+    // Per-tile scalar cost for matrix-tile DMA loads (A and B). A single
+    // `dma.x` carries the whole tile, so the cost is charged once per DMA.
+    // C-tile writes still emit one DMA per row; cost is charged per row.
+    // Defaults of 0 keep behavior unchanged for kernels that don't model
+    // this overhead.
+    uint64_t dma_a_tile_scalar = 0;
+    uint64_t dma_b_tile_scalar = 0;
     uint64_t dma_c_rows        = 0;
-    uint64_t dma_a_row_scalar  = 0;
-    uint64_t dma_b_row_scalar  = 0;
     uint64_t dma_c_row_scalar  = 0;
     // Per-DMA scalar cost for vector-pipe DMAs (reduction / quantization).
     uint64_t dma_vec_rd_scalar = 0;
@@ -211,12 +215,8 @@ struct Worker : sc_module
                               uint64_t n_tiles,
                               uint64_t k_tiles,
                               uint64_t accumulator_registers);
-    void configure_dma_row_cost(uint64_t a_rows,
-                                uint64_t b_rows,
-                                uint64_t c_rows,
-                                uint64_t a_row_cost,
-                                uint64_t b_row_cost,
-                                uint64_t c_row_cost);
+    void configure_dma_tile_load_cost(uint64_t a_tile_cost, uint64_t b_tile_cost);
+    void configure_dma_c_row_cost(uint64_t c_rows, uint64_t c_row_cost);
     void configure_dma_vec_cost(uint64_t rd_cost, uint64_t wr_cost);
     void issue_stream(uint64_t addr,
                       uint64_t call_count,

@@ -356,18 +356,16 @@ void Worker::configure_gemm_reuse(uint64_t m_tiles,
     accumulator_register_count = std::max<uint64_t>(accumulator_registers, 1);
 }
 
-void Worker::configure_dma_row_cost(uint64_t a_rows,
-                                    uint64_t b_rows,
-                                    uint64_t c_rows,
-                                    uint64_t a_row_cost,
-                                    uint64_t b_row_cost,
-                                    uint64_t c_row_cost)
+void Worker::configure_dma_tile_load_cost(uint64_t a_tile_cost,
+                                          uint64_t b_tile_cost)
 {
-    dma_a_rows       = a_rows;
-    dma_b_rows       = b_rows;
+    dma_a_tile_scalar = a_tile_cost;
+    dma_b_tile_scalar = b_tile_cost;
+}
+
+void Worker::configure_dma_c_row_cost(uint64_t c_rows, uint64_t c_row_cost)
+{
     dma_c_rows       = c_rows;
-    dma_a_row_scalar = a_row_cost;
-    dma_b_row_scalar = b_row_cost;
     dma_c_row_scalar = c_row_cost;
 }
 
@@ -416,8 +414,8 @@ void Worker::issue_stream(uint64_t addr,
         {
             if (dma_scalar_mode == DmaScalarMode::MatRow)
             {
-                if (dma_a_rows > 0 && dma_a_row_scalar > 0)
-                    do_scalar(dma_a_rows * dma_a_row_scalar);
+                if (dma_a_tile_scalar > 0)
+                    do_scalar(dma_a_tile_scalar);
             }
             else if (dma_vec_rd_scalar > 0)
             {
@@ -571,8 +569,8 @@ void Worker::issue_gemm_reuse_stream()
         {
             for (uint64_t kt = 0; kt < gemm_k_tiles; ++kt)
             {
-                if (dma_b_rows > 0 && dma_b_row_scalar > 0)
-                    do_scalar(dma_b_rows * dma_b_row_scalar);
+                if (dma_b_tile_scalar > 0)
+                    do_scalar(dma_b_tile_scalar);
                 DmaReq b_read = issue_dma_begin(false, B_bytes);
                 finish_dma(b_read);
 

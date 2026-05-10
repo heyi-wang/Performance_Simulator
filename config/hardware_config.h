@@ -83,7 +83,7 @@ static const uint64_t VECTOR_ACC_CYCLE = HW_VECTOR_INSN_CYCLE;
 
 // Scalar dispatch overhead per accelerator request.
 #ifndef MAT_SCALAR_OVERHEAD
-#define MAT_SCALAR_OVERHEAD 25
+#define MAT_SCALAR_OVERHEAD 10
 #endif
 #ifndef VEC_SCALAR_OVERHEAD
 #define VEC_SCALAR_OVERHEAD 8
@@ -92,22 +92,23 @@ static const uint64_t VECTOR_ACC_CYCLE = HW_VECTOR_INSN_CYCLE;
 static const uint64_t HW_MAT_SCALAR_OVERHEAD = MAT_SCALAR_OVERHEAD;
 static const uint64_t HW_VEC_SCALAR_OVERHEAD = VEC_SCALAR_OVERHEAD;
 
-// Per-row scalar instruction cost for DMA descriptor setup.
-// One `dma.x` per A/B/C row; values derived from the RISC-V codegen of
-// kernel/Conv2d.h (see kernel/test_conv2d_dwarf_o2.asm, 1 insn = 1 cycle).
-#ifndef DMA_A_ROW_SCALAR
-#define DMA_A_ROW_SCALAR 1
+// Scalar instruction cost for DMA descriptor setup of a matrix-tile load.
+// One `dma.x` carries the whole A or B tile in a single descriptor, so the
+// cost is charged once per tile DMA. C-tile writes still emit one DMA per
+// row, hence the per-row scalar below.
+#ifndef DMA_A_TILE_SCALAR
+#define DMA_A_TILE_SCALAR 2
 #endif
-#ifndef DMA_B_ROW_SCALAR
-#define DMA_B_ROW_SCALAR 1
+#ifndef DMA_B_TILE_SCALAR
+#define DMA_B_TILE_SCALAR 4
 #endif
 #ifndef DMA_C_ROW_SCALAR
-#define DMA_C_ROW_SCALAR 1
+#define DMA_C_ROW_SCALAR 3
 #endif
 
-static const uint64_t HW_DMA_A_ROW_SCALAR = DMA_A_ROW_SCALAR;
-static const uint64_t HW_DMA_B_ROW_SCALAR = DMA_B_ROW_SCALAR;
-static const uint64_t HW_DMA_C_ROW_SCALAR = DMA_C_ROW_SCALAR;
+static const uint64_t HW_DMA_A_TILE_SCALAR = DMA_A_TILE_SCALAR;
+static const uint64_t HW_DMA_B_TILE_SCALAR = DMA_B_TILE_SCALAR;
+static const uint64_t HW_DMA_C_ROW_SCALAR  = DMA_C_ROW_SCALAR;
 
 // Per-DMA scalar instruction cost for vector-pipe DMA loads/stores.
 // Used by the reduction/quantization phase, which streams one vector per DMA
