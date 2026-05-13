@@ -5,12 +5,15 @@ Run with:
 """
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
 import pandas as pd
+import plotly.colors as pcolors
 import plotly.graph_objects as go
 import streamlit as st
+from plotly.subplots import make_subplots
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CSV = REPO_ROOT / "kernel" / "matmul" / "full_sweep.csv"
@@ -23,7 +26,35 @@ STACK_SEGMENTS = [
     ("stall_cycle_fraction_pct",  "Stall",  "#d62728"),
 ]
 
+# Columns that are run output / status, not sweep parameters.
+# Mirrors the SWEEP_PARAM_COLUMNS / metric split in kernel/matmul/full_sweep.py.
+NON_PARAM_COLUMNS: set[str] = {
+    "verification_status",
+    "actual_mat_accels", "actual_vec_accels",
+    "slowest_worker_tid",
+    "build_ok", "run_ok",
+    "wall_seconds", "total_cycles",
+    "mat_util_pct", "vec_util_pct",
+    "mat_cycle_fraction_pct", "vec_cycle_fraction_pct",
+    "dma_cycle_fraction_pct", "scalar_cycle_fraction_pct",
+    "stall_cycle_fraction_pct",
+}
+
+QUALITATIVE_PALETTES = ["Plotly", "D3", "Set1", "Set2", "Pastel"]
+SEQUENTIAL_PALETTES = ["Viridis", "Plasma", "Blues"]
+ALL_PALETTES = QUALITATIVE_PALETTES + SEQUENTIAL_PALETTES
+
+TEMPLATES = [
+    "plotly", "plotly_white", "plotly_dark", "ggplot2",
+    "seaborn", "simple_white", "none",
+]
+
+DASH_STYLES = ["solid", "dot", "dash", "longdash", "dashdot", "longdashdot"]
+
 NONE_LABEL = "(none)"
+
+
+# --------------------------------------------------------------------- helpers
 
 
 @st.cache_data(show_spinner=False)
@@ -40,73 +71,130 @@ def _axis_type(use_log: bool) -> str:
     return "log" if use_log else "linear"
 
 
-def _apply_layout(fig: go.Figure, title: str, xlabel: str | None,
-                  ylabel: str | None, x_default: str, y_default: str,
-                  logx: bool, logy: bool) -> None:
+def _to_hex(color: str) -> str:
+    if color.startswith("#"):
+        return color.lower()
+    if color.startswith("rgb"):
+        nums = color[color.find("(") + 1: color.find(")")].split(",")
+        r, g, b = (max(0, min(255, int(round(float(n))))) for n in nums[:3])
+        return f"#{r:02x}{g:02x}{b:02x}"
+    return color
+
+
+def palette_colors(name: str, n: int) -> list[str]:
+    if n <= 0:
+        return []
+    if name in QUALITATIVE_PALETTES:
+        seq = getattr(pcolors.qualitative, name)
+        return [_to_hex(seq[i % len(seq)]) for i in range(n)]
+    if name in SEQUENTIAL_PALETTES:
+        if n == 1:
+            samples = [0.5]
+        else:
+            samples = [i / (n - 1) for i in range(n)]
+        return [_to_hex(c) for c in pcolors.sample_colorscale(name, samples)]
+    return [_to_hex(pcolors.qualitative.Plotly[i % 10]) for i in range(n)]
+
+
+def _style_for(styles: dict | None, key, fallback_label: str,
+               fallback_color: str) -> dict:
+    s = (styles or {}).get(key, {})
+    return {
+        "label": s.get("label") or fallback_label,
+        "color": s.get("color") or fallback_color,
+        "dash":  s.get("dash") or "solid",
+    }
+
+
+def _apply_2d_layout(fig: go.Figure, title: str, xlabel: str, ylabel: str,
+                     x: str, y: str, logx: bool, logy: bool,
+                     template: str) -> None:
     fig.update_layout(
+        template=template,
         title=title or None,
-        xaxis=dict(title=xlabel or x_default, type=_axis_type(logx)),
-        yaxis=dict(title=ylabel or y_default, type=_axis_type(logy)),
+        xaxis=dict(title=xlabel or x, type=_axis_type(logx)),
+        yaxis=dict(title=ylabel or y, type=_axis_type(logy)),
         margin=dict(l=40, r=20, t=50 if title else 30, b=40),
     )
 
 
-def build_scatter_2d(df: pd.DataFrame, x: str, y: str,
-                     logx: bool, logy: bool, series: str | None,
+# --------------------------------------------------------------------- builders
+
+
+def build_scatter_2d(df: pd.DataFrame, x: str, y: str, logx: bool, logy: bool,
+                     series: str | None, *, styles: dict | None = None,
+                     palette: str = "Plotly", template: str = "plotly",
                      title: str = "", xlabel: str = "", ylabel: str = "",
                      ) -> go.Figure:
     fig = go.Figure()
     if series is None:
+        st_ = _style_for(styles, "__single__", y, palette_colors(palette, 1)[0])
         fig.add_trace(go.Scatter(
             x=df[x], y=df[y], mode="markers",
-            marker=dict(size=8, opacity=0.8),
+            name=st_["label"],
+            marker=dict(size=8, opacity=0.85, color=st_["color"]),
             hovertemplate=f"{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>",
             showlegend=False,
         ))
     else:
-        for value, sub in df.groupby(series, sort=True):
+        values = sorted(df[series].dropna().unique())
+        colors = palette_colors(palette, len(values))
+        for i, value in enumerate(values):
+            sub = df[df[series] == value]
+            default_label = f"{series}={value}"
+            st_ = _style_for(styles, value, default_label, colors[i])
             fig.add_trace(go.Scatter(
                 x=sub[x], y=sub[y], mode="markers",
-                marker=dict(size=8, opacity=0.85),
-                name=f"{series}={value}",
+                name=st_["label"],
+                marker=dict(size=8, opacity=0.85, color=st_["color"]),
                 hovertemplate=(
-                    f"{series}={value}<br>{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>"
+                    f"{st_['label']}<br>{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>"
                 ),
             ))
-    _apply_layout(fig, title, xlabel, ylabel, x, y, logx, logy)
+    _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template)
     return fig
 
 
-def build_line_2d(df: pd.DataFrame, x: str, y: str,
-                  logx: bool, logy: bool, series: str | None,
+def build_line_2d(df: pd.DataFrame, x: str, y: str, logx: bool, logy: bool,
+                  series: str | None, *, styles: dict | None = None,
+                  palette: str = "Plotly", template: str = "plotly",
                   title: str = "", xlabel: str = "", ylabel: str = "",
                   ) -> go.Figure:
     fig = go.Figure()
     if series is None:
         sub = df.sort_values(x)
+        st_ = _style_for(styles, "__single__", y, palette_colors(palette, 1)[0])
         fig.add_trace(go.Scatter(
             x=sub[x], y=sub[y], mode="lines+markers",
-            marker=dict(size=7),
+            name=st_["label"],
+            line=dict(color=st_["color"], dash=st_["dash"]),
+            marker=dict(size=7, color=st_["color"]),
             hovertemplate=f"{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>",
             showlegend=False,
         ))
     else:
-        for value, sub in df.groupby(series, sort=True):
-            sub = sub.sort_values(x)
+        values = sorted(df[series].dropna().unique())
+        colors = palette_colors(palette, len(values))
+        for i, value in enumerate(values):
+            sub = df[df[series] == value].sort_values(x)
+            default_label = f"{series}={value}"
+            st_ = _style_for(styles, value, default_label, colors[i])
             fig.add_trace(go.Scatter(
                 x=sub[x], y=sub[y], mode="lines+markers",
-                marker=dict(size=7),
-                name=f"{series}={value}",
+                name=st_["label"],
+                line=dict(color=st_["color"], dash=st_["dash"]),
+                marker=dict(size=7, color=st_["color"]),
                 hovertemplate=(
-                    f"{series}={value}<br>{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>"
+                    f"{st_['label']}<br>{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>"
                 ),
             ))
-    _apply_layout(fig, title, xlabel, ylabel, x, y, logx, logy)
+    _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template)
     return fig
 
 
 def build_scatter_3d(df: pd.DataFrame, x: str, y: str, z: str,
-                     logx: bool, logy: bool, logz: bool,
+                     logx: bool, logy: bool, logz: bool, *,
+                     template: str = "plotly",
                      title: str = "", xlabel: str = "", ylabel: str = "",
                      zlabel: str = "") -> go.Figure:
     fig = go.Figure(
@@ -119,6 +207,7 @@ def build_scatter_3d(df: pd.DataFrame, x: str, y: str, z: str,
         )
     )
     fig.update_layout(
+        template=template,
         title=title or None,
         scene=dict(
             xaxis=dict(title=xlabel or x, type=_axis_type(logx)),
@@ -130,7 +219,9 @@ def build_scatter_3d(df: pd.DataFrame, x: str, y: str, z: str,
     return fig
 
 
-def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool,
+def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
+                      styles: dict | None = None,
+                      palette: str = "Plotly", template: str = "plotly",
                       title: str = "", xlabel: str = "", ylabel: str = "",
                       ) -> go.Figure:
     needed = [col for col, _, _ in STACK_SEGMENTS] + ["total_cycles"]
@@ -153,18 +244,27 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool,
         grouped_rows.append(row)
     agg = pd.DataFrame(grouped_rows)
 
+    # Palette overrides the hardcoded segment colors when user changes from Plotly.
+    if palette == "Plotly":
+        seg_defaults = [c for _, _, c in STACK_SEGMENTS]
+    else:
+        seg_defaults = palette_colors(palette, len(STACK_SEGMENTS))
+
     fig = go.Figure()
-    for col, label, color in STACK_SEGMENTS:
+    for (col, label, _), default_color in zip(STACK_SEGMENTS, seg_defaults):
+        st_ = _style_for(styles, label, label, default_color)
         seg_height = agg["total_cycles"] * agg[col] / 100.0
         fig.add_trace(go.Bar(
-            x=agg[x], y=seg_height, name=label, marker_color=color,
+            x=agg[x], y=seg_height,
+            name=st_["label"], marker_color=st_["color"],
             customdata=agg[col],
             hovertemplate=(
-                f"{x}: %{{x}}<br>{label}: %{{y:.0f}} cycles "
+                f"{x}: %{{x}}<br>{st_['label']}: %{{y:.0f}} cycles "
                 "(%{customdata:.1f}%)<extra></extra>"
             ),
         ))
     fig.update_layout(
+        template=template,
         title=title or None,
         barmode="stack",
         xaxis=dict(title=xlabel or x, type=_axis_type(logx)),
@@ -175,15 +275,13 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool,
     return fig
 
 
-def fixed_params(df: pd.DataFrame, exclude: set[str]) -> str:
-    """Format columns whose values are constant across the DataFrame.
+# ---------------------------------------------------------------- fixed params
 
-    Mirrors collect_fixed_dims() in kernel/matmul/plot_sweep.py: collapses
-    tile_m/k/n into 'tile=MxKxN' and gemm_m/k/n into 'gemm=MxKxN'.
-    """
+
+def fixed_params(df: pd.DataFrame, exclude: set[str]) -> str:
     fixed: dict[str, object] = {}
     for col in df.columns:
-        if col in exclude:
+        if col in exclude or col in NON_PARAM_COLUMNS:
             continue
         try:
             if df[col].nunique(dropna=True) == 1:
@@ -191,7 +289,6 @@ def fixed_params(df: pd.DataFrame, exclude: set[str]) -> str:
                 if not vals.empty:
                     fixed[col] = vals.iloc[0]
         except TypeError:
-            # Unhashable column values (rare) — skip rather than crash.
             continue
 
     parts: list[str] = []
@@ -208,12 +305,129 @@ def fixed_params(df: pd.DataFrame, exclude: set[str]) -> str:
     return "  ·  ".join(parts)
 
 
-def _series_choice(df: pd.DataFrame) -> str | None:
-    pick = st.selectbox(
-        "Series column", [NONE_LABEL] + list(df.columns), index=0,
-        help="Group rows by this column; one curve per unique value.",
+# ------------------------------------------------------------------- facet wrap
+
+
+def render_facet(df: pd.DataFrame, facet_col: str, builder_fn,
+                 template: str, title: str,
+                 xlabel: str, ylabel: str, x: str, y: str | None,
+                 logx: bool, logy: bool) -> go.Figure:
+    values = sorted(df[facet_col].dropna().unique())
+    n = len(values)
+    ncols = max(1, math.ceil(math.sqrt(n)))
+    nrows = max(1, math.ceil(n / ncols))
+    titles = [f"{facet_col}={v}" for v in values]
+
+    fig = make_subplots(
+        rows=nrows, cols=ncols, subplot_titles=titles,
+        shared_xaxes=True, shared_yaxes=True,
     )
-    return None if pick == NONE_LABEL else pick
+    seen_legend = set()
+    for i, v in enumerate(values):
+        r = i // ncols + 1
+        c = i % ncols + 1
+        try:
+            sub_fig = builder_fn(df[df[facet_col] == v])
+        except ValueError as exc:
+            st.warning(f"facet {facet_col}={v}: {exc}")
+            continue
+        for tr in sub_fig.data:
+            name = tr.name or "trace"
+            if name in seen_legend:
+                tr.showlegend = False
+            else:
+                seen_legend.add(name)
+                tr.showlegend = True
+            tr.legendgroup = name
+            fig.add_trace(tr, row=r, col=c)
+        # Carry barmode forward if we're stacking bars.
+        if sub_fig.layout.barmode:
+            fig.update_layout(barmode=sub_fig.layout.barmode)
+
+    fig.update_layout(
+        template=template,
+        title=title or None,
+        margin=dict(l=40, r=20, t=70 if title else 50, b=40),
+    )
+    fig.update_xaxes(type=_axis_type(logx), title_text=xlabel or x)
+    if y is not None:
+        fig.update_yaxes(type=_axis_type(logy), title_text=ylabel or y)
+    return fig
+
+
+# ------------------------------------------------------------ style expander UI
+
+
+def _style_key_suffix(plot_type: str, series: str | None, facet: str | None) -> str:
+    return f"{plot_type}|{series or '-'}|{facet or '-'}"
+
+
+def render_style_expander(plot_type: str, df: pd.DataFrame,
+                          series: str | None, palette: str,
+                          facet: str | None,
+                          line_dash: bool) -> dict:
+    """Render per-trace style overrides above the chart.
+
+    Returns a dict {trace_key: {"label", "color", "dash"}}.
+    """
+    suffix = _style_key_suffix(plot_type, series, facet)
+    styles: dict = {}
+
+    if plot_type == "Stacked bar":
+        if palette == "Plotly":
+            default_colors = [c for _, _, c in STACK_SEGMENTS]
+        else:
+            default_colors = palette_colors(palette, len(STACK_SEGMENTS))
+        keys = [label for _, label, _ in STACK_SEGMENTS]
+        defaults = list(zip(keys, keys, default_colors))
+    elif plot_type in ("2D scatter", "2D line"):
+        if series is None:
+            keys = ["__single__"]
+            defaults = [("__single__", "trace", palette_colors(palette, 1)[0])]
+        else:
+            values = sorted(df[series].dropna().unique())
+            colors = palette_colors(palette, len(values))
+            keys = list(values)
+            defaults = [(v, f"{series}={v}", colors[i])
+                        for i, v in enumerate(values)]
+    else:
+        return styles  # 3D: not supported in v3
+
+    with st.expander("Style per series", expanded=False):
+        if line_dash:
+            header = st.columns([2, 1, 1])
+            header[0].markdown("**Legend**")
+            header[1].markdown("**Color**")
+            header[2].markdown("**Line**")
+        else:
+            header = st.columns([2, 1])
+            header[0].markdown("**Legend**")
+            header[1].markdown("**Color**")
+        for key, default_label, default_color in defaults:
+            if line_dash:
+                cols = st.columns([2, 1, 1])
+            else:
+                cols = st.columns([2, 1])
+            label_in = cols[0].text_input(
+                "label", value=default_label, label_visibility="collapsed",
+                key=f"label_{suffix}_{key}",
+            )
+            color_in = cols[1].color_picker(
+                "color", value=default_color, label_visibility="collapsed",
+                key=f"color_{suffix}_{key}",
+            )
+            dash_in = "solid"
+            if line_dash:
+                dash_in = cols[2].selectbox(
+                    "dash", DASH_STYLES, index=0,
+                    label_visibility="collapsed",
+                    key=f"dash_{suffix}_{key}",
+                )
+            styles[key] = {"label": label_in, "color": color_in, "dash": dash_in}
+    return styles
+
+
+# ----------------------------------------------------------------------- main
 
 
 def main() -> None:
@@ -223,7 +437,6 @@ def main() -> None:
     with st.sidebar:
         st.header("Data")
         csv_path = st.text_input("CSV path", value=str(DEFAULT_CSV))
-
         if not os.path.exists(csv_path):
             st.error(f"CSV not found: {csv_path}")
             return
@@ -241,7 +454,7 @@ def main() -> None:
             index=0,
         )
 
-        cols = list(df.columns)
+        cols_all = list(df.columns)
         num_cols = numeric_columns(df)
 
         def _default(name: str, pool: list[str]) -> int:
@@ -254,12 +467,13 @@ def main() -> None:
         logx = logy = logz = False
 
         if plot_type in ("2D scatter", "2D line"):
-            x = st.selectbox("X column", cols, index=_default("threads", cols))
+            x = st.selectbox("X column", cols_all, index=_default("threads", cols_all))
             y = st.selectbox("Y column", num_cols,
                              index=_default("total_cycles", num_cols))
             logx = st.checkbox("log X", value=False)
             logy = st.checkbox("log Y", value=False)
-            series = _series_choice(df)
+            pick = st.selectbox("Series column", [NONE_LABEL] + cols_all, index=0)
+            series = None if pick == NONE_LABEL else pick
             used = {x, y}
             if series:
                 used.add(series)
@@ -275,9 +489,8 @@ def main() -> None:
             logz = st.checkbox("log Z", value=False)
             used = {x, y, z}
         else:  # Stacked bar
-            x = st.selectbox("X column", cols, index=_default("threads", cols))
+            x = st.selectbox("X column", cols_all, index=_default("threads", cols_all))
             logx = st.checkbox("log X", value=False)
-            # Stacked bar consumes the five fraction columns + total_cycles.
             used = {x, "total_cycles"} | {c for c, _, _ in STACK_SEGMENTS}
 
         st.header("Labels")
@@ -288,23 +501,86 @@ def main() -> None:
         if plot_type == "3D scatter":
             zlabel = st.text_input("Z axis label", value="")
 
+        st.header("Style")
+        template = st.selectbox("Plot style", TEMPLATES, index=0)
+        palette = st.selectbox("Color palette", ALL_PALETTES, index=0)
+        facet_pick = st.selectbox("Facet column", [NONE_LABEL] + cols_all, index=0)
+        facet = None if facet_pick == NONE_LABEL else facet_pick
+
+    # Style expander (main panel).
+    styles: dict = {}
+    if plot_type != "3D scatter":
+        styles = render_style_expander(
+            plot_type, df, series, palette, facet,
+            line_dash=(plot_type == "2D line"),
+        )
+
+    # Facet caveat for 3D.
+    if facet and plot_type == "3D scatter":
+        st.info("Facet is not supported for 3D scatter; rendering single chart.")
+        facet = None
+    if facet:
+        used.add(facet)
+
+    # Build figure.
     if plot_type == "2D scatter":
-        fig = build_scatter_2d(df, x, y, logx, logy, series,
-                               title=title, xlabel=xlabel, ylabel=ylabel)
+        def _build(d: pd.DataFrame) -> go.Figure:
+            return build_scatter_2d(
+                d, x, y, logx, logy, series,
+                styles=styles, palette=palette, template=template,
+                title="", xlabel=xlabel, ylabel=ylabel,
+            )
+        if facet:
+            fig = render_facet(df, facet, _build, template, title,
+                               xlabel, ylabel, x, y, logx, logy)
+        else:
+            fig = build_scatter_2d(
+                df, x, y, logx, logy, series,
+                styles=styles, palette=palette, template=template,
+                title=title, xlabel=xlabel, ylabel=ylabel,
+            )
     elif plot_type == "2D line":
-        fig = build_line_2d(df, x, y, logx, logy, series,
-                            title=title, xlabel=xlabel, ylabel=ylabel)
+        def _build(d: pd.DataFrame) -> go.Figure:
+            return build_line_2d(
+                d, x, y, logx, logy, series,
+                styles=styles, palette=palette, template=template,
+                title="", xlabel=xlabel, ylabel=ylabel,
+            )
+        if facet:
+            fig = render_facet(df, facet, _build, template, title,
+                               xlabel, ylabel, x, y, logx, logy)
+        else:
+            fig = build_line_2d(
+                df, x, y, logx, logy, series,
+                styles=styles, palette=palette, template=template,
+                title=title, xlabel=xlabel, ylabel=ylabel,
+            )
     elif plot_type == "3D scatter":
-        fig = build_scatter_3d(df, x, y, z, logx, logy, logz,
-                               title=title, xlabel=xlabel, ylabel=ylabel,
-                               zlabel=zlabel)
-    else:
-        try:
-            fig = build_stacked_bar(df, x, logx,
-                                    title=title, xlabel=xlabel, ylabel=ylabel)
-        except ValueError as exc:
-            st.error(str(exc))
-            return
+        fig = build_scatter_3d(
+            df, x, y, z, logx, logy, logz,
+            template=template, title=title,
+            xlabel=xlabel, ylabel=ylabel, zlabel=zlabel,
+        )
+    else:  # Stacked bar
+        def _build(d: pd.DataFrame) -> go.Figure:
+            return build_stacked_bar(
+                d, x, logx, styles=styles, palette=palette,
+                template=template, title="",
+                xlabel=xlabel, ylabel=ylabel,
+            )
+        if facet:
+            fig = render_facet(df, facet, _build, template, title,
+                               xlabel, ylabel, x, "total_cycles", logx, False)
+        else:
+            try:
+                fig = build_stacked_bar(
+                    df, x, logx, styles=styles, palette=palette,
+                    template=template, title=title,
+                    xlabel=xlabel, ylabel=ylabel,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
+                return
 
     st.plotly_chart(fig, use_container_width=True)
     fixed_text = fixed_params(df, used)

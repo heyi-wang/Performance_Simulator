@@ -84,3 +84,45 @@ All four v2 requirements landed in [app.py](app.py); README updated.
   in v2).
 - Per-column filter widgets.
 - Multi-CSV overlay, figure export, axis-range presets.
+
+# Requirements for v3
+- Allow user to choose color for individual line/point
+- Allow user to assign a similar color to groups
+- Allow user to choose line style.
+- Allow user to set a style of the whole plot 
+- Allow editing legend text in-place.
+- Allow subplot (multiple small charts on one page)
+
+## Status (v3 — implemented)
+
+All six v3 requirements landed in [app.py](app.py); README updated; the
+v2 "Fixed" annotation bug (output/status columns leaking in) is fixed in
+the same commit via a `NON_PARAM_COLUMNS` exclusion set.
+
+### Added in v3
+- **Plot style** sidebar selector — Plotly templates (`plotly`,
+  `plotly_white`, `plotly_dark`, `ggplot2`, `seaborn`, `simple_white`, `none`).
+- **Color palette** sidebar selector — qualitative (`Plotly`, `D3`, `Set1`,
+  `Set2`, `Pastel`) and sequential (`Viridis`, `Plasma`, `Blues`) palettes.
+  Sequential palettes are evenly sampled via `plotly.colors.sample_colorscale`.
+  Drives the default per-trace color, including stacked-bar segments
+  (preserves historical mat/vec/dma/scalar/stall colors at `palette=Plotly`).
+- **Per-series style expander** — above the chart, one row per trace with
+  legend-text override, color picker, and (2D line only) dash style.
+  Keys include plot-type / series / facet so overrides survive unrelated
+  re-renders and reset on context switches.
+- **Facet column** — splits the chart into a subplot grid (one panel per
+  unique value). Supports 2D scatter / 2D line / Stacked bar; 3D shows an
+  `st.info` and falls back to a single chart. Shared X/Y axes; legend
+  deduplicated across panels via `legendgroup`.
+- **NON_PARAM_COLUMNS** filter applied inside `fixed_params` so the
+  `Fixed: …` caption no longer lists `verification_status`,
+  `actual_mat_accels`, `actual_vec_accels`, `slowest_worker_tid`,
+  `build_ok`, `run_ok`, `wall_seconds`, or any metric/utilization column —
+  only true sweep parameters.
+
+### Still deferred
+- Full hue / brightness / style / marker group-by (only single-axis Series
+  + facet today).
+- Per-column filter widgets.
+- Multi-CSV overlay, figure export, custom palettes.

@@ -42,6 +42,24 @@ All controls live in the left sidebar.
 | **Series column** (2D only) | Pick a column to group rows into separate curves. `(none)` = one curve. Otherwise one trace per unique value of the chosen column, labeled in the legend as `<col>=<value>`. In `2D line` each group is sorted by X before connecting. |
 | **Plot title** | Optional figure title. Empty = no title. |
 | **X / Y / Z axis label** | Override the default axis label (which is the column name). Empty = use the column name. The Z input only appears in 3D mode. |
+| **Plot style** | Overall theme: `plotly`, `plotly_white`, `plotly_dark`, `ggplot2`, `seaborn`, `simple_white`, `none`. |
+| **Color palette** | Default colors for every trace. Qualitative: `Plotly`, `D3`, `Set1`, `Set2`, `Pastel`. Sequential (sampled evenly): `Viridis`, `Plasma`, `Blues`. Stacked-bar segments use the palette only when changed from `Plotly` (the default keeps the historical mat/vec/dma/scalar/stall colors). Individual colors can still be overridden in the **Style per series** panel. |
+| **Facet column** | Split the chart into one subplot per unique value of the chosen column. Supported in `2D scatter`, `2D line`, and `Stacked bar`. Shared X and Y axes; legend rendered once across all panels. Not supported in `3D scatter`. |
+
+### Style per series
+
+An expander **"Style per series"** sits above the chart whenever the active
+mode has multiple traces (2D scatter / 2D line with a Series column,
+2D scatter / 2D line without one, Stacked bar). Each row exposes:
+
+- **Legend** — edit the trace's legend label in place (overrides
+  `<series>=<value>` or the stacked-bar segment name).
+- **Color** — color picker; default is the palette color for that index.
+- **Line** (2D line only) — `solid / dot / dash / longdash / dashdot / longdashdot`.
+
+Overrides are keyed on `(plot type, series column, facet column, trace key)`
+so they persist when you toggle unrelated controls but reset when you
+switch the series or plot type.
 
 Below the chart, a `Fixed: …` caption auto-lists columns whose values are
 constant across the loaded data (excluding the axes / series you're currently
