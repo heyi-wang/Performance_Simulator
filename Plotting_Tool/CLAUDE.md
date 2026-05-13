@@ -52,3 +52,35 @@ cd Plotting_Tool
 pip install -r requirements.txt
 streamlit run app.py
 ```
+
+# Requirements for v2
+- Add **2D Line Chart** to plot type
+- Add legend to the chart that labels the meaning of each curve
+- Allow user to edit the name of axis and the title of the plot
+- Show the fixed parameters and their values while plotting variables
+
+## Status (v2 — implemented)
+
+All four v2 requirements landed in [app.py](app.py); README updated.
+
+### Added in v2
+- **2D Line plot type** (`build_line_2d`): `mode="lines+markers"`, rows
+  sorted by X per series so the line is monotonic.
+- **Series column selector** (2D scatter + 2D line). `(none)` = single trace
+  (v1 behavior); otherwise one trace per unique value of the chosen column.
+  Trace names `<col>=<value>` produce the Plotly legend automatically.
+- **Editable title and axis labels**: sidebar text inputs `Plot title`,
+  `X axis label`, `Y axis label`, `Z axis label` (Z only in 3D). Empty
+  string falls back to the column name (and no title).
+- **Fixed-parameter caption**: `fixed_params(df, exclude)` returns columns
+  whose `nunique() == 1`, excluding any column used as X / Y / Z / Series.
+  Reuses the `tile_m/k/n → tile=MxKxN` and `gemm_m/k/n → gemm=MxKxN`
+  triple-collapsing from
+  [`collect_fixed_dims`](../kernel/matmul/plot_sweep.py) so the annotation
+  matches the matplotlib-side convention.
+
+### Still deferred
+- Full hue / brightness / style / marker group-by (only single-axis Series
+  in v2).
+- Per-column filter widgets.
+- Multi-CSV overlay, figure export, axis-range presets.

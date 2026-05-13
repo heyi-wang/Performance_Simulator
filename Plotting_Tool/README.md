@@ -36,9 +36,17 @@ All controls live in the left sidebar.
 | Control | Effect |
 |---|---|
 | **CSV path** | Path to the sweep CSV. Defaults to `kernel/matmul/full_sweep.csv` relative to the repo root. Change it to point at any other sweep CSV; dropdowns auto-populate from that file's columns. The file is re-read whenever its modification time changes. |
-| **Type** | `2D scatter`, `3D scatter`, or `Stacked bar`. |
+| **Type** | `2D scatter`, `2D line`, `3D scatter`, or `Stacked bar`. |
 | **X / Y / Z column** | Pick any column for each axis. In 2D the Y selector is restricted to numeric columns; in 3D all three are. In stacked-bar mode only X is selectable (bar height and segments are fixed by schema, see below). |
 | **log X / log Y / log Z** | Toggle each axis between linear and log scale. |
+| **Series column** (2D only) | Pick a column to group rows into separate curves. `(none)` = one curve. Otherwise one trace per unique value of the chosen column, labeled in the legend as `<col>=<value>`. In `2D line` each group is sorted by X before connecting. |
+| **Plot title** | Optional figure title. Empty = no title. |
+| **X / Y / Z axis label** | Override the default axis label (which is the column name). Empty = use the column name. The Z input only appears in 3D mode. |
+
+Below the chart, a `Fixed: …` caption auto-lists columns whose values are
+constant across the loaded data (excluding the axes / series you're currently
+plotting), matching the annotation style of
+[`kernel/matmul/plot_sweep.py`](../kernel/matmul/plot_sweep.py).
 
 ### Stacked-bar mode
 
@@ -65,6 +73,6 @@ streamlit run Plotting_Tool/app.py
 
 In the browser:
 - Set CSV path to `kernel/matmul/full_sweep.csv`.
-- Pick `2D scatter`, X = `threads`, Y = `total_cycles`, enable log Y → scaling curve.
+- Pick `2D line`, X = `threads`, Y = `total_cycles`, Series = `mat_count`, enable log Y → one curve per `mat_count` value with a legend.
 - Switch to `Stacked bar`, X = `threads` → cycle-budget breakdown per thread count.
 - Switch to `3D scatter`, X = `threads`, Y = `mat_count`, Z = `total_cycles` → rotate to explore.
