@@ -124,5 +124,13 @@ the same commit via a `NON_PARAM_COLUMNS` exclusion set.
 ### Still deferred
 - Full hue / brightness / style / marker group-by (only single-axis Series
   + facet today).
-- Per-column filter widgets.
 - Multi-CSV overlay, figure export, custom palettes.
+
+### Follow-up patch: Fix values
+After v3 landed, a sidebar **Fix values** section was added: any sweep
+parameter column not used as X / Y / Z / Series / Facet that has more
+than one CSV value gets a dropdown defaulting to its first concrete
+value. This prevents collisions on the chart (multiple rows mapping to
+the same X+Series). `(none)` keeps the dimension free. Filters are
+applied before plotting; `fixed_params` then naturally shows the pinned
+values in the `Fixed:` caption.

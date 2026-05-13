@@ -45,6 +45,7 @@ All controls live in the left sidebar.
 | **Plot style** | Overall theme: `plotly`, `plotly_white`, `plotly_dark`, `ggplot2`, `seaborn`, `simple_white`, `none`. |
 | **Color palette** | Default colors for every trace. Qualitative: `Plotly`, `D3`, `Set1`, `Set2`, `Pastel`. Sequential (sampled evenly): `Viridis`, `Plasma`, `Blues`. Stacked-bar segments use the palette only when changed from `Plotly` (the default keeps the historical mat/vec/dma/scalar/stall colors). Individual colors can still be overridden in the **Style per series** panel. |
 | **Facet column** | Split the chart into one subplot per unique value of the chosen column. Supported in `2D scatter`, `2D line`, and `Stacked bar`. Shared X and Y axes; legend rendered once across all panels. Not supported in `3D scatter`. |
+| **Fix values** | One dropdown per sweep parameter that isn't being used as X / Y / Z / Series / Facet and that has more than one value in the CSV. The default is the first concrete value, which pins the dimension so rows don't collide on the chart. Choose `(none)` for a column to let it vary (legacy behavior). |
 
 ### Style per series
 

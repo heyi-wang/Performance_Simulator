@@ -507,6 +507,46 @@ def main() -> None:
         facet_pick = st.selectbox("Facet column", [NONE_LABEL] + cols_all, index=0)
         facet = None if facet_pick == NONE_LABEL else facet_pick
 
+        # ------------------------------------------------ Fix values
+        # Every sweep parameter not used as X/Y/Z/Series/Facet gets pinned
+        # to one of its CSV values; otherwise rows would collide on the chart.
+        # Picking "(all)" lets the dimension vary (legacy behavior).
+        active_used = set(used)
+        if facet:
+            active_used.add(facet)
+        free_cols = [
+            c for c in cols_all
+            if c not in active_used
+            and c not in NON_PARAM_COLUMNS
+            and df[c].nunique(dropna=True) > 1
+        ]
+        fix_filters: dict[str, object] = {}
+        if free_cols:
+            st.header("Fix values")
+            for col in free_cols:
+                opts = sorted(df[col].dropna().unique().tolist())
+                option_values = [None] + opts
+                idx = st.selectbox(
+                    col, list(range(len(option_values))),
+                    index=1,  # first concrete value
+                    format_func=lambda i, _vals=option_values: (
+                        NONE_LABEL if _vals[i] is None else str(_vals[i])
+                    ),
+                    key=f"fix_{col}",
+                )
+                if option_values[idx] is not None:
+                    fix_filters[col] = option_values[idx]
+
+    # Apply fixes outside the sidebar context.
+    if fix_filters:
+        mask = pd.Series(True, index=df.index)
+        for col, val in fix_filters.items():
+            mask &= (df[col] == val)
+        df = df[mask].copy()
+        if df.empty:
+            st.warning("No rows match the current Fix values selection.")
+            return
+
     # Style expander (main panel).
     styles: dict = {}
     if plot_type != "3D scatter":
