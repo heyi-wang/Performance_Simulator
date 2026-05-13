@@ -126,6 +126,21 @@ the same commit via a `NON_PARAM_COLUMNS` exclusion set.
   + facet today).
 - Multi-CSV overlay, figure export, custom palettes.
 
+### Follow-up patch: composite `gemm` / `tile` columns and constant bar widths
+- **Composite columns (additive)**: on load, `add_composite_columns(df)`
+  appends string columns `gemm = "MxKxN"` and `tile = "MxKxN"` when the
+  underlying components are present. The raw `gemm_m/k/n` and
+  `tile_m/k/n` remain in the dataframe and in every dropdown — composites
+  are added alongside, not in place. `expand_used_with_composites` keeps
+  the composite and its parts in sync inside the `used` set so
+  `fixed_params` doesn't double-list them. The synthetic names are also
+  skipped inside `fixed_params` directly (the triple-collapse already
+  produces `gemm=MxKxN` / `tile=MxKxN`).
+- **Constant stacked-bar widths**: stacked-bar X axis is now
+  `type="category"`, so bars render at constant visual width regardless
+  of X spacing. The log-X toggle is hidden in the sidebar for stacked
+  bar (it had no effect on a categorical axis).
+
 ### Follow-up patch: log axes use base 2 for power-of-two columns
 Plotly's `type="log"` defaults to base 10 (ticks at 1, 10, 100, …), which
 is wrong for sweep dims like `threads`, `mat_count`, `vec_count`,

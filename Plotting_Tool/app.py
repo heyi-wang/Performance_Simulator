@@ -40,6 +40,42 @@ NON_PARAM_COLUMNS: set[str] = {
     "stall_cycle_fraction_pct",
 }
 
+SYNTHETIC_COMPOSITES: dict[str, tuple[str, str, str]] = {
+    "gemm": ("gemm_m", "gemm_k", "gemm_n"),
+    "tile": ("tile_m", "tile_k", "tile_n"),
+}
+
+
+def add_composite_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Append synthetic 'gemm' / 'tile' string columns when their three
+    components are present. Returns a copy with the extra columns; raw
+    component columns are kept (additive)."""
+    df = df.copy()
+    for synth, parts in SYNTHETIC_COMPOSITES.items():
+        if synth in df.columns:
+            continue
+        if all(p in df.columns for p in parts):
+            df[synth] = (
+                df[parts[0]].astype(str) + "x"
+                + df[parts[1]].astype(str) + "x"
+                + df[parts[2]].astype(str)
+            )
+    return df
+
+
+def expand_used_with_composites(used: set[str]) -> set[str]:
+    """If a composite is used, mark its parts used; and vice-versa.
+    Prevents fixed_params from double-listing the composite alongside its
+    own triple-collapse over the raw parts."""
+    out = set(used)
+    for synth, parts in SYNTHETIC_COMPOSITES.items():
+        if synth in used:
+            out.update(parts)
+        if any(p in used for p in parts):
+            out.add(synth)
+    return out
+
+
 QUALITATIVE_PALETTES = ["Plotly", "D3", "Set1", "Set2", "Pastel"]
 SEQUENTIAL_PALETTES = ["Viridis", "Plasma", "Blues"]
 ALL_PALETTES = QUALITATIVE_PALETTES + SEQUENTIAL_PALETTES
@@ -303,7 +339,9 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
         template=template,
         title=title or None,
         barmode="stack",
-        xaxis=_axis_kwargs(xlabel or x, logx, agg[x]),
+        # Categorical X so all bars render at constant visual width,
+        # regardless of how the underlying X values are spaced.
+        xaxis=dict(title=xlabel or x, type="category"),
         yaxis=dict(title=ylabel or "total_cycles"),
         legend=dict(orientation="h", yanchor="bottom", y=1.0),
         margin=dict(l=40, r=20, t=50 if title else 40, b=40),
@@ -315,9 +353,13 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
 
 
 def fixed_params(df: pd.DataFrame, exclude: set[str]) -> str:
+    # Synthetic composites are reported via the triple-collapse below
+    # (`tile=MxKxN` / `gemm=MxKxN`), so we never list them by their
+    # composite name directly.
+    skip = exclude | NON_PARAM_COLUMNS | set(SYNTHETIC_COMPOSITES.keys())
     fixed: dict[str, object] = {}
     for col in df.columns:
-        if col in exclude or col in NON_PARAM_COLUMNS:
+        if col in skip:
             continue
         try:
             if df[col].nunique(dropna=True) == 1:
@@ -487,6 +529,7 @@ def main() -> None:
         except Exception as exc:  # noqa: BLE001
             st.error(f"Failed to read CSV: {exc}")
             return
+        df = add_composite_columns(df)
 
         st.header("Plot")
         plot_type = st.radio(
@@ -531,7 +574,9 @@ def main() -> None:
             used = {x, y, z}
         else:  # Stacked bar
             x = st.selectbox("X column", cols_all, index=_default("threads", cols_all))
-            logx = st.checkbox("log X", value=False)
+            # log-X has no visual effect with a categorical X axis, so we
+            # omit the toggle here to avoid confusion.
+            logx = False
             used = {x, "total_cycles"} | {c for c, _, _ in STACK_SEGMENTS}
 
         st.header("Labels")
@@ -555,6 +600,7 @@ def main() -> None:
         active_used = set(used)
         if facet:
             active_used.add(facet)
+        active_used = expand_used_with_composites(active_used)
         free_cols = [
             c for c in cols_all
             if c not in active_used
@@ -664,7 +710,7 @@ def main() -> None:
                 return
 
     st.plotly_chart(fig, use_container_width=True)
-    fixed_text = fixed_params(df, used)
+    fixed_text = fixed_params(df, expand_used_with_composites(used))
     if fixed_text:
         st.caption(f"Fixed: {fixed_text}")
     st.caption(f"{len(df)} rows · {csv_path}")
