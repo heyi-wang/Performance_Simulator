@@ -71,6 +71,40 @@ def _axis_type(use_log: bool) -> str:
     return "log" if use_log else "linear"
 
 
+LOG2_DTICK = math.log10(2)
+
+
+def _is_pow2_series(values) -> bool:
+    """True if every value is a positive integer power of two."""
+    try:
+        items = [v for v in values if pd.notna(v)]
+    except TypeError:
+        return False
+    if not items:
+        return False
+    for v in items:
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return False
+        if f <= 0 or not f.is_integer():
+            return False
+        iv = int(f)
+        if iv & (iv - 1):
+            return False
+    return True
+
+
+def _axis_kwargs(title: str, use_log: bool, values) -> dict:
+    """Build a Plotly axis dict, switching log-axis tick spacing to base 2
+    when the underlying data is power-of-two (so 'threads' shows 1,2,4,8,…
+    instead of 1,10,100,…)."""
+    cfg: dict = {"title": title, "type": _axis_type(use_log)}
+    if use_log and _is_pow2_series(values):
+        cfg["dtick"] = LOG2_DTICK
+    return cfg
+
+
 def _to_hex(color: str) -> str:
     if color.startswith("#"):
         return color.lower()
@@ -108,12 +142,14 @@ def _style_for(styles: dict | None, key, fallback_label: str,
 
 def _apply_2d_layout(fig: go.Figure, title: str, xlabel: str, ylabel: str,
                      x: str, y: str, logx: bool, logy: bool,
-                     template: str) -> None:
+                     template: str, df: pd.DataFrame | None = None) -> None:
+    x_vals = df[x] if df is not None and x in df else None
+    y_vals = df[y] if df is not None and y in df else None
     fig.update_layout(
         template=template,
         title=title or None,
-        xaxis=dict(title=xlabel or x, type=_axis_type(logx)),
-        yaxis=dict(title=ylabel or y, type=_axis_type(logy)),
+        xaxis=_axis_kwargs(xlabel or x, logx, x_vals),
+        yaxis=_axis_kwargs(ylabel or y, logy, y_vals),
         margin=dict(l=40, r=20, t=50 if title else 30, b=40),
     )
 
@@ -151,7 +187,7 @@ def build_scatter_2d(df: pd.DataFrame, x: str, y: str, logx: bool, logy: bool,
                     f"{st_['label']}<br>{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>"
                 ),
             ))
-    _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template)
+    _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template, df)
     return fig
 
 
@@ -188,7 +224,7 @@ def build_line_2d(df: pd.DataFrame, x: str, y: str, logx: bool, logy: bool,
                     f"{st_['label']}<br>{x}: %{{x}}<br>{y}: %{{y}}<extra></extra>"
                 ),
             ))
-    _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template)
+    _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template, df)
     return fig
 
 
@@ -210,9 +246,9 @@ def build_scatter_3d(df: pd.DataFrame, x: str, y: str, z: str,
         template=template,
         title=title or None,
         scene=dict(
-            xaxis=dict(title=xlabel or x, type=_axis_type(logx)),
-            yaxis=dict(title=ylabel or y, type=_axis_type(logy)),
-            zaxis=dict(title=zlabel or z, type=_axis_type(logz)),
+            xaxis=_axis_kwargs(xlabel or x, logx, df[x]),
+            yaxis=_axis_kwargs(ylabel or y, logy, df[y]),
+            zaxis=_axis_kwargs(zlabel or z, logz, df[z]),
         ),
         margin=dict(l=0, r=0, t=50 if title else 30, b=0),
     )
@@ -267,7 +303,7 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
         template=template,
         title=title or None,
         barmode="stack",
-        xaxis=dict(title=xlabel or x, type=_axis_type(logx)),
+        xaxis=_axis_kwargs(xlabel or x, logx, agg[x]),
         yaxis=dict(title=ylabel or "total_cycles"),
         legend=dict(orientation="h", yanchor="bottom", y=1.0),
         margin=dict(l=40, r=20, t=50 if title else 40, b=40),
@@ -349,9 +385,14 @@ def render_facet(df: pd.DataFrame, facet_col: str, builder_fn,
         title=title or None,
         margin=dict(l=40, r=20, t=70 if title else 50, b=40),
     )
-    fig.update_xaxes(type=_axis_type(logx), title_text=xlabel or x)
+    x_kwargs = _axis_kwargs(xlabel or x, logx, df[x] if x in df else None)
+    fig.update_xaxes(**{k: v for k, v in x_kwargs.items() if k != "title"},
+                     title_text=x_kwargs["title"])
     if y is not None:
-        fig.update_yaxes(type=_axis_type(logy), title_text=ylabel or y)
+        y_vals = df[y] if y in df else None
+        y_kwargs = _axis_kwargs(ylabel or y, logy, y_vals)
+        fig.update_yaxes(**{k: v for k, v in y_kwargs.items() if k != "title"},
+                         title_text=y_kwargs["title"])
     return fig
 
 

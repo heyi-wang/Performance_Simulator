@@ -126,6 +126,14 @@ the same commit via a `NON_PARAM_COLUMNS` exclusion set.
   + facet today).
 - Multi-CSV overlay, figure export, custom palettes.
 
+### Follow-up patch: log axes use base 2 for power-of-two columns
+Plotly's `type="log"` defaults to base 10 (ticks at 1, 10, 100, …), which
+is wrong for sweep dims like `threads`, `mat_count`, `vec_count`,
+`vec_bytes`, `tile_*`. `_axis_kwargs(title, use_log, values)` now sets
+`dtick = log10(2)` whenever the underlying data is a positive integer
+power of two, so log axes tick at 1, 2, 4, 8, …. Applied across all
+plot types, including facet subplots and the 3D scene axes.
+
 ### Follow-up patch: Fix values
 After v3 landed, a sidebar **Fix values** section was added: any sweep
 parameter column not used as X / Y / Z / Series / Facet that has more
