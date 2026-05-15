@@ -6,6 +6,7 @@
 #include <tlm_utils/simple_initiator_socket.h>
 
 #include <algorithm>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -244,6 +245,13 @@ struct PoolWorker : sc_module
             done_map.erase(gp);
             p.sync_done = true;
         }
+
+        // Per-DMA scalar setup cost (matches matmul's DmaScalarMode::VecPerCall).
+        const uint64_t scalar_cost =
+            is_write ? cfg.dma_vec_wr_scalar : cfg.dma_vec_rd_scalar;
+        if (scalar_cost > 0)
+            do_scalar(scalar_cost);
+
         return p;
     }
 
@@ -300,6 +308,22 @@ struct PoolWorker : sc_module
         return (end > start) ? static_cast<uint64_t>((end - start) / CYCLE) : 0;
     }
 
+    static uint64_t tile_input_bytes(const PoolRuntimeConfig &cfg, int t)
+    {
+        const uint64_t tile_elems =
+            std::min<uint64_t>(cfg.vec_acc_cap,
+                               static_cast<uint64_t>(cfg.spatial()) -
+                                   static_cast<uint64_t>(t) * cfg.vec_acc_cap);
+        return tile_elems * cfg.input_elem_bytes;
+    }
+
+    struct InflightLoad
+    {
+        PendingReq dma;
+        int tile_idx = 0;
+        uint64_t rd_bytes = 0;
+    };
+
     void run()
     {
         if (start_event)
@@ -309,78 +333,108 @@ struct PoolWorker : sc_module
         int c_start = (tid * cfg.channels) / n_workers;
         int c_end = ((tid + 1) * cfg.channels) / n_workers;
 
+        const size_t max_inflight =
+            static_cast<size_t>(std::max<uint64_t>(cfg.max_inflight_vec_reqs, 1));
+        const size_t l1_buffers =
+            static_cast<size_t>(std::max(cfg.l1_tile_buffers, 1));
+
         for (int c = c_start; c < c_end; ++c)
         {
-            PendingReq load_req = issue_dma(false,
-                                            std::min<uint64_t>(
-                                                cfg.vec_acc_cap,
-                                                static_cast<uint64_t>(cfg.spatial())) *
-                                                cfg.input_elem_bytes,
-                                            c,
-                                            0);
+            // Two-queue polling loop modeled on Worker::issue_stream
+            // (src/worker.cpp:534-554). Pipeline depth is gated by
+            // min(max_inflight_vec_reqs, l1_tile_buffers).
+            std::deque<InflightLoad> read_inflight;
+            std::deque<PendingReq>   accel_inflight;
+            int next_load_tile = 0;
+
             bool has_prev_compute = false;
             sc_time prev_compute_start = SC_ZERO_TIME;
             sc_time prev_compute_end = SC_ZERO_TIME;
 
-            for (int t = 0; t < cfg.tile_count(); ++t)
-            {
-                const uint64_t tile_elems =
-                    std::min<uint64_t>(cfg.vec_acc_cap,
-                                       static_cast<uint64_t>(cfg.spatial()) -
-                                           static_cast<uint64_t>(t) * cfg.vec_acc_cap);
-                uint64_t rd = tile_elems * cfg.input_elem_bytes;
+            auto issue_read = [&]() -> bool {
+                if (next_load_tile >= cfg.tile_count()) return false;
+                if (read_inflight.size() >= max_inflight) return false;
+                if (read_inflight.size() + accel_inflight.size() >= l1_buffers)
+                    return false;
+                InflightLoad in;
+                in.tile_idx = next_load_tile;
+                in.rd_bytes = tile_input_bytes(cfg, next_load_tile);
+                in.dma = issue_dma(false, in.rd_bytes, c, next_load_tile);
+                read_inflight.push_back(std::move(in));
+                ++next_load_tile;
+                return true;
+            };
 
-                issue_end(load_req);
-                total_l2_rd_bytes += rd;
+            auto promote_read = [&]() -> bool {
+                if (read_inflight.empty()) return false;
+                if (accel_inflight.size() >= max_inflight) return false;
+
+                InflightLoad head = std::move(read_inflight.front());
+                read_inflight.pop_front();
+                issue_end(head.dma);
+                total_l2_rd_bytes += head.rd_bytes;
                 if (has_prev_compute)
                 {
-                    dma_accel_overlap_cycles += overlap_cycles(prev_compute_start,
-                                                               prev_compute_end,
-                                                               load_req.submit_time,
-                                                               load_req.complete_time);
+                    dma_accel_overlap_cycles += overlap_cycles(
+                        prev_compute_start, prev_compute_end,
+                        head.dma.submit_time, head.dma.complete_time);
                 }
 
-                auto req = issue_begin(rd, cfg.output_elem_bytes, c, t);
+                const bool is_last_tile = (head.tile_idx + 1) == cfg.tile_count();
+                const uint64_t wr = is_last_tile ? cfg.output_elem_bytes : 0;
+                auto req = issue_begin(head.rd_bytes, wr, c, head.tile_idx);
                 ++vec_calls;
-                total_rd_bytes += rd;
-                total_wr_bytes += cfg.output_elem_bytes;
-
-                PendingReq next_load;
-                const bool has_next_tile = (t + 1) < cfg.tile_count();
-                const bool prefetch_next = has_next_tile && cfg.l1_tile_buffers >= 2;
-                if (prefetch_next)
-                {
-                    const uint64_t next_tile_elems =
-                        std::min<uint64_t>(cfg.vec_acc_cap,
-                                           static_cast<uint64_t>(cfg.spatial()) -
-                                               static_cast<uint64_t>(t + 1) * cfg.vec_acc_cap);
-                    next_load = issue_dma(false,
-                                          next_tile_elems * cfg.input_elem_bytes,
-                                          c,
-                                          t + 1);
-                }
+                total_rd_bytes += head.rd_bytes;
+                total_wr_bytes += wr;
+                accel_inflight.push_back(std::move(req));
 
                 do_scalar(cfg.scalar_overhead);
-                issue_end(req);
+                return true;
+            };
 
-                prev_compute_start = req.submit_time;
-                prev_compute_end = req.complete_time;
+            auto retire_accel = [&]() {
+                PendingReq oldest = std::move(accel_inflight.front());
+                accel_inflight.pop_front();
+                issue_end(oldest);
+                prev_compute_start = oldest.submit_time;
+                prev_compute_end = oldest.complete_time;
                 has_prev_compute = true;
+            };
 
-                if (has_next_tile)
+            while (next_load_tile < cfg.tile_count() ||
+                   !read_inflight.empty() ||
+                   !accel_inflight.empty())
+            {
+                bool progress = false;
+
+                // Try to keep the DMA pipeline full.
+                while (issue_read()) progress = true;
+
+                // Promote any completed DMA to a compute submission.
+                if (promote_read()) progress = true;
+
+                // Retire the oldest compute when its slot is needed or
+                // when no more reads can be issued/promoted right now.
+                const bool window_full =
+                    accel_inflight.size() >= max_inflight;
+                const bool buffers_full =
+                    read_inflight.size() + accel_inflight.size() >= l1_buffers;
+                const bool no_more_reads =
+                    next_load_tile >= cfg.tile_count() && read_inflight.empty();
+
+                if (!accel_inflight.empty() &&
+                    (window_full || buffers_full || no_more_reads))
                 {
-                    if (!prefetch_next)
-                    {
-                        const uint64_t next_tile_elems =
-                            std::min<uint64_t>(cfg.vec_acc_cap,
-                                               static_cast<uint64_t>(cfg.spatial()) -
-                                                   static_cast<uint64_t>(t + 1) * cfg.vec_acc_cap);
-                        next_load = issue_dma(false,
-                                              next_tile_elems * cfg.input_elem_bytes,
-                                              c,
-                                              t + 1);
-                    }
-                    load_req = std::move(next_load);
+                    retire_accel();
+                    progress = true;
+                }
+
+                if (!progress)
+                {
+                    // Should not happen: if any queue is non-empty there
+                    // is always a wait we can do. Break to avoid an
+                    // infinite loop in unforeseen states.
+                    break;
                 }
             }
 
@@ -406,15 +460,16 @@ PoolTop::PoolTop(sc_module_name name,
       mat_acc("mat_acc", cfg.acc_queue_depth),
       vec_acc("vec_acc",
               static_cast<size_t>(cfg.vec_acc_instances),
-              cfg.acc_queue_depth),
+              cfg.acc_queue_depth,
+              /*enable_unit_pipeline=*/true),
       noc("noc"),
       memory("memory",
              cfg.l1_base_lat,
              cfg.l1_bw,
              cfg.l2_base_lat,
              cfg.l2_bw,
-             static_cast<uint64_t>(cfg.vec_acc_instances),
-             1),
+             cfg.l1_slots,
+             cfg.l2_slots),
       done_event(done_event_)
 {
     noc.to_mat.bind(mat_acc.tgt);
@@ -456,9 +511,14 @@ PoolSimulationStats PoolTop::collect_stats() const
 {
     PoolSimulationStats stats;
 
+    const PoolWorker *slowest = nullptr;
     for (const auto *w : workers)
     {
-        stats.max_elapsed_cycles = std::max(stats.max_elapsed_cycles, w->elapsed_cycles);
+        if (w->elapsed_cycles > stats.max_elapsed_cycles)
+        {
+            stats.max_elapsed_cycles = w->elapsed_cycles;
+            slowest = w;
+        }
         stats.total_vec_calls += w->vec_calls;
         stats.total_rd_bytes += w->total_rd_bytes;
         stats.total_wr_bytes += w->total_wr_bytes;
@@ -472,9 +532,13 @@ PoolSimulationStats PoolTop::collect_stats() const
     stats.expected_l1_read_bytes =
         static_cast<uint64_t>(cfg.channels) * static_cast<uint64_t>(cfg.spatial()) *
         cfg.input_elem_bytes;
+    // Writeback happens once per channel (final tile only): one L1 write
+    // request and `output_elem_bytes` per channel, plus one L1 read per
+    // vec call.
     stats.expected_l1_write_bytes =
-        stats.expected_vec_calls * cfg.output_elem_bytes;
-    stats.expected_l1_reqs = stats.expected_vec_calls * 2;
+        static_cast<uint64_t>(cfg.channels) * cfg.output_elem_bytes;
+    stats.expected_l1_reqs =
+        stats.expected_vec_calls + static_cast<uint64_t>(cfg.channels);
     stats.expected_l2_read_bytes =
         static_cast<uint64_t>(cfg.channels) * static_cast<uint64_t>(cfg.spatial()) *
         cfg.input_elem_bytes;
@@ -512,6 +576,38 @@ PoolSimulationStats PoolTop::collect_stats() const
     stats.l2_bw_observed = (sim_cycles > 0.0)
         ? static_cast<double>(stats.l2_dma_read_bytes + stats.l2_dma_write_bytes) / sim_cycles
         : 0.0;
+    if (slowest != nullptr && stats.max_elapsed_cycles > 0)
+    {
+        // Per-category cycle counts attributed to the critical-path worker.
+        // Categories can overlap on the wall-clock timeline (e.g. scalar
+        // runs while a vec request is in service), so we normalize the
+        // fractions by the sum of categorized cycles, not by elapsed
+        // — same convention as matmul (see matmul_top.cpp).
+        const uint64_t vec_service =
+            slowest->vec_calls * cfg.vec_acc_cycle;
+        const uint64_t dma_cycles = slowest->total_mem_cycles;
+        const uint64_t scalar_cycles =
+            slowest->total_scalar_cycles + slowest->total_divide_cycles;
+        const uint64_t stall_cycles = slowest->total_stall_cycles;
+
+        stats.slowest_worker_tid = slowest->tid;
+        stats.slowest_vec_cycles = vec_service;
+        stats.slowest_dma_cycles = dma_cycles;
+        stats.slowest_scalar_cycles = scalar_cycles;
+        stats.slowest_stall_cycles = stall_cycles;
+
+        const uint64_t total_categorized =
+            vec_service + dma_cycles + scalar_cycles + stall_cycles;
+        if (total_categorized > 0)
+        {
+            const double denom = static_cast<double>(total_categorized);
+            stats.vec_cycle_fraction    = vec_service   / denom * 100.0;
+            stats.dma_cycle_fraction    = dma_cycles    / denom * 100.0;
+            stats.scalar_cycle_fraction = scalar_cycles / denom * 100.0;
+            stats.stall_cycle_fraction  = stall_cycles  / denom * 100.0;
+        }
+    }
+
     stats.verification_passed =
         stats.total_vec_calls == stats.expected_vec_calls &&
         stats.total_rd_bytes == stats.expected_l1_read_bytes &&
@@ -521,9 +617,7 @@ PoolSimulationStats PoolTop::collect_stats() const
         stats.l1_write_bytes == stats.expected_l1_write_bytes &&
         stats.l2_dma_reqs == stats.expected_l2_dma_reqs &&
         stats.l2_dma_read_bytes == stats.expected_l2_read_bytes &&
-        stats.l2_dma_write_bytes == stats.expected_l2_write_bytes &&
-        (cfg.tile_count() <= 1 || cfg.l1_tile_buffers < 2 ||
-         stats.dma_accel_overlap_cycles > 0);
+        stats.l2_dma_write_bytes == stats.expected_l2_write_bytes;
     return stats;
 }
 
@@ -582,69 +676,79 @@ void PoolTop::print_report(std::ostream &os) const
         {"Accelerator Queue Depth [requests]", report::fmt_u64(cfg.acc_queue_depth)},
         {"L1 Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l1_bw)},
         {"L1 Base Latency [cycles]", report::fmt_u64(cfg.l1_base_lat)},
+        {"L1 Parallel Slots", report::fmt_u64(cfg.l1_slots)},
         {"L1 Tile Buffers [tiles]", report::fmt_int(cfg.l1_tile_buffers)},
         {"L2 DMA Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l2_bw)},
         {"L2 DMA Base Latency [cycles]", report::fmt_u64(cfg.l2_base_lat)},
+        {"L2 DMA Parallel Slots", report::fmt_u64(cfg.l2_slots)},
     });
 
     report::print_section_title(os, "Worker Summary");
     report::print_table(os, report::make_worker_summary_table(worker_info));
 
     report::print_section_title(os, "Accelerator Summary");
-    report::print_table(os, report::make_accelerator_summary_table({
-        {
-            "Matrix Accelerator",
-            "pool-level",
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-        },
-        {
-            "Vector Accelerator",
-            "pool-level",
-            report::fmt_int(cfg.vec_acc_instances),
-            report::fmt_u64(stats.vec_acc_reqs),
-            report::fmt_u64(stats.vec_acc_queue_wait_cycles),
-            report::fmt_u64(stats.vec_acc_busy_cycles),
-            report::fmt_u64(stats.vec_acc_occupied_cycles),
-            report::fmt_percent(stats.vec_util),
-            report::fmt_percent(stats.vec_occupancy),
-            report::na(),
-            report::na(),
-        },
-        {
-            "L1 Memory",
-            "accelerator-side",
-            report::fmt_int(cfg.vec_acc_instances),
-            report::fmt_u64(stats.l1_reqs),
-            report::fmt_u64(stats.l1_queue_wait_cycles),
-            report::fmt_u64(stats.l1_busy_cycles),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::fmt_u64(stats.l1_read_bytes),
-            report::fmt_u64(stats.l1_write_bytes),
-        },
-        {
-            "L2 DMA",
-            "prefetch/writeback",
-            "1",
-            report::fmt_u64(stats.l2_dma_reqs),
-            report::fmt_u64(stats.l2_dma_queue_wait_cycles),
-            report::fmt_u64(stats.l2_dma_busy_cycles),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::fmt_u64(stats.l2_dma_read_bytes),
-            report::fmt_u64(stats.l2_dma_write_bytes),
-        },
-    }));
+    std::vector<report::AcceleratorSummaryRow> accel_rows;
+    accel_rows.push_back({
+        "Matrix Accelerator",
+        "pool-level",
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+    });
+    accel_rows.push_back({
+        "Vector Accelerator",
+        "pool-level",
+        report::fmt_int(cfg.vec_acc_instances),
+        report::fmt_u64(stats.vec_acc_reqs),
+        report::fmt_u64(stats.vec_acc_queue_wait_cycles),
+        report::fmt_u64(stats.vec_acc_busy_cycles),
+        report::fmt_u64(stats.vec_acc_occupied_cycles),
+        report::fmt_percent(stats.vec_util),
+        report::fmt_percent(stats.vec_occupancy),
+        report::na(),
+        report::na(),
+        report::na(),
+    });
+    for (auto &r : report::make_per_instance_accel_rows(
+             "Vector Accelerator", vec_acc.per_instance_stats(),
+             stats.max_elapsed_cycles))
+        accel_rows.push_back(std::move(r));
+    accel_rows.push_back({
+        "L1 Memory",
+        "accelerator-side",
+        report::fmt_int(cfg.vec_acc_instances),
+        report::fmt_u64(stats.l1_reqs),
+        report::fmt_u64(stats.l1_queue_wait_cycles),
+        report::fmt_u64(stats.l1_busy_cycles),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::fmt_u64(stats.l1_read_bytes),
+        report::fmt_u64(stats.l1_write_bytes),
+        report::na(),
+    });
+    accel_rows.push_back({
+        "L2 DMA",
+        "prefetch/writeback",
+        "1",
+        report::fmt_u64(stats.l2_dma_reqs),
+        report::fmt_u64(stats.l2_dma_queue_wait_cycles),
+        report::fmt_u64(stats.l2_dma_busy_cycles),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::fmt_u64(stats.l2_dma_read_bytes),
+        report::fmt_u64(stats.l2_dma_write_bytes),
+        report::na(),
+    });
+    report::print_table(os, report::make_accelerator_summary_table(accel_rows));
 
     report::print_section_title(os, "Overall Summary");
     report::print_fields(os, {
@@ -663,6 +767,11 @@ void PoolTop::print_report(std::ostream &os) const
         {"DMA/Accelerator Overlap [cycles]", report::fmt_u64(stats.dma_accel_overlap_cycles)},
         {"Average L1 Bandwidth [bytes/cycle]", report::fmt_rate(stats.l1_bw_observed, "bytes/cycle")},
         {"Average L2 DMA Bandwidth [bytes/cycle]", report::fmt_rate(stats.l2_bw_observed, "bytes/cycle")},
+        {"Critical-Path Worker [tid]", report::fmt_int(stats.slowest_worker_tid)},
+        {"Vec Cycle Fraction [%]",    report::fmt_percent(stats.vec_cycle_fraction)},
+        {"DMA Cycle Fraction [%]",    report::fmt_percent(stats.dma_cycle_fraction)},
+        {"Scalar Cycle Fraction [%]", report::fmt_percent(stats.scalar_cycle_fraction)},
+        {"Stall Cycle Fraction [%]",  report::fmt_percent(stats.stall_cycle_fraction)},
     });
 
     report::print_section_title(os, "Verification");
@@ -692,24 +801,3 @@ void PoolTop::done_monitor()
         completion_fifo->read();
     done_event->notify(SC_ZERO_TIME);
 }
-
-#ifndef KERNEL_STANDALONE_MAIN
-#define KERNEL_STANDALONE_MAIN 1
-#endif
-
-#if KERNEL_STANDALONE_MAIN
-int sc_main(int argc, char *argv[])
-{
-    (void)argc;
-    (void)argv;
-
-    PoolRuntimeConfig cfg = PoolRuntimeConfig::defaults();
-    PoolTop top("pool_top", cfg);
-    sc_start();
-
-    top.print_report(std::cout);
-
-    const PoolSimulationStats stats = top.collect_stats();
-    return stats.verification_passed ? 0 : 2;
-}
-#endif

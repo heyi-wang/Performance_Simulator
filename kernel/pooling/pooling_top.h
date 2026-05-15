@@ -27,10 +27,15 @@ struct PoolRuntimeConfig
     uint64_t divide_cycles = POOL_DIVIDE_CYCLES;
     uint64_t l1_base_lat = POOL_L1_BASE_LAT_CFG;
     uint64_t l1_bw = POOL_L1_BW_CFG;
+    uint64_t l1_slots = POOL_L1_SLOTS_CFG;
     uint64_t l2_base_lat = POOL_L2_BASE_LAT_CFG;
     uint64_t l2_bw = POOL_L2_BW_CFG;
+    uint64_t l2_slots = POOL_L2_SLOTS_CFG;
     int l1_tile_buffers = POOL_L1_TILE_BUFFERS_CFG;
     size_t acc_queue_depth = POOL_ACC_QUEUE_DEPTH;
+    uint64_t dma_vec_rd_scalar = POOL_DMA_VEC_RD_SCALAR_CFG;
+    uint64_t dma_vec_wr_scalar = POOL_DMA_VEC_WR_SCALAR_CFG;
+    uint64_t max_inflight_vec_reqs = POOL_MAX_INFLIGHT_VEC_REQS_CFG;
 
     static PoolRuntimeConfig defaults()
     {
@@ -81,6 +86,15 @@ struct PoolSimulationStats
     double vec_occupancy = 0.0;
     double l1_bw_observed = 0.0;
     double l2_bw_observed = 0.0;
+    int slowest_worker_tid = -1;
+    uint64_t slowest_vec_cycles = 0;
+    uint64_t slowest_dma_cycles = 0;
+    uint64_t slowest_scalar_cycles = 0;
+    uint64_t slowest_stall_cycles = 0;
+    double vec_cycle_fraction = 0.0;
+    double dma_cycle_fraction = 0.0;
+    double scalar_cycle_fraction = 0.0;
+    double stall_cycle_fraction = 0.0;
     bool verification_passed = false;
 };
 
