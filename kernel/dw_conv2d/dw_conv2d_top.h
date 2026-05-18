@@ -125,9 +125,10 @@ struct DwConvTop : sc_module
     std::vector<std::unique_ptr<DwConvPostProcessor>> post_processors;
     // Per-vec-unit strip-contiguity lock. A worker acquires its
     // assigned unit's semaphore before issuing the strip's first
-    // sub-request and releases it after the last sub-request's
-    // issue_end -- guaranteeing no other worker's strip interleaves
-    // on the same unit (see Dw_Conv2d.md Requirements v2).
+    // sub-request and releases it after the strip's last sub-request
+    // is admitted/enqueued, guaranteeing no other worker's strip
+    // interleaves on the same unit while still allowing queued
+    // overlap during completion drain (see Dw_Conv2d.md Requirements v2).
     std::vector<std::unique_ptr<sc_core::sc_semaphore>> per_unit_lock;
     sc_event *done_event = nullptr;
     std::unique_ptr<sc_fifo<int>> completion_fifo;

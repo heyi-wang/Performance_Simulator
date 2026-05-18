@@ -28,10 +28,11 @@ using namespace tlm;
 // vector unit. The last sub-request carries the L1 writeback
 // payload (vl * output_elem_bytes); a fire-and-forget L2 DMA
 // then writes the strip's output to L2. Sub-requests of one
-// strip must run contiguously on the assigned vec unit — no
-// other worker's strip may interleave. Contiguity is enforced
-// via a per-unit sc_semaphore held by the worker for the
-// duration of the strip's sub-request submission and drain.
+// strip must be admitted contiguously to the assigned vec unit
+// FIFO -- no other worker's strip may interleave between those
+// sub-requests. Contiguity is enforced via a per-unit
+// sc_semaphore held only while the worker submits the strip's
+// sub-requests; completions are drained after releasing it.
 // ============================================================
 struct DwConvPostProcessor : WorkerPostProcessor
 {
@@ -146,11 +147,10 @@ struct DwConvPostProcessor : WorkerPostProcessor
                     total_dma_cycles += static_cast<uint64_t>(
                         (sc_time_stamp() - prefetch_submit) / CYCLE);
 
-                    // --- (2) Acquire per-unit lock for contiguity --
-                    // Hold the lock across all kh*kw sub-requests so
-                    // no other worker's strip can be admitted to this
-                    // unit between them. The lock is released after
-                    // the last sub-request's issue_end completes.
+                    // --- (2) Acquire per-unit lock for admission contiguity --
+                    // Hold the lock across all kh*kw issue_begin calls, including
+                    // any queue-full stalls, so no other worker's strip can be
+                    // admitted to this unit between this strip's sub-requests.
                     if (unit_lock)
                         unit_lock->wait();
 
@@ -188,15 +188,17 @@ struct DwConvPostProcessor : WorkerPostProcessor
                         }
                     }
 
+                    // --- (4) Release unit lock ---------------------
+                    // The strip is now fully admitted/enqueued. Let the next
+                    // worker queue behind it while this worker drains responses.
+                    if (unit_lock)
+                        unit_lock->post();
+
                     // Drain all kh*kw sub-requests. Their internal
                     // load/compute/write stages overlap via the
                     // AcceleratorTLM's pipelined unit threads.
                     for (auto &req : pending)
                         worker.issue_end(req);
-
-                    // --- (4) Release unit lock ---------------------
-                    if (unit_lock)
-                        unit_lock->post();
 
                     // --- (5) Fire-and-forget L2 writeback ----------
                     // Per the user's spec: charge the writeback DMA
