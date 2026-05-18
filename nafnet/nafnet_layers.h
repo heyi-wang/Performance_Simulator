@@ -412,10 +412,17 @@ static inline LayerExpectedStats expected_layer_stats(const LayerDesc &l, int n_
                     if (oh == 0 && strip == 0)
                         rd += static_cast<uint64_t>(l.Kh) * l.Kw * DW_INPUT_ELEM_BYTES;
                     uint64_t wr = vl * DW_OUTPUT_ELEM_BYTES;
-                    ++stats.vec_reqs;
-                    stats.accel_cycles += DW_VEC_ACC_CYCLE;
-                    stats.rd_bytes += rd;
-                    stats.wr_bytes += wr;
+                    // v2: one output strip emits Kh*Kw load-broadcast-compute
+                    // requests to the vec unit; the byte totals stay the
+                    // same (split across Kh*Kw L1 reads + 1 L1 write on the
+                    // last sub-request).
+                    const uint64_t sub_per_strip =
+                        static_cast<uint64_t>(l.Kh) *
+                        static_cast<uint64_t>(l.Kw);
+                    stats.vec_reqs    += sub_per_strip;
+                    stats.accel_cycles += sub_per_strip * DW_VEC_ACC_CYCLE;
+                    stats.rd_bytes    += rd;
+                    stats.wr_bytes    += wr;
                 }
             }
         }
