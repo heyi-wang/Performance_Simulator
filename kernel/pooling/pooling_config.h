@@ -154,3 +154,13 @@ static const uint64_t POOL_DMA_VEC_WR_SCALAR_CFG = POOL_DMA_VEC_WR_SCALAR;
 #endif
 
 static const uint64_t POOL_MAX_INFLIGHT_VEC_REQS_CFG = POOL_MAX_INFLIGHT_VEC_REQS;
+
+// ------------------------------------------------------------
+// Per-worker bound on outstanding L2 writeback DMAs (fire-and-forget
+// channel results). Reaped when window fills.
+// ------------------------------------------------------------
+#ifndef POOL_MAX_INFLIGHT_DMA_WRITES
+#define POOL_MAX_INFLIGHT_DMA_WRITES 2
+#endif
+
+static const uint64_t POOL_MAX_INFLIGHT_DMA_WRITES_CFG = POOL_MAX_INFLIGHT_DMA_WRITES;

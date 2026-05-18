@@ -24,7 +24,12 @@ From [pooling_config.h](pooling_config.h):
 All hardware knobs derive from [config/hardware_config.h](../../config/hardware_config.h)
 so pooling and matmul see identical hardware:
 - Vector accelerator: `POOL_VEC_ACC_CAP = VECTOR_ACC_CAP = 64` B/call,
-  `POOL_VEC_ACC_CYCLE = VECTOR_ACC_CYCLE = 1` cycle, `POOL_VEC_ACC_INSTANCES = VEC_ACCEL_COUNT = 8`.
+  `POOL_VEC_ACC_CYCLE = VECTOR_ACC_CYCLE = 1` cycle. Under pinned mode the
+  effective instance count equals `worker_count`: the vec `AcceleratorPool`
+  is constructed via the 5-arg pinned ctor with an identity
+  `worker_to_accel` map, so each worker drives its own dedicated vec unit.
+  `POOL_VEC_ACC_INSTANCES = VEC_ACCEL_COUNT = 8` is a fallback only. Inner
+  load/compute/write stage pipeline is always-on in pinned mode.
 - Queue depth: `POOL_ACC_QUEUE_DEPTH = max(HW_ACC_QUEUE_DEPTH, VEC_ACCEL_COUNT*4)`.
 - L1: `POOL_L1_BW = VECTOR_ACC_CAP` (one vec/cycle), `POOL_L1_BASE_LAT=1`, `POOL_L1_SLOTS=8`.
 - DMA / L2: `POOL_L2_BW = POOL_L1_BW/4`, `POOL_L2_BASE_LAT=10`, `POOL_L2_SLOTS=16`.
@@ -78,23 +83,30 @@ Effective pipeline depth = `min(max_inflight_vec_reqs, l1_tile_buffers)`.
 With `max_inflight=1` it reduces to the prior prefetch-one-ahead pattern.
 
 ### Inner pipeline — load / compute / writeback within one vec request
-`PoolTop` constructs the vec `AcceleratorPool` with
-`enable_unit_pipeline=true` so each unit spawns `load_thread`, `compute_thread`,
-`write_thread` (capacity-1 stage queues). One request's L1 read overlaps with
-the next request's compute and the previous request's L1 writeback on the same
-unit. This is more aggressive than matmul's vec phase (matmul keeps
-`unit_pipeline=false`).
+Pinned mode always pipelines its per-unit stages: each pinned vec unit spawns
+`load_thread`, `compute_thread`, `write_thread` (capacity-1 stage queues), so
+one request's L1 read overlaps with the next request's compute and the previous
+request's L1 writeback on the same unit. Pooling and matmul now follow the
+same pinned-mode default.
 
-### End-of-channel writeback semantics (Pooling.md L13)
-The partial sum lives in the vec accelerator's accumulator register across
-tiles of one channel. The L1 writeback happens **once per channel** on the
-final tile (`wr = output_elem_bytes` only when `t == tile_count - 1`).
-Then the inline divide and L2 DMA store run.
+### Per-request writeback + non-blocking channel commit
+The partial sum lives in the pinned vec unit's accumulator **register** across
+all tiles of one channel — no L1 read-back is modeled. The L1 writeback
+happens **once per vec request** as a checkpoint
+(`wr = output_elem_bytes` for every tile, not just the last).
+
+After a channel's last tile completes, the worker waits `divide_cycles` and
+issues the L2 store DMA **fire-and-forget**: the `PendingReq` is pushed onto
+a per-worker `dma_write_inflight` deque and the worker immediately proceeds
+to the next channel's vec requests. The window is bounded by
+`cfg.max_inflight_dma_writes` (default 2, CLI `--max-inflight-dma-writes`);
+when full, the oldest write is reaped via `issue_end`. After all channels are
+issued, remaining writes are drained. This is structurally analogous to
+`Worker::issue_stream`'s `write_inflight` deque (worker.cpp ~470-510).
 
 Counter consequences (verified in `collect_stats`):
-- `expected_l1_write_bytes = channels × output_elem_bytes`.
-- `expected_l1_reqs = vec_calls + channels` (one read per vec call +
-  one final write per channel).
+- `expected_l1_write_bytes = expected_vec_calls × output_elem_bytes`.
+- `expected_l1_reqs = expected_vec_calls × 2` (one read + one write per vec call).
 - L2 DMA expectations unchanged: one write DMA per channel.
 
 ## Reporting
@@ -117,7 +129,8 @@ is wired correctly.
 ```
 make kernel-pooling
 ./kernel/build/pooling_sim [--workers N] [--channels C] [--height H] \
-    [--width W] [--max-inflight-vec N] [--dma-base-lat N]
+    [--width W] [--max-inflight-vec N] [--max-inflight-dma-writes N] \
+    [--dma-base-lat N]
 ```
 Exit code 2 indicates verification or req-count mismatch.
 

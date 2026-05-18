@@ -43,11 +43,17 @@ NON_PARAM_COLUMNS: set[str] = {
 SYNTHETIC_COMPOSITES: dict[str, tuple[str, str, str]] = {
     "gemm": ("gemm_m", "gemm_k", "gemm_n"),
     "tile": ("tile_m", "tile_k", "tile_n"),
+    "pool": ("pool_channels", "pool_height", "pool_width"),
 }
+
+SIZE_LABEL_COMPOSITES = {"gemm", "pool"}
+ALIASED_COLUMN_GROUPS = (
+    {"threads", "workers"},
+)
 
 
 def add_composite_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Append synthetic 'gemm' / 'tile' string columns when their three
+    """Append synthetic shape string columns when their three
     components are present. Returns a copy with the extra columns; raw
     component columns are kept (additive)."""
     df = df.copy()
@@ -64,16 +70,51 @@ def add_composite_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def expand_used_with_composites(used: set[str]) -> set[str]:
-    """If a composite is used, mark its parts used; and vice-versa.
-    Prevents fixed_params from double-listing the composite alongside its
-    own triple-collapse over the raw parts."""
+    """If a composite or alias is used, mark equivalent columns used too.
+
+    Prevents Fix values from pinning duplicate columns such as
+    threads/workers or size_label/pool while the equivalent column is already
+    driving the chart.
+    """
     out = set(used)
     for synth, parts in SYNTHETIC_COMPOSITES.items():
         if synth in used:
             out.update(parts)
         if any(p in used for p in parts):
             out.add(synth)
+        if synth in SIZE_LABEL_COMPOSITES and (
+            "size_label" in used or synth in out or any(p in out for p in parts)
+        ):
+            out.add("size_label")
+            out.add(synth)
+            out.update(parts)
+    if any(
+        synth in out or any(part in out for part in SYNTHETIC_COMPOSITES[synth])
+        for synth in SIZE_LABEL_COMPOSITES
+    ):
+        for synth in SIZE_LABEL_COMPOSITES:
+            out.add(synth)
+            out.update(SYNTHETIC_COMPOSITES[synth])
+        out.add("size_label")
+    for group in ALIASED_COLUMN_GROUPS:
+        if out & group:
+            out.update(group)
     return out
+
+
+def duplicates_used_param(df: pd.DataFrame, col: str, used: set[str]) -> bool:
+    """True when col carries the same values as an already-used parameter."""
+    for used_col in used:
+        if used_col == col or used_col not in df.columns:
+            continue
+        if used_col in NON_PARAM_COLUMNS:
+            continue
+        try:
+            if df[col].astype(str).equals(df[used_col].astype(str)):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 QUALITATIVE_PALETTES = ["Plotly", "D3", "Set1", "Set2", "Pastel"]
@@ -357,6 +398,11 @@ def fixed_params(df: pd.DataFrame, exclude: set[str]) -> str:
     # (`tile=MxKxN` / `gemm=MxKxN`), so we never list them by their
     # composite name directly.
     skip = exclude | NON_PARAM_COLUMNS | set(SYNTHETIC_COMPOSITES.keys())
+    if any(
+        all(part in df.columns for part in SYNTHETIC_COMPOSITES[synth])
+        for synth in SIZE_LABEL_COMPOSITES
+    ):
+        skip.add("size_label")
     fixed: dict[str, object] = {}
     for col in df.columns:
         if col in skip:
@@ -370,14 +416,16 @@ def fixed_params(df: pd.DataFrame, exclude: set[str]) -> str:
             continue
 
     parts: list[str] = []
-    if all(c in fixed for c in ("tile_m", "tile_k", "tile_n")):
-        parts.append(f"tile={fixed['tile_m']}x{fixed['tile_k']}x{fixed['tile_n']}")
-        for c in ("tile_m", "tile_k", "tile_n"):
-            fixed.pop(c)
-    if all(c in fixed for c in ("gemm_m", "gemm_k", "gemm_n")):
-        parts.append(f"gemm={fixed['gemm_m']}x{fixed['gemm_k']}x{fixed['gemm_n']}")
-        for c in ("gemm_m", "gemm_k", "gemm_n"):
-            fixed.pop(c)
+    for synth, composite_cols in SYNTHETIC_COMPOSITES.items():
+        if all(c in fixed for c in composite_cols):
+            values = [fixed[c] for c in composite_cols]
+            if synth == "tile" and all(str(v) in ("0", "0.0") for v in values):
+                for c in composite_cols:
+                    fixed.pop(c)
+                continue
+            parts.append(f"{synth}={values[0]}x{values[1]}x{values[2]}")
+            for c in composite_cols:
+                fixed.pop(c)
     for col, val in fixed.items():
         parts.append(f"{col}={val}")
     return "  ·  ".join(parts)
@@ -605,6 +653,7 @@ def main() -> None:
             c for c in cols_all
             if c not in active_used
             and c not in NON_PARAM_COLUMNS
+            and not duplicates_used_param(df, c, active_used)
             and df[c].nunique(dropna=True) > 1
         ]
         fix_filters: dict[str, object] = {}

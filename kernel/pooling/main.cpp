@@ -12,6 +12,7 @@ static bool parse_args(int argc,
                        int &height,
                        int &width,
                        int64_t &max_inflight,
+                       int64_t &max_inflight_dma_writes,
                        int64_t &l2_base_lat)
 {
     workers = -1;
@@ -19,6 +20,7 @@ static bool parse_args(int argc,
     height = -1;
     width = -1;
     max_inflight = -1;
+    max_inflight_dma_writes = -1;
     l2_base_lat = -1;
 
     for (int i = 1; i < argc; ++i)
@@ -58,6 +60,11 @@ static bool parse_args(int argc,
             if (!need_value("--max-inflight-vec")) return false;
             max_inflight = std::max<int64_t>(std::stoll(argv[++i]), 1);
         }
+        else if (arg == "--max-inflight-dma-writes")
+        {
+            if (!need_value("--max-inflight-dma-writes")) return false;
+            max_inflight_dma_writes = std::max<int64_t>(std::stoll(argv[++i]), 1);
+        }
         else if (arg == "--dma-base-lat")
         {
             if (!need_value("--dma-base-lat")) return false;
@@ -69,6 +76,7 @@ static bool parse_args(int argc,
                       << " [--workers N] [--channels C]"
                       << " [--height H] [--width W]"
                       << " [--max-inflight-vec N]"
+                      << " [--max-inflight-dma-writes N]"
                       << " [--dma-base-lat N]\n";
             return false;
         }
@@ -89,10 +97,11 @@ int sc_main(int argc, char *argv[])
     int height = -1;
     int width = -1;
     int64_t max_inflight = -1;
+    int64_t max_inflight_dma_writes = -1;
     int64_t l2_base_lat = -1;
     if (!parse_args(argc, argv,
                     workers, channels, height, width,
-                    max_inflight, l2_base_lat))
+                    max_inflight, max_inflight_dma_writes, l2_base_lat))
         return (argc > 1) ? 1 : 0;
 
     PoolRuntimeConfig cfg = PoolRuntimeConfig::defaults();
@@ -101,6 +110,8 @@ int sc_main(int argc, char *argv[])
     if (height > 0)       cfg.height = height;
     if (width > 0)        cfg.width = width;
     if (max_inflight > 0) cfg.max_inflight_vec_reqs = static_cast<uint64_t>(max_inflight);
+    if (max_inflight_dma_writes > 0)
+        cfg.max_inflight_dma_writes = static_cast<uint64_t>(max_inflight_dma_writes);
     if (l2_base_lat >= 0) cfg.l2_base_lat = static_cast<uint64_t>(l2_base_lat);
 
     PoolTop top("pool_top", cfg);

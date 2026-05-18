@@ -337,6 +337,10 @@ struct PoolWorker : sc_module
             static_cast<size_t>(std::max<uint64_t>(cfg.max_inflight_vec_reqs, 1));
         const size_t l1_buffers =
             static_cast<size_t>(std::max(cfg.l1_tile_buffers, 1));
+        const size_t max_dma_writes =
+            static_cast<size_t>(std::max<uint64_t>(cfg.max_inflight_dma_writes, 1));
+
+        std::deque<PendingReq> dma_write_inflight;
 
         for (int c = c_start; c < c_end; ++c)
         {
@@ -380,8 +384,9 @@ struct PoolWorker : sc_module
                         head.dma.submit_time, head.dma.complete_time);
                 }
 
-                const bool is_last_tile = (head.tile_idx + 1) == cfg.tile_count();
-                const uint64_t wr = is_last_tile ? cfg.output_elem_bytes : 0;
+                // Per-request L1 writeback checkpoint; pinned vec unit
+                // keeps the running sum in its register across tiles.
+                const uint64_t wr = cfg.output_elem_bytes;
                 auto req = issue_begin(head.rd_bytes, wr, c, head.tile_idx);
                 ++vec_calls;
                 total_rd_bytes += head.rd_bytes;
@@ -440,9 +445,22 @@ struct PoolWorker : sc_module
 
             total_divide_cycles += cfg.divide_cycles;
             wait(cfg.divide_cycles * CYCLE);
+            // Fire-and-forget L2 channel writeback bounded by a
+            // per-worker inflight window; reap oldest when full.
             auto store_req = issue_dma(true, cfg.output_elem_bytes, c, -1);
-            issue_end(store_req);
+            dma_write_inflight.push_back(std::move(store_req));
             total_l2_wr_bytes += cfg.output_elem_bytes;
+            if (dma_write_inflight.size() > max_dma_writes)
+            {
+                issue_end(dma_write_inflight.front());
+                dma_write_inflight.pop_front();
+            }
+        }
+
+        while (!dma_write_inflight.empty())
+        {
+            issue_end(dma_write_inflight.front());
+            dma_write_inflight.pop_front();
         }
 
         elapsed_cycles = static_cast<uint64_t>((sc_time_stamp() - t_start) / CYCLE);
@@ -450,6 +468,14 @@ struct PoolWorker : sc_module
             completion_fifo->write(tid);
     }
 };
+
+static std::vector<int> build_identity_map(int n)
+{
+    std::vector<int> m;
+    m.reserve(static_cast<size_t>(n));
+    for (int i = 0; i < n; ++i) m.push_back(i);
+    return m;
+}
 
 PoolTop::PoolTop(sc_module_name name,
                  const PoolRuntimeConfig &cfg_,
@@ -459,9 +485,11 @@ PoolTop::PoolTop(sc_module_name name,
       cfg(cfg_),
       mat_acc("mat_acc", cfg.acc_queue_depth),
       vec_acc("vec_acc",
-              static_cast<size_t>(cfg.vec_acc_instances),
+              static_cast<size_t>(std::max(cfg.worker_count, 1)),
               cfg.acc_queue_depth,
-              /*enable_unit_pipeline=*/true),
+              build_identity_map(std::max(cfg.worker_count, 1)),
+              std::vector<uint64_t>(
+                  static_cast<size_t>(std::max(cfg.worker_count, 1)), 0)),
       noc("noc"),
       memory("memory",
              cfg.l1_base_lat,
@@ -532,13 +560,12 @@ PoolSimulationStats PoolTop::collect_stats() const
     stats.expected_l1_read_bytes =
         static_cast<uint64_t>(cfg.channels) * static_cast<uint64_t>(cfg.spatial()) *
         cfg.input_elem_bytes;
-    // Writeback happens once per channel (final tile only): one L1 write
-    // request and `output_elem_bytes` per channel, plus one L1 read per
-    // vec call.
+    // Per-request L1 writeback checkpoint: one read + one write per vec
+    // call. Carry is kept in the pinned vec unit's register; channel
+    // result lands in L2 via a separate fire-and-forget DMA.
     stats.expected_l1_write_bytes =
-        static_cast<uint64_t>(cfg.channels) * cfg.output_elem_bytes;
-    stats.expected_l1_reqs =
-        stats.expected_vec_calls + static_cast<uint64_t>(cfg.channels);
+        stats.expected_vec_calls * cfg.output_elem_bytes;
+    stats.expected_l1_reqs = stats.expected_vec_calls * 2;
     stats.expected_l2_read_bytes =
         static_cast<uint64_t>(cfg.channels) * static_cast<uint64_t>(cfg.spatial()) *
         cfg.input_elem_bytes;
@@ -666,14 +693,17 @@ void PoolTop::print_report(std::ostream &os) const
                                 ", H=1, W=1]"},
     });
 
+    const int pinned_vec_instances = std::max(cfg.worker_count, 1);
     report::print_section_title(os, "Hardware Configuration");
     report::print_fields(os, {
         {"Workers [count]", report::fmt_int(cfg.worker_count)},
         {"Matrix Accelerators [count]", report::na()},
-        {"Vector Accelerators [count]", report::fmt_int(cfg.vec_acc_instances)},
+        {"Vector Accelerators [count]", report::fmt_int(pinned_vec_instances)},
+        {"Worker->Vec Binding", "pinned 1:1"},
         {"Matrix Accelerator Capacity", report::na()},
         {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(cfg.vec_acc_cap)},
         {"Accelerator Queue Depth [requests]", report::fmt_u64(cfg.acc_queue_depth)},
+        {"Max Inflight L2 DMA Writes / worker", report::fmt_u64(cfg.max_inflight_dma_writes)},
         {"L1 Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l1_bw)},
         {"L1 Base Latency [cycles]", report::fmt_u64(cfg.l1_base_lat)},
         {"L1 Parallel Slots", report::fmt_u64(cfg.l1_slots)},
@@ -705,7 +735,7 @@ void PoolTop::print_report(std::ostream &os) const
     accel_rows.push_back({
         "Vector Accelerator",
         "pool-level",
-        report::fmt_int(cfg.vec_acc_instances),
+        report::fmt_int(pinned_vec_instances),
         report::fmt_u64(stats.vec_acc_reqs),
         report::fmt_u64(stats.vec_acc_queue_wait_cycles),
         report::fmt_u64(stats.vec_acc_busy_cycles),
@@ -723,7 +753,7 @@ void PoolTop::print_report(std::ostream &os) const
     accel_rows.push_back({
         "L1 Memory",
         "accelerator-side",
-        report::fmt_int(cfg.vec_acc_instances),
+        report::fmt_int(pinned_vec_instances),
         report::fmt_u64(stats.l1_reqs),
         report::fmt_u64(stats.l1_queue_wait_cycles),
         report::fmt_u64(stats.l1_busy_cycles),

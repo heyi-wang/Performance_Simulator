@@ -22,6 +22,9 @@ struct PoolRuntimeConfig
     int worker_count = POOL_NUM_WORKERS;
     uint64_t vec_acc_cap = POOL_VEC_ACC_CAP;
     uint64_t vec_acc_cycle = POOL_VEC_ACC_CYCLE;
+    // Under pinned mode the effective vec instance count is `worker_count`
+    // regardless of this value; the pool builds `worker_count` units mapped
+    // 1:1 to workers. This field is a fallback only used if worker_count == 0.
     int vec_acc_instances = POOL_VEC_ACC_INSTANCES;
     uint64_t scalar_overhead = POOL_SCALAR_OVERHEAD;
     uint64_t divide_cycles = POOL_DIVIDE_CYCLES;
@@ -36,6 +39,7 @@ struct PoolRuntimeConfig
     uint64_t dma_vec_rd_scalar = POOL_DMA_VEC_RD_SCALAR_CFG;
     uint64_t dma_vec_wr_scalar = POOL_DMA_VEC_WR_SCALAR_CFG;
     uint64_t max_inflight_vec_reqs = POOL_MAX_INFLIGHT_VEC_REQS_CFG;
+    uint64_t max_inflight_dma_writes = POOL_MAX_INFLIGHT_DMA_WRITES_CFG;
 
     static PoolRuntimeConfig defaults()
     {

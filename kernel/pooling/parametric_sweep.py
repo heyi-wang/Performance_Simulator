@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sweep input size and worker count for the pooling simulator."""
+"""Sweep pooling input size and thread count for the pooling simulator."""
 
 import argparse
 import csv
@@ -128,13 +128,15 @@ def power_of_two_workers(max_workers: int) -> list[int]:
 def build_parser() -> argparse.ArgumentParser:
     default_vec_accels, vec_bytes, channels, height, width = read_defaults()
     parser = argparse.ArgumentParser(
-        description="Sweep pooling input size and workers, then plot elapsed cycles."
+        description="Sweep pooling input size and threads, then plot elapsed cycles."
     )
     parser.add_argument(
         "--max-workers",
+        "--max-threads",
+        dest="max_workers",
         type=int,
         default=64,
-        help="Largest worker count to sweep. Points are 1, 2, 4, ... up to this value.",
+        help="Largest thread count to sweep. Points are 1, 2, 4, ... up to this value.",
     )
     parser.add_argument(
         "--size-multipliers",
@@ -391,6 +393,13 @@ def read_csv(csv_path: Path) -> list[dict[str, str]]:
         return list(csv.DictReader(f))
 
 
+def row_threads(row: dict[str, int | str]) -> int:
+    value = row.get("threads") or row.get("workers")
+    if value is None:
+        raise KeyError("expected either 'threads' or 'workers' in sweep CSV")
+    return int(value)
+
+
 def plot_rows(rows: list[dict[str, int | str]], png_path: Path) -> None:
     png_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -407,7 +416,7 @@ def plot_rows(rows: list[dict[str, int | str]], png_path: Path) -> None:
         label = str(row["size_label"])
         if include_hardware_in_label:
             label += f" vec={row['vec_accels']}"
-        workers = int(row["workers"])
+        workers = row_threads(row)
         cycles = int(row["total_cycles"])
         work = (
             int(row["pool_channels"]) *
@@ -432,7 +441,7 @@ def plot_rows(rows: list[dict[str, int | str]], png_path: Path) -> None:
             label=label,
         )
 
-    worker_ticks = sorted({int(row["workers"]) for row in rows})
+    worker_ticks = sorted({row_threads(row) for row in rows})
     hardware_label = ", ".join(f"vec={vec_accels}" for vec_accels in hardware_configs)
 
     ax.set_xscale("log", base=2)
@@ -445,10 +454,10 @@ def plot_rows(rows: list[dict[str, int | str]], png_path: Path) -> None:
     )
     ax.yaxis.set_minor_formatter(mticker.NullFormatter())
     ax.set_title(
-        f"Pooling Performance Simulation (input size vs workers), {hardware_label}",
+        f"Pooling Performance Simulation (input size vs threads), {hardware_label}",
         fontweight="bold",
     )
-    ax.set_xlabel("Workers (log2 scale)")
+    ax.set_xlabel("Threads (log2 scale)")
     ax.set_ylabel("Total Elapsed Cycles (log10 scale)")
     ax.grid(True, which="major", linestyle="-", linewidth=0.45, alpha=0.35)
     ax.grid(True, which="minor", linestyle=":", linewidth=0.35, alpha=0.25)
@@ -471,7 +480,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.max_workers < 1:
-        parser.error("--max-workers must be >= 1")
+        parser.error("--max-workers/--max-threads must be >= 1")
     if args.base_channels < 1 or args.base_height < 1 or args.base_width < 1:
         parser.error("base dimensions must be >= 1")
     if args.max_inflight_vec < 0:
@@ -526,7 +535,7 @@ def main() -> int:
                             "tile_n": 0,
                             "mat_latency": 0,
                             "mat_count": 0,
-                            "vec_count": actual_vec,
+                            "vec_count": vec_accels,
                             "vec_bytes": args.vec_bytes,
                             "gemm_m": channels,
                             "gemm_k": height,
@@ -553,7 +562,7 @@ def main() -> int:
                             "pool_height": height,
                             "pool_width": width,
                             "workers": workers,
-                            "vec_accels": actual_vec,
+                            "vec_accels": vec_accels,
                             "max_inflight_vec": args.max_inflight_vec or "default",
                         }
                     )
