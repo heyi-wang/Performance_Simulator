@@ -85,6 +85,21 @@ struct DwConvPostProcessor : WorkerPostProcessor
         return static_cast<uint64_t>(hi - lo) * cfg.input_elem_bytes;
     }
 
+    // Geometry for one strip in the flat (c, oh, st) iteration. The
+    // flat enumeration lets the per-worker prefetch lookahead pipeline
+    // straddle row and channel boundaries without resetting.
+    struct StripGeom
+    {
+        int c = 0;
+        int oh = 0;
+        int st = 0;
+        uint64_t strip_start = 0;
+        uint64_t vl = 0;
+        uint64_t prefetch_bytes = 0;
+        uint64_t wr_bytes_strip = 0;
+        bool first_of_channel = false;
+    };
+
     void run_post_mat(Worker &worker) override
     {
         const int c_start = (tid * cfg.channels) / n_workers;
@@ -104,120 +119,145 @@ struct DwConvPostProcessor : WorkerPostProcessor
 
         std::deque<Worker::DmaReq> write_inflight;
 
-        for (int c = c_start; c < c_end; ++c)
+        const int strips_per_row    = cfg.strips_per_row();
+        const int rows              = cfg.out_h();
+        const int strips_per_channel = rows * strips_per_row;
+        const int n_channels        = c_end - c_start;
+        const int n_strips_total    = n_channels * strips_per_channel;
+        if (n_strips_total == 0)
+            return;
+
+        auto strip_geom = [&](int idx) {
+            StripGeom g;
+            const int c_local = idx / strips_per_channel;
+            const int rem     = idx % strips_per_channel;
+            g.c                = c_start + c_local;
+            g.oh               = rem / strips_per_row;
+            g.st               = rem % strips_per_row;
+            g.first_of_channel = (rem == 0);
+            g.strip_start      =
+                static_cast<uint64_t>(g.st) * cfg.vec_acc_cap;
+            g.vl = std::min<uint64_t>(
+                cfg.vec_acc_cap,
+                static_cast<uint64_t>(cfg.out_w()) - g.strip_start);
+            g.wr_bytes_strip = g.vl * cfg.output_elem_bytes;
+            uint64_t pb = 0;
+            for (int kh = 0; kh < cfg.kernel_h; ++kh)
+                for (int kw = 0; kw < cfg.kernel_w; ++kw)
+                    pb += sub_rd_bytes(g.oh, g.strip_start, g.vl, kh, kw);
+            if (g.first_of_channel)
+                pb += kernel_rd_bytes;
+            g.prefetch_bytes = pb;
+            return g;
+        };
+
+        // --- Bootstrap: fire strip 0's prefetch before entering the loop. ---
+        // The loop body then maintains a one-deep prefetch pipeline:
+        // while we hold the unit lock / drain / writeback for strip s,
+        // strip s+1's DMA is already inflight. By the time we loop back
+        // to finish_dma it usually returns immediately.
+        Worker::DmaReq pending_read;
         {
-            for (int oh = 0; oh < cfg.out_h(); ++oh)
+            const StripGeom g0 = strip_geom(0);
+            if (cfg.dma_vec_rd_scalar > 0)
+                worker.do_scalar(cfg.dma_vec_rd_scalar);
+            pending_read = worker.issue_dma_begin(false, g0.prefetch_bytes);
+        }
+
+        for (int idx = 0; idx < n_strips_total; ++idx)
+        {
+            const StripGeom g = strip_geom(idx);
+
+            // --- (1) Block until THIS strip's prefetch lands. -----
+            // Account only the wall-clock spent inside finish_dma so
+            // dma_cycles tracks worker-blocking time, not the DMA's
+            // total inflight span (which now overlaps with submit/drain).
+            const sc_time wait_start = sc_time_stamp();
+            worker.finish_dma(pending_read);
+            total_dma_cycles += static_cast<uint64_t>(
+                (sc_time_stamp() - wait_start) / CYCLE);
+            total_l2_rd_bytes += g.prefetch_bytes;
+
+            // --- (1b) Launch NEXT strip's prefetch (lookahead). ---
+            // Fired BEFORE acquiring the unit lock so its inflight
+            // window covers lock-hold + drain + writeback scalar.
+            if (idx + 1 < n_strips_total)
             {
-                const int strips = cfg.strips_per_row();
-                bool channel_kernel_loaded = (oh != 0);
+                const StripGeom gn = strip_geom(idx + 1);
+                if (cfg.dma_vec_rd_scalar > 0)
+                    worker.do_scalar(cfg.dma_vec_rd_scalar);
+                pending_read = worker.issue_dma_begin(false, gn.prefetch_bytes);
+            }
 
-                for (int st = 0; st < strips; ++st)
+            // --- (2) Acquire per-unit lock for admission contiguity --
+            // Hold the lock across all kh*kw issue_begin calls, including
+            // any queue-full stalls, so no other worker's strip can be
+            // admitted to this unit between this strip's sub-requests.
+            if (unit_lock)
+                unit_lock->wait();
+
+            // --- (3) Issue kh*kw sub-requests --------------
+            // The last sub-request carries the L1 writeback
+            // (vl * output_elem_bytes); earlier ones write
+            // nothing (accumulator stays in the unit's
+            // register and is committed on the final req).
+            std::deque<Worker::PendingReq> pending;
+            const int total_sub = cfg.kernel_h * cfg.kernel_w;
+            int sub_idx = 0;
+            for (int kh = 0; kh < cfg.kernel_h; ++kh)
+            {
+                for (int kw = 0; kw < cfg.kernel_w; ++kw, ++sub_idx)
                 {
-                    const uint64_t strip_start =
-                        static_cast<uint64_t>(st) * cfg.vec_acc_cap;
-                    const uint64_t vl = std::min<uint64_t>(
-                        cfg.vec_acc_cap,
-                        static_cast<uint64_t>(cfg.out_w()) - strip_start);
-                    const uint64_t wr_bytes_strip =
-                        vl * cfg.output_elem_bytes;
+                    const uint64_t rd_sub =
+                        sub_rd_bytes(g.oh, g.strip_start, g.vl, kh, kw);
+                    const bool is_last = (sub_idx == total_sub - 1);
+                    const uint64_t wr_sub =
+                        is_last ? g.wr_bytes_strip : 0ULL;
 
-                    // --- (1) L2 DMA prefetch -----------------------
-                    // One DMA brings the full in-bounds input window
-                    // for this strip into L1; kh*kw vec sub-requests
-                    // below then read from L1.
-                    uint64_t prefetch_bytes = 0;
-                    for (int kh = 0; kh < cfg.kernel_h; ++kh)
-                        for (int kw = 0; kw < cfg.kernel_w; ++kw)
-                            prefetch_bytes +=
-                                sub_rd_bytes(oh, strip_start, vl, kh, kw);
-                    if (!channel_kernel_loaded)
-                    {
-                        prefetch_bytes += kernel_rd_bytes;
-                        channel_kernel_loaded = true;
-                    }
+                    auto req = worker.issue_begin(
+                        Interconnect::ADDR_VEC,
+                        cfg.vec_acc_cycle,
+                        rd_sub,
+                        wr_sub);
+                    ++worker.vec_calls;
+                    total_l1_rd_bytes += rd_sub;
+                    total_l1_wr_bytes += wr_sub;
+                    pending.push_back(std::move(req));
 
-                    if (cfg.dma_vec_rd_scalar > 0)
-                        worker.do_scalar(cfg.dma_vec_rd_scalar);
-
-                    const sc_time prefetch_submit = sc_time_stamp();
-                    Worker::DmaReq read_dma =
-                        worker.issue_dma_begin(false, prefetch_bytes);
-                    worker.finish_dma(read_dma);
-                    total_l2_rd_bytes += prefetch_bytes;
-                    total_dma_cycles += static_cast<uint64_t>(
-                        (sc_time_stamp() - prefetch_submit) / CYCLE);
-
-                    // --- (2) Acquire per-unit lock for admission contiguity --
-                    // Hold the lock across all kh*kw issue_begin calls, including
-                    // any queue-full stalls, so no other worker's strip can be
-                    // admitted to this unit between this strip's sub-requests.
-                    if (unit_lock)
-                        unit_lock->wait();
-
-                    // --- (3) Issue kh*kw sub-requests --------------
-                    // The last sub-request carries the L1 writeback
-                    // (vl * output_elem_bytes); earlier ones write
-                    // nothing (accumulator stays in the unit's
-                    // register and is committed on the final req).
-                    std::deque<Worker::PendingReq> pending;
-                    const int total_sub = cfg.kernel_h * cfg.kernel_w;
-                    int sub_idx = 0;
-                    for (int kh = 0; kh < cfg.kernel_h; ++kh)
-                    {
-                        for (int kw = 0; kw < cfg.kernel_w; ++kw, ++sub_idx)
-                        {
-                            const uint64_t rd_sub =
-                                sub_rd_bytes(oh, strip_start, vl, kh, kw);
-                            const bool is_last = (sub_idx == total_sub - 1);
-                            const uint64_t wr_sub =
-                                is_last ? wr_bytes_strip : 0ULL;
-
-                            auto req = worker.issue_begin(
-                                Interconnect::ADDR_VEC,
-                                cfg.vec_acc_cycle,
-                                rd_sub,
-                                wr_sub);
-                            ++worker.vec_calls;
-                            total_l1_rd_bytes += rd_sub;
-                            total_l1_wr_bytes += wr_sub;
-                            pending.push_back(std::move(req));
-
-                            // Per-request scalar dispatch overhead
-                            // (matches matmul/pooling per-vec-call).
-                            worker.do_scalar(cfg.scalar_overhead);
-                        }
-                    }
-
-                    // --- (4) Release unit lock ---------------------
-                    // The strip is now fully admitted/enqueued. Let the next
-                    // worker queue behind it while this worker drains responses.
-                    if (unit_lock)
-                        unit_lock->post();
-
-                    // Drain all kh*kw sub-requests. Their internal
-                    // load/compute/write stages overlap via the
-                    // AcceleratorTLM's pipelined unit threads.
-                    for (auto &req : pending)
-                        worker.issue_end(req);
-
-                    // --- (5) Fire-and-forget L2 writeback ----------
-                    // Per the user's spec: charge the writeback DMA
-                    // scalar overhead at the end of the last
-                    // sub-request, then non-blocking L2 DMA.
-                    if (cfg.dma_vec_wr_scalar > 0)
-                        worker.do_scalar(cfg.dma_vec_wr_scalar);
-
-                    if (write_inflight.size() >= max_dma_writes)
-                    {
-                        worker.finish_dma(write_inflight.front());
-                        write_inflight.pop_front();
-                    }
-                    Worker::DmaReq w =
-                        worker.issue_dma_begin(true, wr_bytes_strip);
-                    total_l2_wr_bytes += wr_bytes_strip;
-                    write_inflight.push_back(std::move(w));
+                    // Per-request scalar dispatch overhead
+                    // (matches matmul/pooling per-vec-call).
+                    worker.do_scalar(cfg.scalar_overhead);
                 }
             }
+
+            // --- (4) Release unit lock ---------------------
+            // The strip is now fully admitted/enqueued. Let the next
+            // worker queue behind it while this worker drains responses.
+            if (unit_lock)
+                unit_lock->post();
+
+            // Drain all kh*kw sub-requests. Their internal
+            // load/compute/write stages overlap via the
+            // AcceleratorTLM's pipelined unit threads.
+            for (auto &req : pending)
+                worker.issue_end(req);
+
+            // --- (5) Fire-and-forget L2 writeback ----------
+            // Per the user's spec: charge the writeback DMA
+            // scalar overhead at the end of the last
+            // sub-request, then non-blocking L2 DMA.
+            if (cfg.dma_vec_wr_scalar > 0)
+                worker.do_scalar(cfg.dma_vec_wr_scalar);
+
+            if (write_inflight.size() >= max_dma_writes)
+            {
+                worker.finish_dma(write_inflight.front());
+                write_inflight.pop_front();
+            }
+            Worker::DmaReq w =
+                worker.issue_dma_begin(true, g.wr_bytes_strip);
+            total_l2_wr_bytes += g.wr_bytes_strip;
+            write_inflight.push_back(std::move(w));
         }
 
         // Drain remaining fire-and-forget L2 writes.
@@ -479,15 +519,46 @@ DwConvSimulationStats DwConvTop::collect_stats() const
               sim_cycles
         : 0.0;
 
-    int slowest_tid = -1;
+    int slowest_idx = -1;
     uint64_t slowest_cycles = 0;
-    for (const auto *w : workers)
-        if (w->elapsed_cycles > slowest_cycles)
+    for (size_t i = 0; i < workers.size(); ++i)
+        if (workers[i]->elapsed_cycles > slowest_cycles)
         {
-            slowest_cycles = w->elapsed_cycles;
-            slowest_tid = w->tid;
+            slowest_cycles = workers[i]->elapsed_cycles;
+            slowest_idx = static_cast<int>(i);
         }
-    stats.slowest_worker_tid = slowest_tid;
+    stats.slowest_worker_tid =
+        (slowest_idx >= 0) ? workers[static_cast<size_t>(slowest_idx)]->tid : -1;
+
+    if (slowest_idx >= 0)
+    {
+        const Worker *sw = workers[static_cast<size_t>(slowest_idx)];
+        const DwConvPostProcessor *spp =
+            post_processors[static_cast<size_t>(slowest_idx)].get();
+        const uint64_t vec_service = sw->vec_calls * cfg.vec_acc_cycle;
+        const uint64_t dma_cycles  = (spp ? spp->total_dma_cycles : 0) +
+                                     sw->mem_cycles_accum;
+        const uint64_t scalar_cycles =
+            (sw->compute_cycles >= sw->vec_service_cycles)
+                ? (sw->compute_cycles - sw->vec_service_cycles) : 0;
+        const uint64_t stall_cycles = sw->stall_cycles;
+
+        stats.slowest_vec_cycles    = vec_service;
+        stats.slowest_dma_cycles    = dma_cycles;
+        stats.slowest_scalar_cycles = scalar_cycles;
+        stats.slowest_stall_cycles  = stall_cycles;
+
+        const uint64_t total_categorized =
+            vec_service + dma_cycles + scalar_cycles + stall_cycles;
+        if (total_categorized > 0)
+        {
+            const double denom = static_cast<double>(total_categorized);
+            stats.vec_cycle_fraction    = vec_service   / denom * 100.0;
+            stats.dma_cycle_fraction    = dma_cycles    / denom * 100.0;
+            stats.scalar_cycle_fraction = scalar_cycles / denom * 100.0;
+            stats.stall_cycle_fraction  = stall_cycles  / denom * 100.0;
+        }
+    }
 
     stats.verification_passed =
         stats.total_vec_calls    == stats.expected_vec_calls &&
@@ -658,6 +729,10 @@ void DwConvTop::print_report(std::ostream &os) const
         {"Average L2 DMA Bandwidth [bytes/cycle]",
          report::fmt_rate(stats.l2_bw_observed, "bytes/cycle")},
         {"Critical-Path Worker [tid]", report::fmt_int(stats.slowest_worker_tid)},
+        {"Vec Cycle Fraction [%]",    report::fmt_percent(stats.vec_cycle_fraction)},
+        {"DMA Cycle Fraction [%]",    report::fmt_percent(stats.dma_cycle_fraction)},
+        {"Scalar Cycle Fraction [%]", report::fmt_percent(stats.scalar_cycle_fraction)},
+        {"Stall Cycle Fraction [%]",  report::fmt_percent(stats.stall_cycle_fraction)},
     });
 
     report::print_section_title(os, "Verification");
@@ -701,23 +776,3 @@ void DwConvTop::done_monitor()
     done_event->notify(SC_ZERO_TIME);
 }
 
-#ifndef KERNEL_STANDALONE_MAIN
-#define KERNEL_STANDALONE_MAIN 1
-#endif
-
-#if KERNEL_STANDALONE_MAIN
-int sc_main(int argc, char *argv[])
-{
-    (void)argc;
-    (void)argv;
-
-    DwConvRuntimeConfig cfg = DwConvRuntimeConfig::defaults();
-    DwConvTop top("dw_top", cfg);
-    sc_start();
-
-    top.print_report(std::cout);
-
-    const DwConvSimulationStats stats = top.collect_stats();
-    return stats.verification_passed ? 0 : 2;
-}
-#endif

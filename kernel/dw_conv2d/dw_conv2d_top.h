@@ -110,6 +110,15 @@ struct DwConvSimulationStats
     double l1_bw_observed = 0.0;
     double l2_bw_observed = 0.0;
     int slowest_worker_tid = -1;
+    // Critical-path-worker per-category cycle counts (mirrors pooling/matmul).
+    uint64_t slowest_vec_cycles = 0;
+    uint64_t slowest_dma_cycles = 0;
+    uint64_t slowest_scalar_cycles = 0;
+    uint64_t slowest_stall_cycles = 0;
+    double vec_cycle_fraction = 0.0;
+    double dma_cycle_fraction = 0.0;
+    double scalar_cycle_fraction = 0.0;
+    double stall_cycle_fraction = 0.0;
     bool verification_passed = false;
 };
 
