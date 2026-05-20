@@ -6,10 +6,12 @@
 #include <tlm_utils/simple_initiator_socket.h>
 
 #include <algorithm>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common.h"
@@ -18,44 +20,6 @@
 
 using namespace sc_core;
 using namespace tlm;
-
-static uint64_t cfg_tile_cap(const VecOpsRuntimeConfig &cfg)
-{
-    return cfg.tile_cap();
-}
-
-static uint64_t cfg_rd_bytes(const VecOpsRuntimeConfig &cfg, uint64_t vl)
-{
-    switch (cfg.op)
-    {
-    case VOP_ELEMWISE_ADD:         return vl * cfg.elem_bytes * 2;
-    case VOP_ELEMWISE_MUL:         return vl * cfg.elem_bytes * 2;
-    case VOP_SCALAR_MUL:           return vl * cfg.elem_bytes;
-    case VOP_QUANTIZE_I32_TO_I8:   return vl * 4;
-    case VOP_DEQUANTIZE_I8_TO_I32: return vl * 1;
-    case VOP_BIAS_ADD_I32:         return vl * 4;
-    }
-    return 0;
-}
-
-static uint64_t cfg_wr_bytes(const VecOpsRuntimeConfig &cfg, uint64_t vl)
-{
-    switch (cfg.op)
-    {
-    case VOP_ELEMWISE_ADD:         return vl * cfg.elem_bytes;
-    case VOP_ELEMWISE_MUL:         return vl * cfg.elem_bytes;
-    case VOP_SCALAR_MUL:           return vl * cfg.elem_bytes;
-    case VOP_QUANTIZE_I32_TO_I8:   return vl * 1;
-    case VOP_DEQUANTIZE_I8_TO_I32: return vl * 4;
-    case VOP_BIAS_ADD_I32:         return vl * 4;
-    }
-    return 0;
-}
-
-static uint64_t cfg_extra_rd_bytes_per_channel(const VecOpsRuntimeConfig &cfg)
-{
-    return (cfg.op == VOP_BIAS_ADD_I32) ? 4 : 0;
-}
 
 struct VecOpsExt : tlm_extension<VecOpsExt>
 {
@@ -90,8 +54,8 @@ struct VecOpsWorker : sc_module
     uint64_t total_wait_cycles = 0;
     uint64_t total_stall_cycles = 0;
     uint64_t total_mem_cycles = 0;
-    uint64_t total_rd_bytes = 0;
-    uint64_t total_wr_bytes = 0;
+    uint64_t total_rd_bytes = 0;        // L1 vec-pipe reads
+    uint64_t total_wr_bytes = 0;        // L1 vec-pipe writes
     uint64_t elapsed_cycles = 0;
 
     struct DoneEntry
@@ -109,6 +73,7 @@ struct VecOpsWorker : sc_module
         ReqExt *req_ext = nullptr;
         TxnExt *tx_ext = nullptr;
         VecOpsExt *vop_ext = nullptr;
+        MemoryAccessExt *mem_ext = nullptr;
         DoneEntry *done_entry = nullptr;
         uint64_t stall_cycles = 0;
         sc_time submit_time = SC_ZERO_TIME;
@@ -192,7 +157,7 @@ struct VecOpsWorker : sc_module
         gp->set_streaming_width(0);
         gp->set_response_status(TLM_INCOMPLETE_RESPONSE);
 
-        auto *req = new ReqExt(tid, cfg.vec_acc_cycle, rd, wr);
+        auto *req = new ReqExt(tid, cfg.service_cycles(), rd, wr);
         auto *tx = new TxnExt();
         tx->src_worker = tid;
         auto *vop = new VecOpsExt();
@@ -233,13 +198,13 @@ struct VecOpsWorker : sc_module
         return p;
     }
 
-    PendingReq issue_mem_read(uint64_t bytes, int channel_id)
+    PendingReq issue_dma(bool is_write, uint64_t bytes, int channel_id)
     {
         PendingReq p;
         p.direct_mem = true;
 
         auto *gp = new tlm_generic_payload();
-        gp->set_command(TLM_READ_COMMAND);
+        gp->set_command(is_write ? TLM_WRITE_COMMAND : TLM_READ_COMMAND);
         gp->set_address(Interconnect::ADDR_MEM);
         gp->set_data_ptr(nullptr);
         gp->set_data_length(static_cast<unsigned>(bytes));
@@ -252,13 +217,16 @@ struct VecOpsWorker : sc_module
         vop->op_type = cfg.op;
         vop->channel_id = channel_id;
         vop->tile_idx = -1;
+        auto *mem = new MemoryAccessExt(MemoryAccessKind::Dma);
 
         gp->set_extension(tx);
         gp->set_extension(vop);
+        gp->set_extension(mem);
 
         p.gp = gp;
         p.tx_ext = tx;
         p.vop_ext = vop;
+        p.mem_ext = mem;
         p.done_entry = new DoneEntry();
         p.done_entry->ev = new sc_event();
         p.done_entry->admit_ev = new sc_event();
@@ -273,6 +241,13 @@ struct VecOpsWorker : sc_module
             done_map.erase(gp);
             p.sync_done = true;
         }
+
+        // Per-DMA scalar setup cost (matches matmul/pooling DmaScalarMode::VecPerCall).
+        const uint64_t scalar_cost =
+            is_write ? cfg.dma_vec_wr_scalar : cfg.dma_vec_rd_scalar;
+        if (scalar_cost > 0)
+            do_scalar(scalar_cost);
+
         return p;
     }
 
@@ -307,9 +282,12 @@ struct VecOpsWorker : sc_module
         p.gp->clear_extension(p.req_ext);
         p.gp->clear_extension(p.tx_ext);
         p.gp->clear_extension(p.vop_ext);
+        if (p.mem_ext)
+            p.gp->clear_extension(p.mem_ext);
         delete p.req_ext;
         delete p.tx_ext;
         delete p.vop_ext;
+        delete p.mem_ext;
         delete p.gp;
         p.gp = nullptr;
     }
@@ -322,29 +300,34 @@ struct VecOpsWorker : sc_module
         sc_time t_start = sc_time_stamp();
         int c_start = (tid * cfg.channels) / n_workers;
         int c_end = ((tid + 1) * cfg.channels) / n_workers;
-        const uint64_t tile_cap = cfg_tile_cap(cfg);
-        const uint64_t extra_rd = cfg_extra_rd_bytes_per_channel(cfg);
+        const uint64_t tile_cap = cfg.tile_cap();
+        const uint64_t spatial = static_cast<uint64_t>(cfg.spatial());
+        const uint64_t in_bytes_per_chan =
+            spatial * vop_input_operand_count(cfg.op) * vop_input_elem_bytes(cfg.op);
+        const uint64_t out_bytes_per_chan = spatial * vop_output_elem_bytes(cfg.op);
+        const size_t max_dma_writes =
+            static_cast<size_t>(std::max<uint64_t>(cfg.max_inflight_dma_writes, 1));
+
+        std::deque<PendingReq> dma_write_inflight;
 
         for (int c = c_start; c < c_end; ++c)
         {
-            if (extra_rd != 0)
-            {
-                auto bias_rd = issue_mem_read(extra_rd, c);
-                total_rd_bytes += extra_rd;
-                issue_end(bias_rd);
-            }
+            // L2 -> L1 prefetch of the channel's input operands.
+            auto prefetch = issue_dma(false, in_bytes_per_chan, c);
+            issue_end(prefetch);
 
+            // Vec calls on the prefetched channel. Each call charges
+            // its operation-specific service cycles + per-call L1 r/w.
             std::vector<PendingReq> pending;
             pending.reserve(static_cast<size_t>(cfg.tile_count()));
 
             for (int t = 0; t < cfg.tile_count(); ++t)
             {
-                uint64_t tile_elems =
+                const uint64_t tile_elems =
                     std::min<uint64_t>(tile_cap,
-                                       static_cast<uint64_t>(cfg.spatial()) -
-                                           static_cast<uint64_t>(t) * tile_cap);
-                uint64_t rd = cfg_rd_bytes(cfg, tile_elems);
-                uint64_t wr = cfg_wr_bytes(cfg, tile_elems);
+                                       spatial - static_cast<uint64_t>(t) * tile_cap);
+                const uint64_t rd = vop_rd_bytes(cfg.op, tile_elems);
+                const uint64_t wr = vop_wr_bytes(cfg.op, tile_elems);
                 auto req = issue_begin(rd, wr, c, t);
                 ++vec_calls;
                 total_rd_bytes += rd;
@@ -355,6 +338,21 @@ struct VecOpsWorker : sc_module
 
             for (auto &req : pending)
                 issue_end(req);
+
+            // Fire-and-forget L1 -> L2 writeback of the channel output.
+            auto store = issue_dma(true, out_bytes_per_chan, c);
+            dma_write_inflight.push_back(std::move(store));
+            if (dma_write_inflight.size() > max_dma_writes)
+            {
+                issue_end(dma_write_inflight.front());
+                dma_write_inflight.pop_front();
+            }
+        }
+
+        while (!dma_write_inflight.empty())
+        {
+            issue_end(dma_write_inflight.front());
+            dma_write_inflight.pop_front();
         }
 
         elapsed_cycles = static_cast<uint64_t>((sc_time_stamp() - t_start) / CYCLE);
@@ -375,9 +373,12 @@ VecOpsTop::VecOpsTop(sc_module_name name,
               cfg.acc_queue_depth),
       noc("noc"),
       memory("memory",
-             cfg.memory_base_lat,
-             cfg.memory_bw,
-             static_cast<uint64_t>(cfg.vec_acc_instances)),
+             cfg.l1_base_lat,
+             cfg.l1_bw,
+             cfg.l2_base_lat,
+             cfg.l2_bw,
+             cfg.l1_slots,
+             cfg.l2_slots),
       done_event(done_event_)
 {
     noc.to_mat.bind(mat_acc.tgt);
@@ -418,12 +419,15 @@ VecOpsTop::~VecOpsTop()
 VecOpsSimulationStats VecOpsTop::collect_stats() const
 {
     VecOpsSimulationStats stats;
-    const uint64_t tile_cap = cfg_tile_cap(cfg);
-    const uint64_t extra_rd_per_channel = cfg_extra_rd_bytes_per_channel(cfg);
 
+    const VecOpsWorker *slowest = nullptr;
     for (const auto *w : workers)
     {
-        stats.max_elapsed_cycles = std::max(stats.max_elapsed_cycles, w->elapsed_cycles);
+        if (w->elapsed_cycles > stats.max_elapsed_cycles)
+        {
+            stats.max_elapsed_cycles = w->elapsed_cycles;
+            slowest = w;
+        }
         stats.total_vec_calls += w->vec_calls;
         stats.total_rd_bytes += w->total_rd_bytes;
         stats.total_wr_bytes += w->total_wr_bytes;
@@ -431,28 +435,54 @@ VecOpsSimulationStats VecOpsTop::collect_stats() const
         stats.total_mem_cycles += w->total_mem_cycles;
     }
 
-    stats.expected_vec_calls =
-        static_cast<uint64_t>(cfg.channels) * static_cast<uint64_t>(cfg.tile_count());
+    const uint64_t channels = static_cast<uint64_t>(cfg.channels);
+    const uint64_t spatial = static_cast<uint64_t>(cfg.spatial());
+    const uint64_t tile_cap = cfg.tile_cap();
+    const uint64_t operands = vop_input_operand_count(cfg.op);
+    const uint64_t in_elem = vop_input_elem_bytes(cfg.op);
+    const uint64_t out_elem = vop_output_elem_bytes(cfg.op);
+
     uint64_t per_chan_rd = 0;
     uint64_t per_chan_wr = 0;
     for (int t = 0; t < cfg.tile_count(); ++t)
     {
-        uint64_t vl = std::min<uint64_t>(
-            tile_cap,
-            static_cast<uint64_t>(cfg.spatial()) - static_cast<uint64_t>(t) * tile_cap);
-        per_chan_rd += cfg_rd_bytes(cfg, vl);
-        per_chan_wr += cfg_wr_bytes(cfg, vl);
+        const uint64_t vl = std::min<uint64_t>(
+            tile_cap, spatial - static_cast<uint64_t>(t) * tile_cap);
+        per_chan_rd += vop_rd_bytes(cfg.op, vl);
+        per_chan_wr += vop_wr_bytes(cfg.op, vl);
     }
-    stats.expected_rd_bytes =
-        static_cast<uint64_t>(cfg.channels) * (per_chan_rd + extra_rd_per_channel);
-    stats.expected_wr_bytes = static_cast<uint64_t>(cfg.channels) * per_chan_wr;
+    stats.expected_vec_calls = channels * static_cast<uint64_t>(cfg.tile_count());
+    stats.expected_l1_read_bytes  = channels * per_chan_rd;
+    stats.expected_l1_write_bytes = channels * per_chan_wr;
+    stats.expected_l1_reqs        = stats.expected_vec_calls * 2;
+    stats.expected_l2_read_bytes  = channels * spatial * operands * in_elem;
+    stats.expected_l2_write_bytes = channels * spatial * out_elem;
+    stats.expected_l2_dma_reqs    = channels * 2;
+    stats.expected_vec_acc_busy_cycles =
+        stats.expected_vec_calls * cfg.service_cycles();
+
     stats.vec_acc_reqs = vec_acc.req_count_total();
     stats.vec_acc_busy_cycles = vec_acc.busy_cycles_total();
     stats.vec_acc_occupied_cycles = vec_acc.occupied_cycles_total();
     stats.vec_acc_queue_wait_cycles = vec_acc.queue_wait_cycles_total();
-    stats.memory_reqs = memory.reqs;
-    stats.memory_busy_cycles = memory.busy_cycles;
-    stats.memory_queue_wait_cycles = memory.qwait_cycles;
+
+    stats.l1_reqs = memory.l1_reqs;
+    stats.l1_read_bytes = memory.l1_read_bytes;
+    stats.l1_write_bytes = memory.l1_write_bytes;
+    stats.l1_busy_cycles = memory.l1_busy_cycles;
+    stats.l1_queue_wait_cycles = memory.l1_qwait_cycles;
+
+    stats.l2_dma_reqs = memory.dma_reqs;
+    stats.l2_dma_read_bytes = memory.dma_read_bytes;
+    stats.l2_dma_write_bytes = memory.dma_write_bytes;
+    stats.l2_dma_busy_cycles = memory.dma_busy_cycles;
+    stats.l2_dma_queue_wait_cycles = memory.dma_qwait_cycles;
+
+    // Back-compat aliases for the nafnet bridge: the bridge sums into
+    // a flat memory_* slot. Surface the L2 DMA counters there.
+    stats.memory_reqs = stats.l2_dma_reqs;
+    stats.memory_busy_cycles = stats.l2_dma_busy_cycles;
+    stats.memory_queue_wait_cycles = stats.l2_dma_queue_wait_cycles;
 
     const double sim_cycles = static_cast<double>(sc_time_stamp() / CYCLE);
     const double vec_capacity =
@@ -463,14 +493,50 @@ VecOpsSimulationStats VecOpsTop::collect_stats() const
     stats.vec_occupancy = (vec_capacity > 0.0)
         ? static_cast<double>(vec_acc.occupied_cycles_total()) / vec_capacity * 100.0
         : 0.0;
-    const uint64_t total_mem_bytes = stats.total_rd_bytes + stats.total_wr_bytes;
-    stats.mem_bw = (sim_cycles > 0.0)
-        ? static_cast<double>(total_mem_bytes) / sim_cycles
+    stats.l1_bw_observed = (sim_cycles > 0.0)
+        ? static_cast<double>(stats.l1_read_bytes + stats.l1_write_bytes) / sim_cycles
         : 0.0;
+    stats.l2_bw_observed = (sim_cycles > 0.0)
+        ? static_cast<double>(stats.l2_dma_read_bytes + stats.l2_dma_write_bytes) / sim_cycles
+        : 0.0;
+
+    if (slowest != nullptr && stats.max_elapsed_cycles > 0)
+    {
+        const uint64_t vec_service =
+            slowest->vec_calls * cfg.service_cycles();
+        const uint64_t dma_cycles = slowest->total_mem_cycles;
+        const uint64_t scalar_cycles = slowest->total_scalar_cycles;
+        const uint64_t stall_cycles = slowest->total_stall_cycles;
+
+        stats.slowest_worker_tid = slowest->tid;
+        stats.slowest_vec_cycles = vec_service;
+        stats.slowest_dma_cycles = dma_cycles;
+        stats.slowest_scalar_cycles = scalar_cycles;
+        stats.slowest_stall_cycles = stall_cycles;
+
+        const uint64_t total_categorized =
+            vec_service + dma_cycles + scalar_cycles + stall_cycles;
+        if (total_categorized > 0)
+        {
+            const double denom = static_cast<double>(total_categorized);
+            stats.vec_cycle_fraction    = vec_service   / denom * 100.0;
+            stats.dma_cycle_fraction    = dma_cycles    / denom * 100.0;
+            stats.scalar_cycle_fraction = scalar_cycles / denom * 100.0;
+            stats.stall_cycle_fraction  = stall_cycles  / denom * 100.0;
+        }
+    }
+
     stats.verification_passed =
         stats.total_vec_calls == stats.expected_vec_calls &&
-        stats.total_rd_bytes == stats.expected_rd_bytes &&
-        stats.total_wr_bytes == stats.expected_wr_bytes;
+        stats.total_rd_bytes == stats.expected_l1_read_bytes &&
+        stats.total_wr_bytes == stats.expected_l1_write_bytes &&
+        stats.vec_acc_busy_cycles == stats.expected_vec_acc_busy_cycles &&
+        stats.l1_reqs == stats.expected_l1_reqs &&
+        stats.l1_read_bytes == stats.expected_l1_read_bytes &&
+        stats.l1_write_bytes == stats.expected_l1_write_bytes &&
+        stats.l2_dma_reqs == stats.expected_l2_dma_reqs &&
+        stats.l2_dma_read_bytes == stats.expected_l2_read_bytes &&
+        stats.l2_dma_write_bytes == stats.expected_l2_write_bytes;
     return stats;
 }
 
@@ -515,7 +581,10 @@ void VecOpsTop::print_report(std::ostream &os) const
         {"Input Tensor Shape", "[C=" + report::fmt_int(cfg.channels) +
                                ", H=" + report::fmt_int(cfg.height) +
                                ", W=" + report::fmt_int(cfg.width) + "]"},
-        {"Element Size [bytes]", report::fmt_u64(cfg.elem_bytes)},
+        {"Input Element Size [bytes]", report::fmt_u64(vop_input_elem_bytes(cfg.op))},
+        {"Output Element Size [bytes]", report::fmt_u64(vop_output_elem_bytes(cfg.op))},
+        {"Input Operand Count [vectors/tile]",
+         report::fmt_u64(vop_input_operand_count(cfg.op))},
     });
 
     report::print_section_title(os, "Hardware Configuration");
@@ -526,78 +595,125 @@ void VecOpsTop::print_report(std::ostream &os) const
         {"Matrix Accelerator Capacity", report::na()},
         {"Vector Accelerator Capacity [elements/request]", report::fmt_u64(cfg.tile_cap())},
         {"Accelerator Queue Depth [requests]", report::fmt_u64(cfg.acc_queue_depth)},
-        {"Memory Bandwidth [bytes/cycle]", report::fmt_u64(cfg.memory_bw)},
-        {"Memory Base Latency [cycles]", report::fmt_u64(cfg.memory_base_lat)},
+        {"Vector Instruction Cycle [cycles/insn]", report::fmt_u64(cfg.vec_insn_cycle)},
+        {"Op Vector Instructions [insns/request]", report::fmt_u64(vop_insn_count(cfg.op))},
+        {"L1 Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l1_bw)},
+        {"L1 Base Latency [cycles]", report::fmt_u64(cfg.l1_base_lat)},
+        {"L1 Parallel Slots", report::fmt_u64(cfg.l1_slots)},
+        {"L2 DMA Bandwidth [bytes/cycle]", report::fmt_u64(cfg.l2_bw)},
+        {"L2 DMA Base Latency [cycles]", report::fmt_u64(cfg.l2_base_lat)},
+        {"L2 DMA Parallel Slots", report::fmt_u64(cfg.l2_slots)},
+        {"Max Inflight L2 DMA Writes / worker", report::fmt_u64(cfg.max_inflight_dma_writes)},
     });
 
     report::print_section_title(os, "Worker Summary");
     report::print_table(os, report::make_worker_summary_table(worker_info));
 
     report::print_section_title(os, "Accelerator Summary");
-    report::print_table(os, report::make_accelerator_summary_table({
-        {
-            "Matrix Accelerator",
-            "pool-level",
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::na(),
-        },
-        {
-            "Vector Accelerator",
-            "pool-level",
-            report::fmt_int(cfg.vec_acc_instances),
-            report::fmt_u64(stats.vec_acc_reqs),
-            report::fmt_u64(stats.vec_acc_queue_wait_cycles),
-            report::fmt_u64(stats.vec_acc_busy_cycles),
-            report::fmt_u64(stats.vec_acc_occupied_cycles),
-            report::fmt_percent(stats.vec_util),
-            report::fmt_percent(stats.vec_occupancy),
-            report::na(),
-            report::na(),
-        },
-        {
-            "Memory",
-            "shared resource",
-            "1",
-            report::fmt_u64(stats.memory_reqs),
-            report::fmt_u64(stats.memory_queue_wait_cycles),
-            report::fmt_u64(stats.memory_busy_cycles),
-            report::na(),
-            report::na(),
-            report::na(),
-            report::fmt_u64(stats.total_rd_bytes),
-            report::fmt_u64(stats.total_wr_bytes),
-        },
-    }));
+    std::vector<report::AcceleratorSummaryRow> accel_rows;
+    accel_rows.push_back({
+        "Matrix Accelerator",
+        "pool-level",
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::na(),
+    });
+    accel_rows.push_back({
+        "Vector Accelerator",
+        "pool-level",
+        report::fmt_int(cfg.vec_acc_instances),
+        report::fmt_u64(stats.vec_acc_reqs),
+        report::fmt_u64(stats.vec_acc_queue_wait_cycles),
+        report::fmt_u64(stats.vec_acc_busy_cycles),
+        report::fmt_u64(stats.vec_acc_occupied_cycles),
+        report::fmt_percent(stats.vec_util),
+        report::fmt_percent(stats.vec_occupancy),
+        report::na(),
+        report::na(),
+        report::na(),
+    });
+    for (auto &r : report::make_per_instance_accel_rows(
+             "Vector Accelerator", vec_acc.per_instance_stats(),
+             stats.max_elapsed_cycles))
+        accel_rows.push_back(std::move(r));
+    accel_rows.push_back({
+        "L1 Memory",
+        "accelerator-side",
+        report::fmt_int(cfg.vec_acc_instances),
+        report::fmt_u64(stats.l1_reqs),
+        report::fmt_u64(stats.l1_queue_wait_cycles),
+        report::fmt_u64(stats.l1_busy_cycles),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::fmt_u64(stats.l1_read_bytes),
+        report::fmt_u64(stats.l1_write_bytes),
+        report::na(),
+    });
+    accel_rows.push_back({
+        "L2 DMA",
+        "prefetch/writeback",
+        "1",
+        report::fmt_u64(stats.l2_dma_reqs),
+        report::fmt_u64(stats.l2_dma_queue_wait_cycles),
+        report::fmt_u64(stats.l2_dma_busy_cycles),
+        report::na(),
+        report::na(),
+        report::na(),
+        report::fmt_u64(stats.l2_dma_read_bytes),
+        report::fmt_u64(stats.l2_dma_write_bytes),
+        report::na(),
+    });
+    report::print_table(os, report::make_accelerator_summary_table(accel_rows));
 
     report::print_section_title(os, "Overall Summary");
     report::print_fields(os, {
         {"Total Elapsed Cycles [cycles]", report::fmt_u64(stats.max_elapsed_cycles)},
         {"Total Matrix Accelerator Requests [requests]", report::na()},
         {"Total Vector Accelerator Requests [requests]", report::fmt_u64(stats.total_vec_calls)},
-        {"Total Memory Requests [requests]", report::fmt_u64(stats.memory_reqs)},
-        {"Total Read Bytes [bytes]", report::fmt_u64(stats.total_rd_bytes)},
-        {"Total Write Bytes [bytes]", report::fmt_u64(stats.total_wr_bytes)},
+        {"Total L1 Requests [requests]", report::fmt_u64(stats.l1_reqs)},
+        {"Total L2 DMA Requests [requests]", report::fmt_u64(stats.l2_dma_reqs)},
+        {"Total L1 Read Bytes [bytes]", report::fmt_u64(stats.l1_read_bytes)},
+        {"Total L1 Write Bytes [bytes]", report::fmt_u64(stats.l1_write_bytes)},
+        {"Total L2 DMA Read Bytes [bytes]", report::fmt_u64(stats.l2_dma_read_bytes)},
+        {"Total L2 DMA Write Bytes [bytes]", report::fmt_u64(stats.l2_dma_write_bytes)},
         {"Total Stall Cycles [cycles]", report::fmt_u64(total_stall_cycles)},
         {"Total Memory Cycles [cycles]", report::fmt_u64(total_mem_cycles)},
         {"Total Scalar Cycles [cycles]", report::fmt_u64(total_scalar_cycles)},
-        {"Average Memory Bandwidth [bytes/cycle]", report::fmt_rate(stats.mem_bw, "bytes/cycle")},
+        {"Average L1 Bandwidth [bytes/cycle]", report::fmt_rate(stats.l1_bw_observed, "bytes/cycle")},
+        {"Average L2 DMA Bandwidth [bytes/cycle]", report::fmt_rate(stats.l2_bw_observed, "bytes/cycle")},
+        {"Critical-Path Worker [tid]", report::fmt_int(stats.slowest_worker_tid)},
+        {"Vec Cycle Fraction [%]",    report::fmt_percent(stats.vec_cycle_fraction)},
+        {"DMA Cycle Fraction [%]",    report::fmt_percent(stats.dma_cycle_fraction)},
+        {"Scalar Cycle Fraction [%]", report::fmt_percent(stats.scalar_cycle_fraction)},
+        {"Stall Cycle Fraction [%]",  report::fmt_percent(stats.stall_cycle_fraction)},
     });
 
     report::print_section_title(os, "Verification");
     report::print_fields(os, {
         {"Expected Vector Accelerator Requests [requests]", report::fmt_u64(stats.expected_vec_calls)},
         {"Actual Vector Accelerator Requests [requests]", report::fmt_u64(stats.total_vec_calls)},
-        {"Expected Read Bytes [bytes]", report::fmt_u64(stats.expected_rd_bytes)},
-        {"Actual Read Bytes [bytes]", report::fmt_u64(stats.total_rd_bytes)},
-        {"Expected Write Bytes [bytes]", report::fmt_u64(stats.expected_wr_bytes)},
-        {"Actual Write Bytes [bytes]", report::fmt_u64(stats.total_wr_bytes)},
+        {"Expected Vector Accelerator Busy Cycles [cycles]", report::fmt_u64(stats.expected_vec_acc_busy_cycles)},
+        {"Actual Vector Accelerator Busy Cycles [cycles]", report::fmt_u64(stats.vec_acc_busy_cycles)},
+        {"Expected L1 Requests [requests]", report::fmt_u64(stats.expected_l1_reqs)},
+        {"Actual L1 Requests [requests]", report::fmt_u64(stats.l1_reqs)},
+        {"Expected L1 Read Bytes [bytes]", report::fmt_u64(stats.expected_l1_read_bytes)},
+        {"Actual L1 Read Bytes [bytes]", report::fmt_u64(stats.l1_read_bytes)},
+        {"Expected L1 Write Bytes [bytes]", report::fmt_u64(stats.expected_l1_write_bytes)},
+        {"Actual L1 Write Bytes [bytes]", report::fmt_u64(stats.l1_write_bytes)},
+        {"Expected L2 DMA Requests [requests]", report::fmt_u64(stats.expected_l2_dma_reqs)},
+        {"Actual L2 DMA Requests [requests]", report::fmt_u64(stats.l2_dma_reqs)},
+        {"Expected L2 DMA Read Bytes [bytes]", report::fmt_u64(stats.expected_l2_read_bytes)},
+        {"Actual L2 DMA Read Bytes [bytes]", report::fmt_u64(stats.l2_dma_read_bytes)},
+        {"Expected L2 DMA Write Bytes [bytes]", report::fmt_u64(stats.expected_l2_write_bytes)},
+        {"Actual L2 DMA Write Bytes [bytes]", report::fmt_u64(stats.l2_dma_write_bytes)},
         {"Verification Status", stats.verification_passed ? "PASS" : "FAIL"},
     });
 }
@@ -608,24 +724,3 @@ void VecOpsTop::done_monitor()
         completion_fifo->read();
     done_event->notify(SC_ZERO_TIME);
 }
-
-#ifndef KERNEL_STANDALONE_MAIN
-#define KERNEL_STANDALONE_MAIN 1
-#endif
-
-#if KERNEL_STANDALONE_MAIN
-int sc_main(int argc, char *argv[])
-{
-    (void)argc;
-    (void)argv;
-
-    VecOpsRuntimeConfig cfg = VecOpsRuntimeConfig::defaults();
-    VecOpsTop top("vec_ops_top", cfg);
-    sc_start();
-
-    top.print_report(std::cout);
-
-    const VecOpsSimulationStats stats = top.collect_stats();
-    return stats.verification_passed ? 0 : 2;
-}
-#endif
