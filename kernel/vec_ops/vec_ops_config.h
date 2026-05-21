@@ -33,6 +33,12 @@ enum VopType
     VOP_QUANTIZE_I32_TO_I8,     // mf_quantize_i32_to_i8        (rd=4*vl, wr=vl;  6 insns)
     VOP_QUANTIZE_I16_TO_I8,     // quant i16->i8                (rd=2*vl, wr=vl;  5 insns)
     VOP_DEQUANTIZE_I8_TO_I32,   // mf_dequantize_i8_to_i32      (rd=vl,   wr=4*vl;3 insns)
+    VOP_DOT_PRODUCT_I8,         // i8 . i8 -> i32 scalar; vwmul_vv + vredsum_vs
+                                // (rd=2*vl,  wr=0/tile;          2 insns).
+                                // Per-tile write is 0 because the i32 partial
+                                // sum lives in the unit's accumulator register
+                                // across tiles; the final scalar per output
+                                // pixel is small enough to ignore in L1/L2.
 };
 
 // ------------------------------------------------------------
@@ -158,6 +164,7 @@ static inline uint64_t vop_input_elem_bytes(VopType op)
     case VOP_QUANTIZE_I32_TO_I8:   return 4;  // int32
     case VOP_QUANTIZE_I16_TO_I8:   return 2;  // int16
     case VOP_DEQUANTIZE_I8_TO_I32: return 1;  // int8
+    case VOP_DOT_PRODUCT_I8:       return 1;  // int8 (two i8 operand vectors)
     }
     return 1;
 }
@@ -172,6 +179,7 @@ static inline uint64_t vop_output_elem_bytes(VopType op)
     case VOP_QUANTIZE_I32_TO_I8:   return 1;  // int8
     case VOP_QUANTIZE_I16_TO_I8:   return 1;  // int8
     case VOP_DEQUANTIZE_I8_TO_I32: return 4;  // int32
+    case VOP_DOT_PRODUCT_I8:       return 0;  // accumulator-resident scalar
     }
     return 1;
 }
@@ -182,9 +190,10 @@ static inline uint64_t vop_input_operand_count(VopType op)
 {
     switch (op)
     {
-    case VOP_ELEMWISE_ADD: return 2;
-    case VOP_ELEMWISE_MUL: return 2;
-    default:               return 1;
+    case VOP_ELEMWISE_ADD:   return 2;
+    case VOP_ELEMWISE_MUL:   return 2;
+    case VOP_DOT_PRODUCT_I8: return 2;
+    default:                 return 1;
     }
 }
 
@@ -224,6 +233,7 @@ static inline uint64_t vop_insn_count(VopType op)
     case VOP_QUANTIZE_I32_TO_I8:   return 6;  // vsra,vadd,vmax,vmin,vnsra,vnsra
     case VOP_QUANTIZE_I16_TO_I8:   return 5;  // vsra,vadd,vmax,vmin,vnsra
     case VOP_DEQUANTIZE_I8_TO_I32: return 3;  // vwadd,vwadd,vmul_vx
+    case VOP_DOT_PRODUCT_I8:       return 2;  // vwmul_vv + vredsum_vs
     }
     return 1;
 }
@@ -252,6 +262,10 @@ static inline uint64_t vop_rd_bytes(VopType op, uint64_t vl)
 
 static inline uint64_t vop_wr_bytes(VopType op, uint64_t vl)
 {
+    // Dot-product writes one i32 partial scalar per request (the accumulator
+    // result post-vredsum), independent of vl. Other ops write `vl` elements.
+    if (op == VOP_DOT_PRODUCT_I8)
+        return 4;
     return vl * vop_output_elem_bytes(op);
 }
 
@@ -267,6 +281,7 @@ static inline const char *vop_name(VopType op)
     case VOP_QUANTIZE_I32_TO_I8:   return "mf_quantize_i32_to_i8";
     case VOP_QUANTIZE_I16_TO_I8:   return "mf_quantize_i16_to_i8";
     case VOP_DEQUANTIZE_I8_TO_I32: return "mf_dequantize_i8_to_i32";
+    case VOP_DOT_PRODUCT_I8:       return "mf_dotprod_i8_to_i32";
     }
     return "unknown";
 }

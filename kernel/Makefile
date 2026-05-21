@@ -23,10 +23,18 @@ TARGET_POOL   := $(BUILDDIR)/pooling_sim
 TARGET_VEC    := $(BUILDDIR)/vec_ops_sim
 TARGET_MATMUL := $(BUILDDIR)/matmul_sim
 
-OBJS_LN := $(BUILDDIR)/layer_norm/layer_norm_top.o $(COMMON_HW_OBJS)
-OBJS_DW := $(BUILDDIR)/dw_conv2d/dw_conv2d_top.o $(COMMON_HW_OBJS)
-OBJS_POOL := $(BUILDDIR)/pooling/pooling_top.o $(COMMON_HW_OBJS)
-OBJS_VEC := $(BUILDDIR)/vec_ops/vec_ops_top.o $(COMMON_HW_OBJS)
+OBJS_LN := $(BUILDDIR)/layer_norm/main.o \
+           $(BUILDDIR)/layer_norm/layer_norm_top.o \
+           $(MATMUL_HW_OBJS)
+OBJS_DW := $(BUILDDIR)/dw_conv2d/main.o \
+           $(BUILDDIR)/dw_conv2d/dw_conv2d_top.o \
+           $(MATMUL_HW_OBJS)
+OBJS_POOL := $(BUILDDIR)/pooling/main.o \
+             $(BUILDDIR)/pooling/pooling_top.o \
+             $(COMMON_HW_OBJS)
+OBJS_VEC := $(BUILDDIR)/vec_ops/main.o \
+            $(BUILDDIR)/vec_ops/vec_ops_top.o \
+            $(COMMON_HW_OBJS)
 OBJS_MATMUL := $(BUILDDIR)/matmul/main.o \
                $(BUILDDIR)/matmul/matmul_top.o \
                $(BUILDDIR)/matmul/accum_coordinator.o \

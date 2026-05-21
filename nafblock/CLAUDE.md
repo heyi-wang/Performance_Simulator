@@ -84,6 +84,31 @@ Validated:
 - `C=128, H=W=16`: `sca_conv` row = 256 vec reqs (128 channels × ⌈128/64⌉ tiles), 490 cycles, PASS.
 - Standalone `make kernel-vecops && ./kernel/build/vec_ops_sim` still PASS — additive enum doesn't affect existing ops.
 
+### Parametric sweep (2026-05-21)
+[parametric_sweep.py](parametric_sweep.py) mirrors the per-kernel sweep scripts.
+Sweeps **block shape × hardware accelerator counts**, parses the simulator
+report, and emits `parametric_sweep.csv` + `parametric_sweep.png`.
+
+```
+# default: 5 NAFNet32 shapes × default HW (mat=2,vec=4)
+/home/why/anaconda3/bin/python3 nafblock/parametric_sweep.py
+
+# multi-HW: 5 shapes × 3 HW configs (15 points, ~22 s wall)
+/home/why/anaconda3/bin/python3 nafblock/parametric_sweep.py --hw "1:2,2:4,4:8"
+
+# custom shapes (CxH list, H is also used for W)
+/home/why/anaconda3/bin/python3 nafblock/parametric_sweep.py --shapes "32x64,64x32"
+```
+
+HW changes recompile via `EXTRA_CXXFLAGS=-DMAT_ACCEL_COUNT=...,VEC_ACCEL_COUNT=...`;
+shape changes only re-run the binary. The Makefile passes `EXTRA_CXXFLAGS`
+through every compile rule (added with the sweep script).
+
+Plot has two panels: total elapsed cycles vs block shape (one line per HW),
+and per-backend cycle breakdown stacked bars for the first HW configuration.
+The CSV also records per-backend cycle / request totals so other plots are
+straightforward to build from the same data.
+
 ### Integration note
 The 14-layer composition is exposed through
 `append_nafblock_layers(std::vector<NafBlockLayerDesc> &, int &id, const char *prefix, int C, int H, int W)`
