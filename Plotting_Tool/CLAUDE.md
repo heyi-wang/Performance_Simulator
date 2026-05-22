@@ -157,3 +157,86 @@ value. This prevents collisions on the chart (multiple rows mapping to
 the same X+Series). `(none)` keeps the dimension free. Filters are
 applied before plotting; `fixed_params` then naturally shows the pinned
 values in the `Fixed:` caption.
+
+# Requirement v4 
+- In the stacked bar chart, the exact percentage of each bar segment should be clearly marked
+- The legend order should be customizable by allowing the user to use the mouse to drag lengend to intended position. 
+- In the drop down menu to select variables to plot, just show the variables that are relavant to current csv file. Do not include irrelavant variable names. 
+- Render the plot in a more scientific way.
+
+## Status (v4 — implemented)
+
+All four v4 requirements landed in [app.py](app.py); README updated and
+`streamlit-sortables` added to [requirements.txt](requirements.txt).
+
+### Added in v4
+- **Stacked-bar percentage labels**: every segment renders its
+  percentage inline (`text=…%`, `textposition="inside"`,
+  `insidetextanchor="middle"`, white text). Slices ≤ 1.5% are blanked
+  to avoid clutter; hover tooltip still shows the precise number.
+- **Drag-to-reorder legend** (`render_legend_order` +
+  `apply_legend_order`): a **Legend order** sidebar panel uses
+  [`streamlit-sortables`](https://github.com/ohtaman/streamlit-sortables)
+  to render trace labels as a vertical drag-and-drop list. The result
+  is stored in `st.session_state` keyed by the same plot-context
+  suffix used by the Style expander, and applied via Plotly's
+  `legendrank` attribute. Reconciles automatically when the trace set
+  changes. Skipped for 3D (single trace). Falls back to a static order
+  + warning when the optional dep isn't installed.
+- **Relevant-only variable dropdowns** (`selector_cols(df, role)`):
+  X / Series / Facet (and 3D X) hide `NON_PARAM_COLUMNS` — status
+  flags (`verification_status`, `build_ok`, `run_ok`), run outputs
+  (`actual_mat_accels`, `actual_vec_accels`, `slowest_worker_tid`,
+  `wall_seconds`), and metric columns (`total_cycles`, `*_util_pct`,
+  `*_cycle_fraction_pct`). Y and Z (3D) stay unrestricted so metrics
+  remain plottable on the value axis.
+- **Scientific defaults** (`apply_scientific_layout`): default
+  template flipped to `simple_white`; every figure now gets a serif
+  font (`Times New Roman / Liberation Serif / DejaVu Serif`),
+  black inward tick marks (`ticks="inside"`, `linecolor="#111"`,
+  `mirror=True`), and a 18-pt title font. Layered on top of whichever
+  template the user picks, so the publication look survives a
+  template change. 3D scenes get the same treatment via
+  `update_scenes` with axis-line styling.
+
+### Still deferred
+- Full hue / brightness / style / marker group-by.
+- Multi-CSV overlay, figure export, custom palettes.
+
+# Requirements v5
+
+- Add the option of turn on the grid line of horizontal and vertial directions
+- The font size of stack bar percentage should not decreases when the stack bar is small compared to others. Instead, it shoud adaptively move the number to the side of the bar and use and arrow to label it clearly.
+- The indicatioin of these percentage values can be manually switched on or off by user.
+- Allow user to select the csv file to be plotted with file explorer instead of manually type the file path.
+
+## Status (v5 — implemented)
+
+All four v5 requirements landed in [app.py](app.py); README updated.
+
+### Added in v5
+- **File uploader for CSV** (`st.file_uploader`): the typed-path
+  text input is gone. Users browse / drag-drop a CSV from their
+  machine. When nothing is uploaded the tool falls back to
+  `kernel/matmul/full_sweep.csv` so the default experience is
+  unchanged. The caption under the chart shows the active file
+  name (`csv_label`).
+- **Grid toggles** (`apply_grid(fig, show_x, show_y, is_3d)`): two
+  sidebar checkboxes — `Vertical gridlines` and `Horizontal
+  gridlines`, both default on. Applied as a post-process so they
+  propagate through facet subplots; in 3D mode they drive all three
+  `scene.<axis>.showgrid` flags (Z follows the horizontal toggle).
+- **Show/hide segment % toggle**: `Show segment %` checkbox visible
+  only in stacked-bar mode (default on). When off, neither inline
+  labels nor side arrows are drawn; hover tooltip still reports
+  precise values.
+- **Adaptive percentage placement** (`build_stacked_bar`): segments
+  above `STACK_SIDE_LABEL_PCT` (4%) keep the white in-bar label at
+  12pt; segments at or below 4% (but > 0) get a **side annotation
+  with an arrow** pointing at the segment mid-Y. Side labels include
+  the segment name (`<b>Mat</b> 2.3%`), bordered box, white
+  background. Multiple small segments in the same bar stagger
+  horizontally (`ax=45/70`). Inline text is no longer auto-shrunk:
+  `layout.uniformtext = dict(mode="hide", minsize=11)` hides any
+  inline label that wouldn't fit at 11pt, so the rendered font size
+  stays constant across bars regardless of the percentage value.

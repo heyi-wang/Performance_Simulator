@@ -122,13 +122,36 @@ SEQUENTIAL_PALETTES = ["Viridis", "Plasma", "Blues"]
 ALL_PALETTES = QUALITATIVE_PALETTES + SEQUENTIAL_PALETTES
 
 TEMPLATES = [
-    "plotly", "plotly_white", "plotly_dark", "ggplot2",
-    "seaborn", "simple_white", "none",
+    "simple_white", "plotly", "plotly_white", "plotly_dark", "ggplot2",
+    "seaborn", "none",
 ]
+DEFAULT_TEMPLATE = "simple_white"
 
 DASH_STYLES = ["solid", "dot", "dash", "longdash", "dashdot", "longdashdot"]
 
 NONE_LABEL = "(none)"
+
+# Publication-style baseline applied on top of whichever Plotly template
+# the user selected, so charts look "scientific" by default.
+SCIENTIFIC_FONT = dict(
+    family="Times New Roman, Liberation Serif, DejaVu Serif, serif",
+    size=14, color="#111",
+)
+SCIENTIFIC_AXIS = dict(
+    ticks="inside", tickwidth=1.2, ticklen=6,
+    showline=True, linewidth=1.2, linecolor="#111",
+    mirror=True, zeroline=False,
+)
+SCIENTIFIC_SCENE_AXIS = dict(
+    showline=True, linewidth=1.2, linecolor="#111",
+    ticks="inside", tickwidth=1.2, ticklen=6,
+)
+
+# Segments smaller than this percentage get a side annotation with an arrow
+# instead of an in-bar text label, so the font size never shrinks.
+STACK_SIDE_LABEL_PCT = 4.0
+# Plotly's `uniformtext` floor for in-bar segment text (in points).
+STACK_LABEL_MIN_FONT = 11
 
 
 # --------------------------------------------------------------------- helpers
@@ -142,6 +165,18 @@ def load_csv(path: str, mtime: float) -> pd.DataFrame:
 
 def numeric_columns(df: pd.DataFrame) -> list[str]:
     return [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+
+
+def selector_cols(df: pd.DataFrame, role: str) -> list[str]:
+    """Columns offered for each selector role.
+
+    role in {"x", "y", "z", "series", "facet"}.
+    - x / series / facet: hide NON_PARAM_COLUMNS (status + run-output).
+    - y / z: numeric only; metrics are valid (no NON_PARAM filter).
+    """
+    if role in ("y", "z"):
+        return numeric_columns(df)
+    return [c for c in df.columns if c not in NON_PARAM_COLUMNS]
 
 
 def _axis_type(use_log: bool) -> str:
@@ -231,6 +266,43 @@ def _apply_2d_layout(fig: go.Figure, title: str, xlabel: str, ylabel: str,
     )
 
 
+def apply_grid(fig: go.Figure, show_x: bool, show_y: bool,
+               *, is_3d: bool = False) -> go.Figure:
+    """Toggle gridlines on the active figure. Works on single charts and
+    facet subplots (Plotly's update_xaxes/update_yaxes touch every
+    matching axis). For 3D, applies to all three scene axes."""
+    if is_3d:
+        fig.update_scenes(
+            xaxis=dict(showgrid=show_x),
+            yaxis=dict(showgrid=show_y),
+            zaxis=dict(showgrid=show_y),
+        )
+    else:
+        fig.update_xaxes(showgrid=show_x)
+        fig.update_yaxes(showgrid=show_y)
+    return fig
+
+
+def apply_scientific_layout(fig: go.Figure, *, is_3d: bool = False) -> go.Figure:
+    """Layer publication-style font + axis cosmetics on top of the chosen
+    template. Called by every builder so the look is consistent across
+    `Plot style` choices. Does not override axis type / dtick (those come
+    from `_axis_kwargs`)."""
+    fig.update_layout(font=SCIENTIFIC_FONT)
+    if fig.layout.title and fig.layout.title.text:
+        fig.update_layout(title=dict(font=dict(size=18)))
+    if is_3d:
+        fig.update_scenes(
+            xaxis=SCIENTIFIC_SCENE_AXIS,
+            yaxis=SCIENTIFIC_SCENE_AXIS,
+            zaxis=SCIENTIFIC_SCENE_AXIS,
+        )
+    else:
+        fig.update_xaxes(**SCIENTIFIC_AXIS)
+        fig.update_yaxes(**SCIENTIFIC_AXIS)
+    return fig
+
+
 # --------------------------------------------------------------------- builders
 
 
@@ -265,6 +337,7 @@ def build_scatter_2d(df: pd.DataFrame, x: str, y: str, logx: bool, logy: bool,
                 ),
             ))
     _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template, df)
+    apply_scientific_layout(fig)
     return fig
 
 
@@ -302,6 +375,7 @@ def build_line_2d(df: pd.DataFrame, x: str, y: str, logx: bool, logy: bool,
                 ),
             ))
     _apply_2d_layout(fig, title, xlabel, ylabel, x, y, logx, logy, template, df)
+    apply_scientific_layout(fig)
     return fig
 
 
@@ -329,6 +403,7 @@ def build_scatter_3d(df: pd.DataFrame, x: str, y: str, z: str,
         ),
         margin=dict(l=0, r=0, t=50 if title else 30, b=0),
     )
+    apply_scientific_layout(fig, is_3d=True)
     return fig
 
 
@@ -336,6 +411,7 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
                       styles: dict | None = None,
                       palette: str = "Plotly", template: str = "plotly",
                       title: str = "", xlabel: str = "", ylabel: str = "",
+                      show_pct: bool = True,
                       ) -> go.Figure:
     needed = [col for col, _, _ in STACK_SEGMENTS] + ["total_cycles"]
     missing = [c for c in needed if c not in df.columns]
@@ -363,19 +439,70 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
     else:
         seg_defaults = palette_colors(palette, len(STACK_SEGMENTS))
 
+    # Pre-compute per-bar segment heights and cumulative tops so we can
+    # place side annotations at the correct mid-point of each small segment.
+    n_bars = len(agg)
+    n_segs = len(STACK_SEGMENTS)
+    heights = [[0.0] * n_bars for _ in range(n_segs)]
+    for si, (col, _, _) in enumerate(STACK_SEGMENTS):
+        for bi in range(n_bars):
+            heights[si][bi] = (
+                agg["total_cycles"].iloc[bi] * agg[col].iloc[bi] / 100.0
+            )
+
     fig = go.Figure()
-    for (col, label, _), default_color in zip(STACK_SEGMENTS, seg_defaults):
+    side_annotations: list[dict] = []
+    for si, ((col, label, _), default_color) in enumerate(
+        zip(STACK_SEGMENTS, seg_defaults)
+    ):
         st_ = _style_for(styles, label, label, default_color)
-        seg_height = agg["total_cycles"] * agg[col] / 100.0
+        seg_height = pd.Series(heights[si])
+        # In-bar labels only for segments large enough that the font won't
+        # need to shrink. Small segments get a side arrow annotation below.
+        if show_pct:
+            seg_text = [
+                f"{p:.1f}%" if p > STACK_SIDE_LABEL_PCT else ""
+                for p in agg[col]
+            ]
+        else:
+            seg_text = [""] * n_bars
         fig.add_trace(go.Bar(
             x=agg[x], y=seg_height,
             name=st_["label"], marker_color=st_["color"],
             customdata=agg[col],
+            text=seg_text,
+            textposition="inside",
+            insidetextanchor="middle",
+            textfont=dict(color="white", size=12),
+            cliponaxis=False,
             hovertemplate=(
                 f"{x}: %{{x}}<br>{st_['label']}: %{{y:.0f}} cycles "
                 "(%{customdata:.1f}%)<extra></extra>"
             ),
         ))
+        if show_pct:
+            for bi in range(n_bars):
+                pct = agg[col].iloc[bi]
+                if not (0 < pct <= STACK_SIDE_LABEL_PCT):
+                    continue
+                # Mid-Y of this segment within the stacked bar.
+                base = sum(heights[k][bi] for k in range(si))
+                mid_y = base + heights[si][bi] / 2.0
+                # Stagger horizontal offset so multiple small slices in the
+                # same bar don't pile on top of each other.
+                ax = 45 + (bi % 2) * 25
+                side_annotations.append(dict(
+                    x=agg[x].iloc[bi], y=mid_y,
+                    xref="x", yref="y",
+                    text=f"<b>{st_['label']}</b> {pct:.1f}%",
+                    showarrow=True, arrowhead=2, arrowsize=1,
+                    arrowwidth=1, arrowcolor="#444",
+                    ax=ax, ay=0,
+                    font=dict(size=11, color="#111"),
+                    bgcolor="rgba(255,255,255,0.92)",
+                    bordercolor="#444",
+                    borderwidth=0.5, borderpad=2,
+                ))
     fig.update_layout(
         template=template,
         title=title or None,
@@ -385,8 +512,13 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
         xaxis=dict(title=xlabel or x, type="category"),
         yaxis=dict(title=ylabel or "total_cycles"),
         legend=dict(orientation="h", yanchor="bottom", y=1.0),
+        # Force inline text size; segments that can't fit are hidden (and
+        # their value is reported via the side annotations instead).
+        uniformtext=dict(mode="hide", minsize=STACK_LABEL_MIN_FONT),
         margin=dict(l=40, r=20, t=50 if title else 40, b=40),
+        annotations=side_annotations,
     )
+    apply_scientific_layout(fig)
     return fig
 
 
@@ -483,6 +615,7 @@ def render_facet(df: pd.DataFrame, facet_col: str, builder_fn,
         y_kwargs = _axis_kwargs(ylabel or y, logy, y_vals)
         fig.update_yaxes(**{k: v for k, v in y_kwargs.items() if k != "title"},
                          title_text=y_kwargs["title"])
+    apply_scientific_layout(fig)
     return fig
 
 
@@ -491,6 +624,106 @@ def render_facet(df: pd.DataFrame, facet_col: str, builder_fn,
 
 def _style_key_suffix(plot_type: str, series: str | None, facet: str | None) -> str:
     return f"{plot_type}|{series or '-'}|{facet or '-'}"
+
+
+def trace_keys_and_labels(
+    plot_type: str, df: pd.DataFrame, series: str | None,
+    palette: str, styles: dict | None = None,
+) -> list[tuple[object, str, str]]:
+    """Return [(trace_key, default_label, default_color)] for the active
+    plot context. Used by both the Style-per-series expander and the
+    Legend-order panel so they always agree on traces. When `styles` is
+    provided, the label is replaced by the user's legend-text override."""
+    if plot_type == "Stacked bar":
+        if palette == "Plotly":
+            default_colors = [c for _, _, c in STACK_SEGMENTS]
+        else:
+            default_colors = palette_colors(palette, len(STACK_SEGMENTS))
+        triples = [
+            (label, label, default_colors[i])
+            for i, (_, label, _) in enumerate(STACK_SEGMENTS)
+        ]
+    elif plot_type in ("2D scatter", "2D line"):
+        if series is None:
+            triples = [("__single__", "trace", palette_colors(palette, 1)[0])]
+        else:
+            values = sorted(df[series].dropna().unique())
+            colors = palette_colors(palette, len(values))
+            triples = [
+                (v, f"{series}={v}", colors[i]) for i, v in enumerate(values)
+            ]
+    else:
+        triples = []
+    if styles:
+        out: list[tuple[object, str, str]] = []
+        for key, default_label, default_color in triples:
+            override = styles.get(key, {}) if styles else {}
+            label = override.get("label") or default_label
+            color = override.get("color") or default_color
+            out.append((key, label, color))
+        return out
+    return triples
+
+
+def render_legend_order(
+    plot_type: str, df: pd.DataFrame, series: str | None,
+    facet: str | None, palette: str, styles: dict | None,
+) -> list[str] | None:
+    """Sidebar drag-and-drop list for reordering legend traces. Returns
+    the ordered list of trace labels (matching the current style
+    overrides), or None when there's nothing to reorder."""
+    triples = trace_keys_and_labels(plot_type, df, series, palette, styles)
+    if len(triples) <= 1:
+        return None
+    labels = [label for _, label, _ in triples]
+
+    suffix = _style_key_suffix(plot_type, series, facet)
+    state_key = f"legend_order_{suffix}"
+    existing = st.session_state.get(state_key)
+    if existing is None:
+        order = labels
+    else:
+        # Reconcile: keep existing order, drop missing, append new at end.
+        order = [lbl for lbl in existing if lbl in labels]
+        order += [lbl for lbl in labels if lbl not in order]
+    st.session_state[state_key] = order
+
+    try:
+        from streamlit_sortables import sort_items  # type: ignore
+    except ImportError:
+        st.warning(
+            "Install `streamlit-sortables` to enable drag-to-reorder legend "
+            "(falling back to current order)."
+        )
+        return order
+
+    st.header("Legend order")
+    new_order = sort_items(order, direction="vertical", key=f"sort_{suffix}")
+    if isinstance(new_order, list) and new_order:
+        st.session_state[state_key] = new_order
+        return new_order
+    return order
+
+
+def apply_legend_order(
+    fig: go.Figure, order: list[str] | None,
+    trace_key_to_label: dict,
+) -> None:
+    """Assign `legendrank` to each trace in `fig` so Plotly renders the
+    legend in the order chosen by the user. Matching is done by display
+    label; traces without a match keep the trailing rank."""
+    if not order:
+        return
+    rank_by_label = {lbl: i for i, lbl in enumerate(order)}
+    trailing = len(order)
+    for tr in fig.data:
+        label = tr.name
+        if label in rank_by_label:
+            tr.legendrank = rank_by_label[label]
+        else:
+            tr.legendrank = trailing
+            trailing += 1
+    del trace_key_to_label  # accepted for future use but not currently needed
 
 
 def render_style_expander(plot_type: str, df: pd.DataFrame,
@@ -567,16 +800,28 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Data")
-        csv_path = st.text_input("CSV path", value=str(DEFAULT_CSV))
-        if not os.path.exists(csv_path):
-            st.error(f"CSV not found: {csv_path}")
-            return
-        mtime = os.path.getmtime(csv_path)
-        try:
-            df = load_csv(csv_path, mtime)
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Failed to read CSV: {exc}")
-            return
+        uploaded = st.file_uploader(
+            "CSV file", type=["csv"],
+            help="Browse for a sweep CSV. If nothing is uploaded, the "
+                 "default kernel/matmul/full_sweep.csv is used.",
+        )
+        if uploaded is not None:
+            try:
+                df = pd.read_csv(uploaded)
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Failed to read uploaded CSV: {exc}")
+                return
+            csv_label = uploaded.name
+        else:
+            if not os.path.exists(DEFAULT_CSV):
+                st.error(f"Default CSV not found: {DEFAULT_CSV}")
+                return
+            try:
+                df = load_csv(str(DEFAULT_CSV), os.path.getmtime(DEFAULT_CSV))
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Failed to read CSV: {exc}")
+                return
+            csv_label = str(DEFAULT_CSV)
         df = add_composite_columns(df)
 
         st.header("Plot")
@@ -588,6 +833,11 @@ def main() -> None:
 
         cols_all = list(df.columns)
         num_cols = numeric_columns(df)
+        x_pool = selector_cols(df, "x")
+        series_pool = selector_cols(df, "series")
+        # 3D X stays numeric AND param-only so it matches the "X is a
+        # sweep dim" convention used elsewhere.
+        x_pool_3d = [c for c in num_cols if c not in NON_PARAM_COLUMNS]
 
         def _default(name: str, pool: list[str]) -> int:
             return pool.index(name) if name in pool else 0
@@ -599,19 +849,19 @@ def main() -> None:
         logx = logy = logz = False
 
         if plot_type in ("2D scatter", "2D line"):
-            x = st.selectbox("X column", cols_all, index=_default("threads", cols_all))
+            x = st.selectbox("X column", x_pool, index=_default("threads", x_pool))
             y = st.selectbox("Y column", num_cols,
                              index=_default("total_cycles", num_cols))
             logx = st.checkbox("log X", value=False)
             logy = st.checkbox("log Y", value=False)
-            pick = st.selectbox("Series column", [NONE_LABEL] + cols_all, index=0)
+            pick = st.selectbox("Series column", [NONE_LABEL] + series_pool, index=0)
             series = None if pick == NONE_LABEL else pick
             used = {x, y}
             if series:
                 used.add(series)
         elif plot_type == "3D scatter":
-            x = st.selectbox("X column", num_cols,
-                             index=_default("threads", num_cols))
+            x = st.selectbox("X column", x_pool_3d,
+                             index=_default("threads", x_pool_3d))
             y = st.selectbox("Y column", num_cols,
                              index=_default("mat_count", num_cols))
             z = st.selectbox("Z column", num_cols,
@@ -621,7 +871,7 @@ def main() -> None:
             logz = st.checkbox("log Z", value=False)
             used = {x, y, z}
         else:  # Stacked bar
-            x = st.selectbox("X column", cols_all, index=_default("threads", cols_all))
+            x = st.selectbox("X column", x_pool, index=_default("threads", x_pool))
             # log-X has no visual effect with a categorical X axis, so we
             # omit the toggle here to avoid confusion.
             logx = False
@@ -636,10 +886,22 @@ def main() -> None:
             zlabel = st.text_input("Z axis label", value="")
 
         st.header("Style")
-        template = st.selectbox("Plot style", TEMPLATES, index=0)
+        template = st.selectbox(
+            "Plot style", TEMPLATES, index=TEMPLATES.index(DEFAULT_TEMPLATE),
+        )
         palette = st.selectbox("Color palette", ALL_PALETTES, index=0)
-        facet_pick = st.selectbox("Facet column", [NONE_LABEL] + cols_all, index=0)
+        facet_pool = selector_cols(df, "facet")
+        facet_pick = st.selectbox(
+            "Facet column", [NONE_LABEL] + facet_pool, index=0,
+        )
         facet = None if facet_pick == NONE_LABEL else facet_pick
+
+        st.header("Grid")
+        show_grid_x = st.checkbox("Vertical gridlines", value=True)
+        show_grid_y = st.checkbox("Horizontal gridlines", value=True)
+        show_pct = True
+        if plot_type == "Stacked bar":
+            show_pct = st.checkbox("Show segment %", value=True)
 
         # ------------------------------------------------ Fix values
         # Every sweep parameter not used as X/Y/Z/Series/Facet gets pinned
@@ -690,6 +952,14 @@ def main() -> None:
             plot_type, df, series, palette, facet,
             line_dash=(plot_type == "2D line"),
         )
+
+    # Legend-order sidebar panel (uses style overrides to label items).
+    legend_order: list[str] | None = None
+    if plot_type != "3D scatter":
+        with st.sidebar:
+            legend_order = render_legend_order(
+                plot_type, df, series, facet, palette, styles,
+            )
 
     # Facet caveat for 3D.
     if facet and plot_type == "3D scatter":
@@ -743,6 +1013,7 @@ def main() -> None:
                 d, x, logx, styles=styles, palette=palette,
                 template=template, title="",
                 xlabel=xlabel, ylabel=ylabel,
+                show_pct=show_pct,
             )
         if facet:
             fig = render_facet(df, facet, _build, template, title,
@@ -753,16 +1024,20 @@ def main() -> None:
                     df, x, logx, styles=styles, palette=palette,
                     template=template, title=title,
                     xlabel=xlabel, ylabel=ylabel,
+                    show_pct=show_pct,
                 )
             except ValueError as exc:
                 st.error(str(exc))
                 return
 
+    apply_legend_order(fig, legend_order, {})
+    apply_grid(fig, show_grid_x, show_grid_y, is_3d=(plot_type == "3D scatter"))
+
     st.plotly_chart(fig, use_container_width=True)
     fixed_text = fixed_params(df, expand_used_with_composites(used))
     if fixed_text:
         st.caption(f"Fixed: {fixed_text}")
-    st.caption(f"{len(df)} rows · {csv_path}")
+    st.caption(f"{len(df)} rows · {csv_label}")
 
 
 if __name__ == "__main__":

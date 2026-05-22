@@ -13,14 +13,20 @@
 inline MatmulRuntimeConfig nb_make_matmul_cfg(const NafBlockLayerDesc &layer,
                                               int worker_count = nafblock_cfg::N_WORKERS)
 {
+    // A<->B operand swap: treat weights as A (M=Cout) and input as B (N=Hout*Wout).
+    // gemm_m = n*h*w, gemm_k = c_in*kh*kw, gemm_n = c_out
+    // To get gemm_m = Cout and gemm_n = Hout*Wout while keeping gemm_k = Cin*Kh*Kw,
+    // pack Cout into workload_h and Hout*Wout into workload_c_out.
     MatmulRuntimeConfig cfg = MatmulRuntimeConfig::defaults(worker_count);
+    const uint64_t spatial = static_cast<uint64_t>(layer.Hout)
+                           * static_cast<uint64_t>(layer.Wout);
     cfg.workload_n     = 1;
-    cfg.workload_h     = static_cast<uint64_t>(layer.Hout);
-    cfg.workload_w     = static_cast<uint64_t>(layer.Wout);
+    cfg.workload_h     = static_cast<uint64_t>(layer.Cout);
+    cfg.workload_w     = 1;
     cfg.workload_c_in  = static_cast<uint64_t>(layer.Cin);
     cfg.workload_kh    = static_cast<uint64_t>(layer.Kh);
     cfg.workload_kw    = static_cast<uint64_t>(layer.Kw);
-    cfg.workload_c_out = static_cast<uint64_t>(layer.Cout);
+    cfg.workload_c_out = spatial;
     return cfg;
 }
 

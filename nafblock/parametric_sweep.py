@@ -55,7 +55,7 @@ DEFAULT_SHAPES = [
 ]
 
 # Default HW config matches config/hardware_config.h (MAT=2, VEC=4).
-DEFAULT_HW = [(2, 4)]
+DEFAULT_HW = [(1, 1)]
 
 TOTAL_ELAPSED_RE = re.compile(
     r"^Total Elapsed Cycles\s*\[cycles\]\s*:\s*(\d+)$", re.MULTILINE

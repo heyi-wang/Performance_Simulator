@@ -35,17 +35,20 @@ All controls live in the left sidebar.
 
 | Control | Effect |
 |---|---|
-| **CSV path** | Path to the sweep CSV. Defaults to `kernel/matmul/full_sweep.csv` relative to the repo root. Change it to point at any other sweep CSV; dropdowns auto-populate from that file's columns. The file is re-read whenever its modification time changes. |
+| **CSV file** | File uploader (drag-drop / browse). Pick any sweep CSV from your machine; dropdowns auto-populate from that file's columns. When no file is uploaded, the tool falls back to `kernel/matmul/full_sweep.csv` relative to the repo root so the default experience still works. |
 | **Type** | `2D scatter`, `2D line`, `3D scatter`, or `Stacked bar`. |
-| **X / Y / Z column** | Pick any column for each axis. In 2D the Y selector is restricted to numeric columns; in 3D all three are. In stacked-bar mode only X is selectable (bar height and segments are fixed by schema, see below). |
+| **X / Y / Z column** | Pick any column for each axis. X / Series / Facet selectors hide status/output columns (`verification_status`, `build_ok`, `run_ok`, `actual_*_accels`, `slowest_worker_tid`, `wall_seconds`) and metric columns (`total_cycles`, `*_util_pct`, `*_cycle_fraction_pct`) — only true sweep parameters appear. Y stays unrestricted (numeric-only) so metrics can still be plotted. In stacked-bar mode only X is selectable (bar height and segments are fixed by schema, see below). |
 | **log X / log Y / log Z** | Toggle each axis between linear and log scale. When the underlying values are positive integer powers of two (e.g. `threads`, `mat_count`, `vec_bytes`), the log ticks switch to base 2 automatically. Stacked-bar X is categorical (constant bar width), so the log-X toggle is hidden there. |
 | **Series column** (2D only) | Pick a column to group rows into separate curves. `(none)` = one curve. Otherwise one trace per unique value of the chosen column, labeled in the legend as `<col>=<value>`. In `2D line` each group is sorted by X before connecting. |
 | **Plot title** | Optional figure title. Empty = no title. |
 | **X / Y / Z axis label** | Override the default axis label (which is the column name). Empty = use the column name. The Z input only appears in 3D mode. |
-| **Plot style** | Overall theme: `plotly`, `plotly_white`, `plotly_dark`, `ggplot2`, `seaborn`, `simple_white`, `none`. |
+| **Plot style** | Overall theme: `simple_white` (default — publication look), `plotly`, `plotly_white`, `plotly_dark`, `ggplot2`, `seaborn`, `none`. A serif-font + inward-tick scientific layer is applied on top of every template. |
 | **Color palette** | Default colors for every trace. Qualitative: `Plotly`, `D3`, `Set1`, `Set2`, `Pastel`. Sequential (sampled evenly): `Viridis`, `Plasma`, `Blues`. Stacked-bar segments use the palette only when changed from `Plotly` (the default keeps the historical mat/vec/dma/scalar/stall colors). Individual colors can still be overridden in the **Style per series** panel. |
 | **Facet column** | Split the chart into one subplot per unique value of the chosen column. Supported in `2D scatter`, `2D line`, and `Stacked bar`. Shared X and Y axes; legend rendered once across all panels. Not supported in `3D scatter`. |
 | **Fix values** | One dropdown per sweep parameter that isn't being used as X / Y / Z / Series / Facet and that has more than one value in the CSV. The default is the first concrete value, which pins the dimension so rows don't collide on the chart. Choose `(none)` for a column to let it vary (legacy behavior). |
+| **Legend order** | Drag-and-drop list of trace labels (powered by `streamlit-sortables`). Reorder by mouse; Plotly's `legendrank` rewrites the legend accordingly. Reconciles when the trace set changes. Hidden in 3D mode (single trace). |
+| **Vertical gridlines / Horizontal gridlines** | Toggle gridlines on each axis. Both default on. Applied to every subplot in faceted charts and to all three scene axes in 3D mode. |
+| **Show segment %** (Stacked bar only) | Toggle inline + side-arrow percentage labels on stacked bars. When off, hover still shows precise values. |
 
 ### Style per series
 
@@ -92,6 +95,12 @@ Mirrors `--bar` in [`kernel/matmul/plot_sweep.py`](../kernel/matmul/plot_sweep.p
   `stall_cycle_fraction_pct`.
 - If multiple rows share an X value, totals are summed and fractions are
   averaged weighted by `total_cycles` so segment heights still add up.
+- Each segment is labeled inline with its exact percentage (e.g. `12.3%`)
+  in white text at a fixed 12-pt size. Segments at or below 4% get a
+  **side annotation with an arrow** pointing at the segment instead, so
+  the percentage stays legible without shrinking the font. Hover still
+  shows precise values. The whole labeling can be toggled off via the
+  sidebar **Show segment %** checkbox.
 
 Hovering a segment shows its absolute cycle count and percentage of the bar.
 
