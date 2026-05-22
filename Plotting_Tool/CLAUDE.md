@@ -1,242 +1,110 @@
-## Build a light-weight interactive plotting tool to visulize the results of parametric sweep
+# Plotting Tool
 
-# Requirements:
-- Able to read csv file containing the parametric sweep results (like @/home/why/Desktop/Performance_Simulator/kernel/matmul/full_sweep.csv).
-- Allow user to choose the variables to plot on each axis 
-- Allow user to select the scale of each axis
-- Allow user to choose 2D/3D or stacked bar chart (referring to /home/why/Desktop/Performance_Simulator/kernel/matmul/plot_sweep.py)
-- Can be run in the web browser
+Light-weight interactive plotter for the parametric-sweep CSVs produced by
+the kernel and nafblock sweep scripts (e.g.
+[`kernel/matmul/full_sweep.py`](../kernel/matmul/full_sweep.py)).
 
-Build a usable version first.
-Create the "README.md" file to document the method of building/using the plotting tool.
-
-Update this file for the current project status after modification.
-
-## Status (v1 — usable)
-
-Implemented as a single-file **Streamlit + Plotly** app reading the long/tidy
-CSV schema produced by [`kernel/matmul/full_sweep.py`](../kernel/matmul/full_sweep.py).
-
-### Files
-- [app.py](app.py) — Streamlit entry point. Sidebar controls + Plotly figure in the body.
-- [requirements.txt](requirements.txt) — `streamlit>=1.30`, `plotly>=5.18`, `pandas>=2.0`.
-- [README.md](README.md) — install / run / controls / stacked-bar semantics / example.
-
-### Controls in v1
-- CSV path text input (default: `kernel/matmul/full_sweep.csv`, re-read on mtime change via `st.cache_data`).
-- Plot type radio: **2D scatter**, **3D scatter**, **Stacked bar**.
-- Per-axis column selectors (X / Y / Z) populated from `df.columns`; numeric-only enforced where it matters.
-- Per-axis linear/log toggles.
-
-### Stacked-bar
-Mirrors `--bar` in [`kernel/matmul/plot_sweep.py`](../kernel/matmul/plot_sweep.py):
-bar height = `total_cycles`, segmented by
-`mat/vec/dma/scalar/stall_cycle_fraction_pct` with the same five colors used
-by the reference matplotlib plotter. Multiple rows sharing an X value are
-combined: totals summed, fractions averaged weighted by `total_cycles`.
-
-### Verification
-End-to-end exercised against `kernel/matmul/full_sweep.csv` (headless, with
-`streamlit` stubbed): all three builders return valid Plotly figures; stacked
-segment heights reconstruct each bar's `total_cycles` within rounding error.
-
-### Not in v1 (deferred)
-- Group-by encoding (hue / brightness / style / marker) like plot_sweep.py
-  `--group-by`.
-- Per-column filter widgets like plot_sweep.py `--filter`.
-- Multi-CSV overlay, figure export, axis-range presets.
-
-### Run
+## Run
 ```bash
 cd Plotting_Tool
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-# Requirements for v2
-- Add **2D Line Chart** to plot type
-- Add legend to the chart that labels the meaning of each curve
-- Allow user to edit the name of axis and the title of the plot
-- Show the fixed parameters and their values while plotting variables
+## Files
+- [app.py](app.py) — Streamlit entry point. Sidebar controls + Plotly figure.
+- [requirements.txt](requirements.txt) — `streamlit>=1.30`, `plotly>=5.18`,
+  `pandas>=2.0`, `streamlit-sortables` (drag-reorder legend).
+- [README.md](README.md) — install / run / controls.
 
-## Status (v2 — implemented)
+## Current capabilities (v5)
 
-All four v2 requirements landed in [app.py](app.py); README updated.
+### Input
+- **File uploader**: browse / drag-drop a CSV; falls back to
+  `kernel/matmul/full_sweep.csv` when nothing is uploaded.
+- **Composite columns**: on load, `add_composite_columns(df)` appends
+  string columns `gemm = "MxKxN"` and `tile = "MxKxN"` when the
+  underlying `*_m/k/n` components are present. Originals remain
+  selectable.
 
-### Added in v2
-- **2D Line plot type** (`build_line_2d`): `mode="lines+markers"`, rows
-  sorted by X per series so the line is monotonic.
-- **Series column selector** (2D scatter + 2D line). `(none)` = single trace
-  (v1 behavior); otherwise one trace per unique value of the chosen column.
-  Trace names `<col>=<value>` produce the Plotly legend automatically.
-- **Editable title and axis labels**: sidebar text inputs `Plot title`,
-  `X axis label`, `Y axis label`, `Z axis label` (Z only in 3D). Empty
-  string falls back to the column name (and no title).
-- **Fixed-parameter caption**: `fixed_params(df, exclude)` returns columns
-  whose `nunique() == 1`, excluding any column used as X / Y / Z / Series.
-  Reuses the `tile_m/k/n → tile=MxKxN` and `gemm_m/k/n → gemm=MxKxN`
-  triple-collapsing from
-  [`collect_fixed_dims`](../kernel/matmul/plot_sweep.py) so the annotation
-  matches the matplotlib-side convention.
+### Plot types
+- 2D scatter, 2D line, 3D scatter, stacked bar.
 
-### Still deferred
-- Full hue / brightness / style / marker group-by (only single-axis Series
-  in v2).
-- Per-column filter widgets.
-- Multi-CSV overlay, figure export, axis-range presets.
+### Axis / series controls
+- Per-axis column selectors with linear / log toggles. Log axes auto-tick
+  at base 2 for power-of-two integer columns (`threads`, `mat_count`,
+  `vec_count`, `vec_bytes`, `tile_*`).
+- **Series** selector (2D scatter + 2D line): `(none)` = single trace;
+  otherwise one trace per unique value with auto-named legend entries.
+- **Facet** column: subplot grid (one panel per unique value). Supports
+  2D scatter / 2D line / stacked bar; 3D shows an info banner and falls
+  back to a single chart. Legend dedup via `legendgroup`.
 
-# Requirements for v3
-- Allow user to choose color for individual line/point
-- Allow user to assign a similar color to groups
-- Allow user to choose line style.
-- Allow user to set a style of the whole plot 
-- Allow editing legend text in-place.
-- Allow subplot (multiple small charts on one page)
+### Per-series styling
+- Expander above the chart: legend-text override, color picker, dash
+  style (2D line only). Keys include plot-type / series / facet so
+  overrides survive unrelated re-renders.
+- **Drag-to-reorder legend** (`streamlit-sortables`) stored in
+  `st.session_state` and applied via Plotly's `legendrank`. Falls back
+  to a static order + warning when the optional dep isn't installed.
 
-## Status (v3 — implemented)
+### Stacked bar
+Mirrors `--bar` in
+[`kernel/matmul/plot_sweep.py`](../kernel/matmul/plot_sweep.py): bar
+height = `total_cycles`, segmented by `mat/vec/dma/scalar/stall_cycle_fraction_pct`.
+Multiple rows sharing an X value are combined (totals summed, fractions
+weighted-averaged).
+- X axis is `type="category"` so bars render at constant visual width.
+- Per-segment **percentage labels**: ≥ `STACK_SIDE_LABEL_PCT` (4%) render
+  inline at 12 pt; smaller slices get a **side annotation with an arrow**
+  pointing at the segment mid-Y, staggered (`ax=45/70`) to avoid overlap.
+  `layout.uniformtext = dict(mode="hide", minsize=11)` keeps inline label
+  font size constant across bars.
+- `Show segment %` checkbox toggles labels off entirely (hover still works).
 
-All six v3 requirements landed in [app.py](app.py); README updated; the
-v2 "Fixed" annotation bug (output/status columns leaking in) is fixed in
-the same commit via a `NON_PARAM_COLUMNS` exclusion set.
-
-### Added in v3
-- **Plot style** sidebar selector — Plotly templates (`plotly`,
-  `plotly_white`, `plotly_dark`, `ggplot2`, `seaborn`, `simple_white`, `none`).
-- **Color palette** sidebar selector — qualitative (`Plotly`, `D3`, `Set1`,
-  `Set2`, `Pastel`) and sequential (`Viridis`, `Plasma`, `Blues`) palettes.
-  Sequential palettes are evenly sampled via `plotly.colors.sample_colorscale`.
-  Drives the default per-trace color, including stacked-bar segments
-  (preserves historical mat/vec/dma/scalar/stall colors at `palette=Plotly`).
-- **Per-series style expander** — above the chart, one row per trace with
-  legend-text override, color picker, and (2D line only) dash style.
-  Keys include plot-type / series / facet so overrides survive unrelated
-  re-renders and reset on context switches.
-- **Facet column** — splits the chart into a subplot grid (one panel per
-  unique value). Supports 2D scatter / 2D line / Stacked bar; 3D shows an
-  `st.info` and falls back to a single chart. Shared X/Y axes; legend
-  deduplicated across panels via `legendgroup`.
-- **NON_PARAM_COLUMNS** filter applied inside `fixed_params` so the
-  `Fixed: …` caption no longer lists `verification_status`,
+### Fixed parameters
+- `Fix values` sidebar pins any sweep parameter not on an axis to its
+  first value (prevents row collisions on X+Series). `(none)` keeps the
+  dim free.
+- `fixed_params(df, exclude)` emits a `Fixed: …` caption listing pinned
+  values. Skips `NON_PARAM_COLUMNS` (`verification_status`,
   `actual_mat_accels`, `actual_vec_accels`, `slowest_worker_tid`,
-  `build_ok`, `run_ok`, `wall_seconds`, or any metric/utilization column —
-  only true sweep parameters.
+  `build_ok`, `run_ok`, `wall_seconds`, metric / utilization columns)
+  and synthetic composite names.
 
-### Still deferred
-- Full hue / brightness / style / marker group-by (only single-axis Series
-  + facet today).
+### Variable dropdown filtering
+X / Series / Facet (and 3D X) selectors hide `NON_PARAM_COLUMNS`. Y / Z
+stay unrestricted so metrics remain plottable on the value axis.
+
+### Styling
+- **Scientific defaults** (`apply_scientific_layout`): template
+  `simple_white`, serif font (`Times New Roman / Liberation Serif /
+  DejaVu Serif`), inward black tick marks, 18 pt title, mirrored axes.
+  3D scenes get the same treatment via `update_scenes`.
+- **Plot style** sidebar selector — Plotly templates (`plotly`,
+  `plotly_white`, `plotly_dark`, `ggplot2`, `seaborn`, `simple_white`,
+  `none`). Scientific layout layers on top.
+- **Color palette** sidebar selector — qualitative (`Plotly`, `D3`,
+  `Set1`, `Set2`, `Pastel`) + sequential (`Viridis`, `Plasma`, `Blues`)
+  via `plotly.colors.sample_colorscale`. Stacked-bar mat/vec/dma/scalar/stall
+  colors preserved when `palette=Plotly`.
+- **Grid toggles**: `Vertical gridlines` and `Horizontal gridlines`
+  checkboxes (default on); propagate through facet subplots and 3D
+  scene axes.
+
+## Changelog (high level)
+- v1 — initial Streamlit + Plotly app (2D / 3D scatter, stacked bar).
+- v2 — 2D line plot, series selector, editable axis labels + title,
+  fixed-parameter caption.
+- v3 — plot-style + color-palette selectors, per-series style expander,
+  facet column, `Fix values`, composite `gemm` / `tile` columns,
+  log-axis base-2 ticks.
+- v4 — stacked-bar percentage labels, drag-to-reorder legend, relevant-
+  only dropdown filtering, scientific defaults.
+- v5 — file uploader, grid toggles, show/hide segment % toggle,
+  adaptive (side-arrow) percentage placement.
+
+## Still deferred
+- Full hue / brightness / style / marker group-by (only single-axis
+  series + facet today).
 - Multi-CSV overlay, figure export, custom palettes.
-
-### Follow-up patch: composite `gemm` / `tile` columns and constant bar widths
-- **Composite columns (additive)**: on load, `add_composite_columns(df)`
-  appends string columns `gemm = "MxKxN"` and `tile = "MxKxN"` when the
-  underlying components are present. The raw `gemm_m/k/n` and
-  `tile_m/k/n` remain in the dataframe and in every dropdown — composites
-  are added alongside, not in place. `expand_used_with_composites` keeps
-  the composite and its parts in sync inside the `used` set so
-  `fixed_params` doesn't double-list them. The synthetic names are also
-  skipped inside `fixed_params` directly (the triple-collapse already
-  produces `gemm=MxKxN` / `tile=MxKxN`).
-- **Constant stacked-bar widths**: stacked-bar X axis is now
-  `type="category"`, so bars render at constant visual width regardless
-  of X spacing. The log-X toggle is hidden in the sidebar for stacked
-  bar (it had no effect on a categorical axis).
-
-### Follow-up patch: log axes use base 2 for power-of-two columns
-Plotly's `type="log"` defaults to base 10 (ticks at 1, 10, 100, …), which
-is wrong for sweep dims like `threads`, `mat_count`, `vec_count`,
-`vec_bytes`, `tile_*`. `_axis_kwargs(title, use_log, values)` now sets
-`dtick = log10(2)` whenever the underlying data is a positive integer
-power of two, so log axes tick at 1, 2, 4, 8, …. Applied across all
-plot types, including facet subplots and the 3D scene axes.
-
-### Follow-up patch: Fix values
-After v3 landed, a sidebar **Fix values** section was added: any sweep
-parameter column not used as X / Y / Z / Series / Facet that has more
-than one CSV value gets a dropdown defaulting to its first concrete
-value. This prevents collisions on the chart (multiple rows mapping to
-the same X+Series). `(none)` keeps the dimension free. Filters are
-applied before plotting; `fixed_params` then naturally shows the pinned
-values in the `Fixed:` caption.
-
-# Requirement v4 
-- In the stacked bar chart, the exact percentage of each bar segment should be clearly marked
-- The legend order should be customizable by allowing the user to use the mouse to drag lengend to intended position. 
-- In the drop down menu to select variables to plot, just show the variables that are relavant to current csv file. Do not include irrelavant variable names. 
-- Render the plot in a more scientific way.
-
-## Status (v4 — implemented)
-
-All four v4 requirements landed in [app.py](app.py); README updated and
-`streamlit-sortables` added to [requirements.txt](requirements.txt).
-
-### Added in v4
-- **Stacked-bar percentage labels**: every segment renders its
-  percentage inline (`text=…%`, `textposition="inside"`,
-  `insidetextanchor="middle"`, white text). Slices ≤ 1.5% are blanked
-  to avoid clutter; hover tooltip still shows the precise number.
-- **Drag-to-reorder legend** (`render_legend_order` +
-  `apply_legend_order`): a **Legend order** sidebar panel uses
-  [`streamlit-sortables`](https://github.com/ohtaman/streamlit-sortables)
-  to render trace labels as a vertical drag-and-drop list. The result
-  is stored in `st.session_state` keyed by the same plot-context
-  suffix used by the Style expander, and applied via Plotly's
-  `legendrank` attribute. Reconciles automatically when the trace set
-  changes. Skipped for 3D (single trace). Falls back to a static order
-  + warning when the optional dep isn't installed.
-- **Relevant-only variable dropdowns** (`selector_cols(df, role)`):
-  X / Series / Facet (and 3D X) hide `NON_PARAM_COLUMNS` — status
-  flags (`verification_status`, `build_ok`, `run_ok`), run outputs
-  (`actual_mat_accels`, `actual_vec_accels`, `slowest_worker_tid`,
-  `wall_seconds`), and metric columns (`total_cycles`, `*_util_pct`,
-  `*_cycle_fraction_pct`). Y and Z (3D) stay unrestricted so metrics
-  remain plottable on the value axis.
-- **Scientific defaults** (`apply_scientific_layout`): default
-  template flipped to `simple_white`; every figure now gets a serif
-  font (`Times New Roman / Liberation Serif / DejaVu Serif`),
-  black inward tick marks (`ticks="inside"`, `linecolor="#111"`,
-  `mirror=True`), and a 18-pt title font. Layered on top of whichever
-  template the user picks, so the publication look survives a
-  template change. 3D scenes get the same treatment via
-  `update_scenes` with axis-line styling.
-
-### Still deferred
-- Full hue / brightness / style / marker group-by.
-- Multi-CSV overlay, figure export, custom palettes.
-
-# Requirements v5
-
-- Add the option of turn on the grid line of horizontal and vertial directions
-- The font size of stack bar percentage should not decreases when the stack bar is small compared to others. Instead, it shoud adaptively move the number to the side of the bar and use and arrow to label it clearly.
-- The indicatioin of these percentage values can be manually switched on or off by user.
-- Allow user to select the csv file to be plotted with file explorer instead of manually type the file path.
-
-## Status (v5 — implemented)
-
-All four v5 requirements landed in [app.py](app.py); README updated.
-
-### Added in v5
-- **File uploader for CSV** (`st.file_uploader`): the typed-path
-  text input is gone. Users browse / drag-drop a CSV from their
-  machine. When nothing is uploaded the tool falls back to
-  `kernel/matmul/full_sweep.csv` so the default experience is
-  unchanged. The caption under the chart shows the active file
-  name (`csv_label`).
-- **Grid toggles** (`apply_grid(fig, show_x, show_y, is_3d)`): two
-  sidebar checkboxes — `Vertical gridlines` and `Horizontal
-  gridlines`, both default on. Applied as a post-process so they
-  propagate through facet subplots; in 3D mode they drive all three
-  `scene.<axis>.showgrid` flags (Z follows the horizontal toggle).
-- **Show/hide segment % toggle**: `Show segment %` checkbox visible
-  only in stacked-bar mode (default on). When off, neither inline
-  labels nor side arrows are drawn; hover tooltip still reports
-  precise values.
-- **Adaptive percentage placement** (`build_stacked_bar`): segments
-  above `STACK_SIDE_LABEL_PCT` (4%) keep the white in-bar label at
-  12pt; segments at or below 4% (but > 0) get a **side annotation
-  with an arrow** pointing at the segment mid-Y. Side labels include
-  the segment name (`<b>Mat</b> 2.3%`), bordered box, white
-  background. Multiple small segments in the same bar stagger
-  horizontally (`ax=45/70`). Inline text is no longer auto-shrunk:
-  `layout.uniformtext = dict(mode="hide", minsize=11)` hides any
-  inline label that wouldn't fit at 11pt, so the rendered font size
-  stays constant across bars regardless of the percentage value.
