@@ -10,8 +10,13 @@
 #include "nafblock_config.h"
 #include "nafblock_layers.h"
 
+// `dma_base_lat > 0` overrides each runtime config's L2/DMA base latency at
+// runtime, mirroring matmul's `--dma-base-lat` CLI. Passed through unchanged
+// from `BlockOptions::dma_base_lat` in nafblock_sim.cpp. Default `-1` keeps
+// every kernel on its compile-time default.
 inline MatmulRuntimeConfig nb_make_matmul_cfg(const NafBlockLayerDesc &layer,
-                                              int worker_count = nafblock_cfg::N_WORKERS)
+                                              int worker_count = nafblock_cfg::N_WORKERS,
+                                              int dma_base_lat = -1)
 {
     // A<->B operand swap: treat weights as A (M=Cout) and input as B (N=Hout*Wout).
     // gemm_m = n*h*w, gemm_k = c_in*kh*kw, gemm_n = c_out
@@ -27,10 +32,13 @@ inline MatmulRuntimeConfig nb_make_matmul_cfg(const NafBlockLayerDesc &layer,
     cfg.workload_kh    = static_cast<uint64_t>(layer.Kh);
     cfg.workload_kw    = static_cast<uint64_t>(layer.Kw);
     cfg.workload_c_out = spatial;
+    if (dma_base_lat > 0)
+        cfg.dma_base_lat = static_cast<uint64_t>(dma_base_lat);
     return cfg;
 }
 
-inline DwConvRuntimeConfig nb_make_dwconv_cfg(const NafBlockLayerDesc &layer)
+inline DwConvRuntimeConfig nb_make_dwconv_cfg(const NafBlockLayerDesc &layer,
+                                              int dma_base_lat = -1)
 {
     DwConvRuntimeConfig cfg = DwConvRuntimeConfig::defaults();
     cfg.channels     = layer.Cout;
@@ -45,32 +53,41 @@ inline DwConvRuntimeConfig nb_make_dwconv_cfg(const NafBlockLayerDesc &layer)
     // dwconv kernel's int32 accumulator must be requantized to int8 before
     // the next sub-layer consumes it.
     cfg.requant_enabled = true;
+    if (dma_base_lat > 0)
+        cfg.l2_base_lat = static_cast<uint64_t>(dma_base_lat);
     return cfg;
 }
 
-inline LayerNormRuntimeConfig nb_make_layernorm_cfg(const NafBlockLayerDesc &layer)
+inline LayerNormRuntimeConfig nb_make_layernorm_cfg(const NafBlockLayerDesc &layer,
+                                                    int dma_base_lat = -1)
 {
     LayerNormRuntimeConfig cfg = LayerNormRuntimeConfig::defaults();
     cfg.channels     = layer.Cin;
     cfg.height       = layer.Hin;
     cfg.width        = layer.Win;
     cfg.worker_count = nafblock_cfg::N_WORKERS;
+    if (dma_base_lat > 0)
+        cfg.l2_base_lat = static_cast<uint64_t>(dma_base_lat);
     return cfg;
 }
 
-inline PoolRuntimeConfig nb_make_pool_cfg(const NafBlockLayerDesc &layer)
+inline PoolRuntimeConfig nb_make_pool_cfg(const NafBlockLayerDesc &layer,
+                                          int dma_base_lat = -1)
 {
     PoolRuntimeConfig cfg = PoolRuntimeConfig::defaults();
     cfg.channels     = layer.Cin;
     cfg.height       = layer.Hin;
     cfg.width        = layer.Win;
     cfg.worker_count = nafblock_cfg::N_WORKERS;
+    if (dma_base_lat > 0)
+        cfg.l2_base_lat = static_cast<uint64_t>(dma_base_lat);
     return cfg;
 }
 
 inline VecOpsRuntimeConfig nb_make_vecops_cfg(const NafBlockLayerDesc &layer,
                                               VopType op,
-                                              int phase_idx = 0)
+                                              int phase_idx = 0,
+                                              int dma_base_lat = -1)
 {
     VecOpsRuntimeConfig cfg = VecOpsRuntimeConfig::defaults();
     cfg.op           = op;
@@ -87,6 +104,8 @@ inline VecOpsRuntimeConfig nb_make_vecops_cfg(const NafBlockLayerDesc &layer,
         if (layer.secondary_Wout > 0) cfg.width    = layer.secondary_Wout;
     }
     cfg.worker_count = nafblock_cfg::N_WORKERS;
+    if (dma_base_lat > 0)
+        cfg.l2_base_lat = static_cast<uint64_t>(dma_base_lat);
     return cfg;
 }
 

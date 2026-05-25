@@ -215,12 +215,14 @@ struct MatmulRunner : LayerRunnerBase
     sc_event done_ev;
     std::unique_ptr<MatmulTop> top;
 
-    explicit MatmulRunner(const NafBlockLayerDesc &l) : LayerRunnerBase(l)
+    explicit MatmulRunner(const NafBlockLayerDesc &l, int dma_base_lat)
+        : LayerRunnerBase(l)
     {
-        top = std::make_unique<MatmulTop>(sc_gen_unique_name("nb_matmul_top"),
-                                          nb_make_matmul_cfg(layer),
-                                          &start_ev,
-                                          &done_ev);
+        top = std::make_unique<MatmulTop>(
+            sc_gen_unique_name("nb_matmul_top"),
+            nb_make_matmul_cfg(layer, nafblock_cfg::N_WORKERS, dma_base_lat),
+            &start_ev,
+            &done_ev);
     }
 
     LayerRunResult run() override
@@ -249,12 +251,14 @@ struct DwConvRunner : LayerRunnerBase
     sc_event done_ev;
     std::unique_ptr<DwConvTop> top;
 
-    explicit DwConvRunner(const NafBlockLayerDesc &l) : LayerRunnerBase(l)
+    explicit DwConvRunner(const NafBlockLayerDesc &l, int dma_base_lat)
+        : LayerRunnerBase(l)
     {
-        top = std::make_unique<DwConvTop>(sc_gen_unique_name("nb_dw_top"),
-                                          nb_make_dwconv_cfg(layer),
-                                          &start_ev,
-                                          &done_ev);
+        top = std::make_unique<DwConvTop>(
+            sc_gen_unique_name("nb_dw_top"),
+            nb_make_dwconv_cfg(layer, dma_base_lat),
+            &start_ev,
+            &done_ev);
     }
 
     LayerRunResult run() override
@@ -282,12 +286,14 @@ struct LayerNormRunner : LayerRunnerBase
     sc_event done_ev;
     std::unique_ptr<LayerNormTop> top;
 
-    explicit LayerNormRunner(const NafBlockLayerDesc &l) : LayerRunnerBase(l)
+    explicit LayerNormRunner(const NafBlockLayerDesc &l, int dma_base_lat)
+        : LayerRunnerBase(l)
     {
-        top = std::make_unique<LayerNormTop>(sc_gen_unique_name("nb_ln_top"),
-                                             nb_make_layernorm_cfg(layer),
-                                             &start_ev,
-                                             &done_ev);
+        top = std::make_unique<LayerNormTop>(
+            sc_gen_unique_name("nb_ln_top"),
+            nb_make_layernorm_cfg(layer, dma_base_lat),
+            &start_ev,
+            &done_ev);
     }
 
     LayerRunResult run() override
@@ -315,12 +321,14 @@ struct PoolRunner : LayerRunnerBase
     sc_event done_ev;
     std::unique_ptr<PoolTop> top;
 
-    explicit PoolRunner(const NafBlockLayerDesc &l) : LayerRunnerBase(l)
+    explicit PoolRunner(const NafBlockLayerDesc &l, int dma_base_lat)
+        : LayerRunnerBase(l)
     {
-        top = std::make_unique<PoolTop>(sc_gen_unique_name("nb_pool_top"),
-                                        nb_make_pool_cfg(layer),
-                                        &start_ev,
-                                        &done_ev);
+        top = std::make_unique<PoolTop>(
+            sc_gen_unique_name("nb_pool_top"),
+            nb_make_pool_cfg(layer, dma_base_lat),
+            &start_ev,
+            &done_ev);
     }
 
     LayerRunResult run() override
@@ -355,7 +363,8 @@ struct VecOpsRunner : LayerRunnerBase
 
     std::vector<std::unique_ptr<Phase>> phases;
 
-    explicit VecOpsRunner(const NafBlockLayerDesc &l) : LayerRunnerBase(l)
+    explicit VecOpsRunner(const NafBlockLayerDesc &l, int dma_base_lat)
+        : LayerRunnerBase(l)
     {
         const auto phase_ops = nb_vecops_phases(layer);
         for (size_t i = 0; i < phase_ops.size(); ++i)
@@ -364,7 +373,8 @@ struct VecOpsRunner : LayerRunnerBase
             p->op = phase_ops[i];
             p->top = std::make_unique<VecOpsTop>(
                 sc_gen_unique_name("nb_vec_top"),
-                nb_make_vecops_cfg(layer, phase_ops[i], static_cast<int>(i)),
+                nb_make_vecops_cfg(layer, phase_ops[i],
+                                   static_cast<int>(i), dma_base_lat),
                 &p->start_ev,
                 &p->done_ev);
             phases.push_back(std::move(p));
@@ -416,15 +426,15 @@ struct VecOpsRunner : LayerRunnerBase
 };
 
 static std::unique_ptr<LayerRunnerBase>
-make_runner(const NafBlockLayerDesc &layer)
+make_runner(const NafBlockLayerDesc &layer, int dma_base_lat)
 {
     switch (layer.backend)
     {
-    case NB_BACKEND_MATMUL:    return std::make_unique<MatmulRunner>(layer);
-    case NB_BACKEND_DWCONV:    return std::make_unique<DwConvRunner>(layer);
-    case NB_BACKEND_LAYERNORM: return std::make_unique<LayerNormRunner>(layer);
-    case NB_BACKEND_POOLING:   return std::make_unique<PoolRunner>(layer);
-    case NB_BACKEND_VECOPS:    return std::make_unique<VecOpsRunner>(layer);
+    case NB_BACKEND_MATMUL:    return std::make_unique<MatmulRunner>(layer, dma_base_lat);
+    case NB_BACKEND_DWCONV:    return std::make_unique<DwConvRunner>(layer, dma_base_lat);
+    case NB_BACKEND_LAYERNORM: return std::make_unique<LayerNormRunner>(layer, dma_base_lat);
+    case NB_BACKEND_POOLING:   return std::make_unique<PoolRunner>(layer, dma_base_lat);
+    case NB_BACKEND_VECOPS:    return std::make_unique<VecOpsRunner>(layer, dma_base_lat);
     }
     return nullptr;
 }
@@ -437,6 +447,8 @@ struct BlockOptions
     int block_c = nafblock_cfg::DEFAULT_C;
     int block_h = nafblock_cfg::DEFAULT_H;
     int block_w = nafblock_cfg::DEFAULT_W;
+    // L2 / DMA base latency override (cycles). -1 keeps per-kernel defaults.
+    int dma_base_lat = -1;
 };
 
 struct NafBlockTop : sc_module
@@ -454,7 +466,7 @@ struct NafBlockTop : sc_module
         results.resize(layers.size());
         runners.reserve(layers.size());
         for (const auto &layer : layers)
-            runners.push_back(make_runner(layer));
+            runners.push_back(make_runner(layer, opts.dma_base_lat));
 
         SC_THREAD(run_all);
     }
@@ -475,7 +487,8 @@ static bool parse_args(int argc, char *argv[], BlockOptions &opts)
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
-        if (arg == "--block-c" || arg == "--block-h" || arg == "--block-w")
+        if (arg == "--block-c" || arg == "--block-h" || arg == "--block-w"
+            || arg == "--dma-base-lat")
         {
             if (i + 1 >= argc)
             {
@@ -483,23 +496,37 @@ static bool parse_args(int argc, char *argv[], BlockOptions &opts)
                 return false;
             }
             int v = std::stoi(argv[++i]);
-            if (v <= 0)
+            if (arg == "--dma-base-lat")
             {
-                std::cerr << "Invalid value for " << arg << ": " << v << "\n";
-                return false;
+                if (v < 0)
+                {
+                    std::cerr << "Invalid value for " << arg << ": " << v << "\n";
+                    return false;
+                }
+                opts.dma_base_lat = v;
             }
-            if (arg == "--block-c") opts.block_c = v;
-            if (arg == "--block-h") opts.block_h = v;
-            if (arg == "--block-w") opts.block_w = v;
+            else
+            {
+                if (v <= 0)
+                {
+                    std::cerr << "Invalid value for " << arg << ": " << v << "\n";
+                    return false;
+                }
+                if (arg == "--block-c") opts.block_c = v;
+                if (arg == "--block-h") opts.block_h = v;
+                if (arg == "--block-w") opts.block_w = v;
+            }
         }
         else if (arg == "--help" || arg == "-h")
         {
             std::cout
                 << "Usage: " << argv[0]
-                << " [--block-c N] [--block-h N] [--block-w N]\n"
+                << " [--block-c N] [--block-h N] [--block-w N]"
+                << " [--dma-base-lat N]\n"
                 << "Defaults: C=" << nafblock_cfg::DEFAULT_C
                 << ", H=" << nafblock_cfg::DEFAULT_H
-                << ", W=" << nafblock_cfg::DEFAULT_W << "\n";
+                << ", W=" << nafblock_cfg::DEFAULT_W
+                << ", dma_base_lat=<per-kernel default>\n";
             return false;
         }
         else

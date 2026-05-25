@@ -18,35 +18,87 @@ from plotly.subplots import make_subplots
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CSV = REPO_ROOT / "kernel" / "matmul" / "full_sweep.csv"
 
-STACK_SEGMENTS = [
+# Stacked-bar segment schemas. The tool auto-detects which one to use based
+# on which fraction columns are present in the loaded CSV
+# (see `detect_stack_segments` below). Matmul = critical-path-worker cycle
+# fractions (mat/vec/dma/scalar/stall, sum to 100). Nafblock = per-backend
+# elapsed cycle fractions (LayerNorm/Matmul/DwConv/Pooling/VecOps, sum to 100
+# because nafblock layers run sequentially).
+STACK_SEGMENTS_MATMUL = [
     ("mat_cycle_fraction_pct",    "Mat",    "#1f77b4"),
     ("vec_cycle_fraction_pct",    "Vec",    "#2ca02c"),
     ("dma_cycle_fraction_pct",    "DMA",    "#ff7f0e"),
     ("scalar_cycle_fraction_pct", "Scalar", "#9467bd"),
     ("stall_cycle_fraction_pct",  "Stall",  "#d62728"),
 ]
+STACK_SEGMENTS_NAFBLOCK = [
+    ("layernorm_cycle_fraction_pct", "LayerNorm", "#1f77b4"),
+    ("matmul_cycle_fraction_pct",    "Matmul",    "#2ca02c"),
+    ("dwconv_cycle_fraction_pct",    "DwConv",    "#ff7f0e"),
+    ("pooling_cycle_fraction_pct",   "Pooling",   "#9467bd"),
+    ("vecops_cycle_fraction_pct",    "VecOps",    "#d62728"),
+]
+# Back-compat: matmul is the historical default. Functions that have a df in
+# scope should call `detect_stack_segments(df)` instead.
+STACK_SEGMENTS = STACK_SEGMENTS_MATMUL
+
+
+def detect_stack_segments(df: pd.DataFrame) -> list[tuple[str, str, str]]:
+    """Pick the stacked-bar segment schema that matches the loaded CSV.
+
+    Matmul's full_sweep.csv carries `mat_cycle_fraction_pct` etc.; nafblock's
+    full_sweep.csv carries `<backend>_cycle_fraction_pct`. If neither schema
+    matches we fall back to the matmul layout (caller raises a clear missing-
+    column error from `build_stacked_bar`)."""
+    cols = set(df.columns)
+    if {c for c, _, _ in STACK_SEGMENTS_NAFBLOCK}.issubset(cols):
+        return STACK_SEGMENTS_NAFBLOCK
+    return STACK_SEGMENTS_MATMUL
+
 
 # Columns that are run output / status, not sweep parameters.
-# Mirrors the SWEEP_PARAM_COLUMNS / metric split in kernel/matmul/full_sweep.py.
+# Mirrors the SWEEP_PARAM_COLUMNS / metric split in kernel/matmul/full_sweep.py
+# AND nafblock/full_sweep.py.
 NON_PARAM_COLUMNS: set[str] = {
+    # Common across both schemas.
     "verification_status",
     "actual_mat_accels", "actual_vec_accels",
     "slowest_worker_tid",
     "build_ok", "run_ok",
     "wall_seconds", "total_cycles",
+    # Matmul-only metrics.
     "mat_util_pct", "vec_util_pct",
     "mat_cycle_fraction_pct", "vec_cycle_fraction_pct",
     "dma_cycle_fraction_pct", "scalar_cycle_fraction_pct",
     "stall_cycle_fraction_pct",
+    # Nafblock-only metrics (see nafblock/full_sweep.py CSV_FIELDS).
+    "actual_workers", "actual_vec_cap",
+    "mat_pool_util_pct", "vec_pool_util_pct",
+    "mat_pool_occupancy_pct", "vec_pool_occupancy_pct",
+    "mat_reqs", "vec_reqs", "mem_reqs",
+    "read_bytes", "write_bytes",
+    "stall_cycles", "memory_cycles", "scalar_cycles",
+    "layernorm_cycles", "matmul_cycles", "dwconv_cycles",
+    "pooling_cycles", "vecops_cycles",
+    "layernorm_cycle_fraction_pct", "matmul_cycle_fraction_pct",
+    "dwconv_cycle_fraction_pct", "pooling_cycle_fraction_pct",
+    "vecops_cycle_fraction_pct",
+    "layernorm_mat_reqs", "matmul_mat_reqs", "dwconv_mat_reqs",
+    "pooling_mat_reqs", "vecops_mat_reqs",
+    "layernorm_vec_reqs", "matmul_vec_reqs", "dwconv_vec_reqs",
+    "pooling_vec_reqs", "vecops_vec_reqs",
+    "layernorm_mem_reqs", "matmul_mem_reqs", "dwconv_mem_reqs",
+    "pooling_mem_reqs", "vecops_mem_reqs",
 }
 
 SYNTHETIC_COMPOSITES: dict[str, tuple[str, str, str]] = {
-    "gemm": ("gemm_m", "gemm_k", "gemm_n"),
-    "tile": ("tile_m", "tile_k", "tile_n"),
-    "pool": ("pool_channels", "pool_height", "pool_width"),
+    "gemm":  ("gemm_m", "gemm_k", "gemm_n"),
+    "tile":  ("tile_m", "tile_k", "tile_n"),
+    "pool":  ("pool_channels", "pool_height", "pool_width"),
+    "block": ("block_c", "block_h", "block_w"),
 }
 
-SIZE_LABEL_COMPOSITES = {"gemm", "pool"}
+SIZE_LABEL_COMPOSITES = {"gemm", "pool", "block"}
 ALIASED_COLUMN_GROUPS = (
     {"threads", "workers"},
 )
@@ -413,7 +465,8 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
                       title: str = "", xlabel: str = "", ylabel: str = "",
                       show_pct: bool = True,
                       ) -> go.Figure:
-    needed = [col for col, _, _ in STACK_SEGMENTS] + ["total_cycles"]
+    segments = detect_stack_segments(df)
+    needed = [col for col, _, _ in segments] + ["total_cycles"]
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise ValueError(
@@ -425,7 +478,7 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
     for xv, sub in work.groupby(x, sort=True):
         total = sub["total_cycles"].sum()
         row = {x: xv, "total_cycles": total}
-        for col, _, _ in STACK_SEGMENTS:
+        for col, _, _ in segments:
             row[col] = (
                 (sub[col] * sub["total_cycles"]).sum() / total
                 if total > 0 else 0.0
@@ -435,16 +488,16 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
 
     # Palette overrides the hardcoded segment colors when user changes from Plotly.
     if palette == "Plotly":
-        seg_defaults = [c for _, _, c in STACK_SEGMENTS]
+        seg_defaults = [c for _, _, c in segments]
     else:
-        seg_defaults = palette_colors(palette, len(STACK_SEGMENTS))
+        seg_defaults = palette_colors(palette, len(segments))
 
     # Pre-compute per-bar segment heights and cumulative tops so we can
     # place side annotations at the correct mid-point of each small segment.
     n_bars = len(agg)
-    n_segs = len(STACK_SEGMENTS)
+    n_segs = len(segments)
     heights = [[0.0] * n_bars for _ in range(n_segs)]
-    for si, (col, _, _) in enumerate(STACK_SEGMENTS):
+    for si, (col, _, _) in enumerate(segments):
         for bi in range(n_bars):
             heights[si][bi] = (
                 agg["total_cycles"].iloc[bi] * agg[col].iloc[bi] / 100.0
@@ -453,7 +506,7 @@ def build_stacked_bar(df: pd.DataFrame, x: str, logx: bool, *,
     fig = go.Figure()
     side_annotations: list[dict] = []
     for si, ((col, label, _), default_color) in enumerate(
-        zip(STACK_SEGMENTS, seg_defaults)
+        zip(segments, seg_defaults)
     ):
         st_ = _style_for(styles, label, label, default_color)
         seg_height = pd.Series(heights[si])
@@ -635,13 +688,14 @@ def trace_keys_and_labels(
     Legend-order panel so they always agree on traces. When `styles` is
     provided, the label is replaced by the user's legend-text override."""
     if plot_type == "Stacked bar":
+        segments = detect_stack_segments(df)
         if palette == "Plotly":
-            default_colors = [c for _, _, c in STACK_SEGMENTS]
+            default_colors = [c for _, _, c in segments]
         else:
-            default_colors = palette_colors(palette, len(STACK_SEGMENTS))
+            default_colors = palette_colors(palette, len(segments))
         triples = [
             (label, label, default_colors[i])
-            for i, (_, label, _) in enumerate(STACK_SEGMENTS)
+            for i, (_, label, _) in enumerate(segments)
         ]
     elif plot_type in ("2D scatter", "2D line"):
         if series is None:
@@ -738,11 +792,12 @@ def render_style_expander(plot_type: str, df: pd.DataFrame,
     styles: dict = {}
 
     if plot_type == "Stacked bar":
+        segments = detect_stack_segments(df)
         if palette == "Plotly":
-            default_colors = [c for _, _, c in STACK_SEGMENTS]
+            default_colors = [c for _, _, c in segments]
         else:
-            default_colors = palette_colors(palette, len(STACK_SEGMENTS))
-        keys = [label for _, label, _ in STACK_SEGMENTS]
+            default_colors = palette_colors(palette, len(segments))
+        keys = [label for _, label, _ in segments]
         defaults = list(zip(keys, keys, default_colors))
     elif plot_type in ("2D scatter", "2D line"):
         if series is None:
@@ -875,7 +930,7 @@ def main() -> None:
             # log-X has no visual effect with a categorical X axis, so we
             # omit the toggle here to avoid confusion.
             logx = False
-            used = {x, "total_cycles"} | {c for c, _, _ in STACK_SEGMENTS}
+            used = {x, "total_cycles"} | {c for c, _, _ in detect_stack_segments(df)}
 
         st.header("Labels")
         title = st.text_input("Plot title", value="")

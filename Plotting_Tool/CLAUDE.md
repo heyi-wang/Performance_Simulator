@@ -23,9 +23,9 @@ streamlit run app.py
 - **File uploader**: browse / drag-drop a CSV; falls back to
   `kernel/matmul/full_sweep.csv` when nothing is uploaded.
 - **Composite columns**: on load, `add_composite_columns(df)` appends
-  string columns `gemm = "MxKxN"` and `tile = "MxKxN"` when the
-  underlying `*_m/k/n` components are present. Originals remain
-  selectable.
+  string columns from `SYNTHETIC_COMPOSITES` when their three components
+  are present — `gemm = "MxKxN"`, `tile = "MxKxN"`, `pool = "CxHxW"`,
+  `block = "CxHxW"`. Originals remain selectable.
 
 ### Plot types
 - 2D scatter, 2D line, 3D scatter, stacked bar.
@@ -49,11 +49,20 @@ streamlit run app.py
   to a static order + warning when the optional dep isn't installed.
 
 ### Stacked bar
-Mirrors `--bar` in
-[`kernel/matmul/plot_sweep.py`](../kernel/matmul/plot_sweep.py): bar
-height = `total_cycles`, segmented by `mat/vec/dma/scalar/stall_cycle_fraction_pct`.
-Multiple rows sharing an X value are combined (totals summed, fractions
-weighted-averaged).
+Bar height = `total_cycles`, segmented by 5 cycle-fraction columns. The
+segment schema is **autodetected** from the loaded CSV via
+`detect_stack_segments(df)`:
+
+- **Matmul schema** (default): `mat/vec/dma/scalar/stall_cycle_fraction_pct` —
+  critical-path-worker cycle fractions from
+  [`kernel/matmul/plot_sweep.py`](../kernel/matmul/plot_sweep.py).
+- **Nafblock schema**: `layernorm/matmul/dwconv/pooling/vecops_cycle_fraction_pct` —
+  per-backend layer cycle fractions from
+  [`nafblock/full_sweep.py`](../nafblock/full_sweep.py). Selected when those
+  5 columns are present in the loaded CSV.
+
+Both schemas sum to 100 by construction. Multiple rows sharing an X value
+are combined (totals summed, fractions weighted-averaged).
 - X axis is `type="category"` so bars render at constant visual width.
 - Per-segment **percentage labels**: ≥ `STACK_SIDE_LABEL_PCT` (4%) render
   inline at 12 pt; smaller slices get a **side annotation with an arrow**

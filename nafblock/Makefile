@@ -9,8 +9,8 @@ INCLUDES := -I/usr/include -I../src -I../config -I../kernel -I../kernel/matmul \
 LDFLAGS  := -L/usr/lib/x86_64-linux-gnu -Wl,-rpath,/usr/lib/x86_64-linux-gnu
 LIBS     := -lsystemc -lpthread
 
-TARGET   := build/nafblock_perf_sim
-BUILDDIR := build
+BUILDDIR ?= build
+TARGET   := $(BUILDDIR)/nafblock_perf_sim
 
 OBJS := $(BUILDDIR)/memory.o               \
         $(BUILDDIR)/accelerator.o          \
