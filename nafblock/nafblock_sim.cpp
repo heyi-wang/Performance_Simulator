@@ -357,13 +357,14 @@ struct VecOpsRunner : LayerRunnerBase
 
     explicit VecOpsRunner(const NafBlockLayerDesc &l) : LayerRunnerBase(l)
     {
-        for (VopType op : nb_vecops_phases(layer))
+        const auto phase_ops = nb_vecops_phases(layer);
+        for (size_t i = 0; i < phase_ops.size(); ++i)
         {
             auto p = std::make_unique<Phase>();
-            p->op = op;
+            p->op = phase_ops[i];
             p->top = std::make_unique<VecOpsTop>(
                 sc_gen_unique_name("nb_vec_top"),
-                nb_make_vecops_cfg(layer, op),
+                nb_make_vecops_cfg(layer, phase_ops[i], static_cast<int>(i)),
                 &p->start_ev,
                 &p->done_ev);
             phases.push_back(std::move(p));

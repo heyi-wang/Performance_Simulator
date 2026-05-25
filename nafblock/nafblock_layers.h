@@ -40,6 +40,14 @@ struct NafBlockLayerDesc
     int     phase_count   = 1;
     VopType primary_vop   = VOP_ELEMWISE_MUL;
     VopType secondary_vop = VOP_ELEMWISE_MUL;
+
+    // Optional shape overrides for phase 2. Default 0 = inherit the primary
+    // phase's (Hout, Wout, Cout). Used by sca_conv's quant epilogue, where
+    // phase 1's dot-product re-encoding (Hout=C, Cout=C) would otherwise make
+    // phase 2 iterate C*C elements instead of the real C scalar partials.
+    int secondary_Hout = 0;
+    int secondary_Wout = 0;
+    int secondary_Cout = 0;
 };
 
 inline const char *nb_op_kind_str(NafBlockOpKind op)
@@ -126,14 +134,17 @@ inline NafBlockLayerDesc nb_make_dwconv(int &id, const char *name,
 }
 
 // SimpleGate: split a 2C tensor along channels into two halves and elementwise
-// multiply. Modeled as a single VOP_ELEMWISE_MUL request stream sized on the
-// C-channel output (the two halves are the two operands).
+// multiply, then requant the i16 product back to i8 (matches simplegate_i8 in
+// nafnet_c_ops.h: prod = (a*b)*M >> shift). Phase 1 = widening i8*i8 -> i16,
+// phase 2 = i16 -> i8 quant with M+shift.
 inline NafBlockLayerDesc nb_make_simplegate(int &id, const char *name,
                                             int H, int W, int C)
 {
     return nb_make_layer(id, name, NB_OP_SIMPLEGATE, NB_BACKEND_VECOPS,
                          H, W, 2 * C, H, W, C,
-                         1, 1, 1, 0, 1, 1, VOP_ELEMWISE_MUL);
+                         1, 1, 1, 0, 1, 2,
+                         VOP_ELEMWISE_MUL,
+                         VOP_QUANTIZE_I16_TO_I8);
 }
 
 // Global Average Pool: collapse H*W -> 1*1 per channel.
@@ -145,13 +156,19 @@ inline NafBlockLayerDesc nb_make_gap(int &id, const char *name,
                          1, 1, 1, 0, 1, 1);
 }
 
-// SCA scale: broadcast a 1x1xC scalar onto an HxWxC tensor (channel-wise mul).
+// SCA scale: broadcast a 1x1xC scalar onto an HxWxC tensor (channel-wise mul),
+// then requant the i16 product back to i8. Matches sca_i8's step 3 in
+// nafnet_c_ops.h: out = (x[c,h,w] * attn[c]) * M >> shift. Phase 1 = widening
+// i8*i8 -> i16 (attn[c] is broadcast per channel by the worker pinning),
+// phase 2 = i16 -> i8 quant with M+shift.
 inline NafBlockLayerDesc nb_make_scale(int &id, const char *name,
                                        int H, int W, int C)
 {
     return nb_make_layer(id, name, NB_OP_SCA_SCALE, NB_BACKEND_VECOPS,
                          H, W, C, H, W, C,
-                         1, 1, 1, 0, 1, 1, VOP_SCALAR_MUL);
+                         1, 1, 1, 0, 1, 2,
+                         VOP_ELEMWISE_MUL,
+                         VOP_QUANTIZE_I16_TO_I8);
 }
 
 // SCA 1x1 conv on a 1x1 spatial feature map. Semantically C_out independent
@@ -162,22 +179,37 @@ inline NafBlockLayerDesc nb_make_scale(int &id, const char *name,
 // channels = C_out output pixels and spatial = C_in MACs per dot product.
 inline NafBlockLayerDesc nb_make_sca_conv(int &id, const char *name, int C)
 {
-    return nb_make_layer(id, name, NB_OP_CONV, NB_BACKEND_VECOPS,
-                         /*Hin*/  1, /*Win*/ 1, /*Cin*/  C,
-                         /*Hout*/ C, /*Wout*/ 1, /*Cout*/ C,
-                         /*Kh*/   1, /*Kw*/  1,
-                         /*stride*/ 1, /*pad*/ 0, /*groups*/ 1,
-                         /*phase_count*/ 1, VOP_DOT_PRODUCT_I8);
+    // Phase 1: C output pixels, each a C-element dot product (re-encoded as
+    // Hout=C, Cout=C so the existing nb_make_vecops_cfg sees C channels with
+    // spatial=C). Phase 2: a single C-element i32->i8 requant over the C
+    // partial sums; override the shape to (Cout=1, Hout=C, Wout=1) so it
+    // iterates exactly C elements, not C*C.
+    NafBlockLayerDesc l = nb_make_layer(
+        id, name, NB_OP_CONV, NB_BACKEND_VECOPS,
+        /*Hin*/  1, /*Win*/ 1, /*Cin*/  C,
+        /*Hout*/ C, /*Wout*/ 1, /*Cout*/ C,
+        /*Kh*/   1, /*Kw*/  1,
+        /*stride*/ 1, /*pad*/ 0, /*groups*/ 1,
+        /*phase_count*/ 2,
+        VOP_DOT_PRODUCT_I8,
+        VOP_QUANTIZE_I32_TO_I8);
+    l.secondary_Cout = 1;
+    l.secondary_Hout = C;
+    l.secondary_Wout = 1;
+    return l;
 }
 
-// Residual: y = alpha * x + skip. Two vector phases (scale, then add).
+// Residual with scaling: out = clip(x + (y * beta_i16) >> frac_bits). Phase 1
+// is the fused i8*i16 broadcast multiply + arithmetic shift + clip
+// (VOP_SCALE_REQUANT_I8); phase 2 is the elementwise i8 add of the skip
+// connection. Matches residual_scale_add_i8 in nafnet_c_ops.h.
 inline NafBlockLayerDesc nb_make_residual(int &id, const char *name,
                                           int H, int W, int C)
 {
     return nb_make_layer(id, name, NB_OP_RESIDUAL, NB_BACKEND_VECOPS,
                          H, W, C, H, W, C,
                          1, 1, 1, 0, 1, 2,
-                         VOP_SCALAR_MUL,
+                         VOP_SCALE_REQUANT_I8,
                          VOP_ELEMWISE_ADD);
 }
 
@@ -246,30 +278,35 @@ inline std::vector<NafBlockLayerDesc> build_nafblock_layers(int C, int H, int W)
 }
 
 // Canonical 14-entry manifest used by the pre-sim sanity check.
+// VECOPS rows additionally pin the expected phase composition so any
+// drift in the per-helper quantize epilogue (Changes B / C) fails closed.
 struct NafBlockManifestEntry
 {
     const char     *suffix;
     NafBlockOpKind  op_kind;
     NafBlockBackend backend;
+    int             phase_count;    // 0 = don't check (non-VECOPS rows)
+    VopType         primary_vop;
+    VopType         secondary_vop;
 };
 
 inline const NafBlockManifestEntry *nafblock_manifest()
 {
     static const NafBlockManifestEntry m[14] = {
-        {"norm1",           NB_OP_LAYERNORM,  NB_BACKEND_LAYERNORM},
-        {"conv1",           NB_OP_CONV,       NB_BACKEND_MATMUL},
-        {"conv2_dw",        NB_OP_DWCONV,     NB_BACKEND_DWCONV},
-        {"simplegate1",     NB_OP_SIMPLEGATE, NB_BACKEND_VECOPS},
-        {"sca_gap",         NB_OP_GAP,        NB_BACKEND_POOLING},
-        {"sca_conv",        NB_OP_CONV,       NB_BACKEND_VECOPS},
-        {"sca_scale",       NB_OP_SCA_SCALE,  NB_BACKEND_VECOPS},
-        {"conv3",           NB_OP_CONV,       NB_BACKEND_MATMUL},
-        {"beta_residual",   NB_OP_RESIDUAL,   NB_BACKEND_VECOPS},
-        {"norm2",           NB_OP_LAYERNORM,  NB_BACKEND_LAYERNORM},
-        {"conv4",           NB_OP_CONV,       NB_BACKEND_MATMUL},
-        {"simplegate2",     NB_OP_SIMPLEGATE, NB_BACKEND_VECOPS},
-        {"conv5",           NB_OP_CONV,       NB_BACKEND_MATMUL},
-        {"gamma_residual",  NB_OP_RESIDUAL,   NB_BACKEND_VECOPS},
+        {"norm1",           NB_OP_LAYERNORM,  NB_BACKEND_LAYERNORM, 0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"conv1",           NB_OP_CONV,       NB_BACKEND_MATMUL,    0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"conv2_dw",        NB_OP_DWCONV,     NB_BACKEND_DWCONV,    0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"simplegate1",     NB_OP_SIMPLEGATE, NB_BACKEND_VECOPS,    2, VOP_ELEMWISE_MUL,    VOP_QUANTIZE_I16_TO_I8},
+        {"sca_gap",         NB_OP_GAP,        NB_BACKEND_POOLING,   0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"sca_conv",        NB_OP_CONV,       NB_BACKEND_VECOPS,    2, VOP_DOT_PRODUCT_I8,  VOP_QUANTIZE_I32_TO_I8},
+        {"sca_scale",       NB_OP_SCA_SCALE,  NB_BACKEND_VECOPS,    2, VOP_ELEMWISE_MUL,    VOP_QUANTIZE_I16_TO_I8},
+        {"conv3",           NB_OP_CONV,       NB_BACKEND_MATMUL,    0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"beta_residual",   NB_OP_RESIDUAL,   NB_BACKEND_VECOPS,    2, VOP_SCALE_REQUANT_I8, VOP_ELEMWISE_ADD},
+        {"norm2",           NB_OP_LAYERNORM,  NB_BACKEND_LAYERNORM, 0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"conv4",           NB_OP_CONV,       NB_BACKEND_MATMUL,    0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"simplegate2",     NB_OP_SIMPLEGATE, NB_BACKEND_VECOPS,    2, VOP_ELEMWISE_MUL,    VOP_QUANTIZE_I16_TO_I8},
+        {"conv5",           NB_OP_CONV,       NB_BACKEND_MATMUL,    0, VOP_ELEMWISE_MUL,    VOP_ELEMWISE_MUL},
+        {"gamma_residual",  NB_OP_RESIDUAL,   NB_BACKEND_VECOPS,    2, VOP_SCALE_REQUANT_I8, VOP_ELEMWISE_ADD},
     };
     return m;
 }
@@ -301,6 +338,18 @@ inline bool validate_nafblock_manifest(const std::vector<NafBlockLayerDesc> &lay
             if (error) *error = "unexpected op/backend at index " +
                                 std::to_string(i);
             return false;
+        }
+        if (m[i].phase_count > 0)
+        {
+            if (layers[i].phase_count != m[i].phase_count ||
+                layers[i].primary_vop != m[i].primary_vop ||
+                (m[i].phase_count > 1 &&
+                 layers[i].secondary_vop != m[i].secondary_vop))
+            {
+                if (error) *error = "unexpected phase composition at index " +
+                                    std::to_string(i) + " (" + layers[i].name + ")";
+                return false;
+            }
         }
     }
     return true;

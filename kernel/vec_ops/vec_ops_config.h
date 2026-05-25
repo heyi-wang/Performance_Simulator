@@ -39,6 +39,13 @@ enum VopType
                                 // sum lives in the unit's accumulator register
                                 // across tiles; the final scalar per output
                                 // pixel is small enough to ignore in L1/L2.
+    VOP_SCALE_REQUANT_I8,       // fused (i8 operand · i16 broadcast) >> frac, clip i8
+                                // (rd=vl, wr=vl; 5 insns).
+                                // Models residual_scale_add_i8's epilogue:
+                                // (y[c,h,w] * beta[c]) >> frac_bits, then clip.
+                                // The i16 beta is a per-channel scalar held in
+                                // a register (no per-tile memory read), so the
+                                // operand count is 1 like VOP_SCALAR_MUL.
 };
 
 // ------------------------------------------------------------
@@ -165,6 +172,7 @@ static inline uint64_t vop_input_elem_bytes(VopType op)
     case VOP_QUANTIZE_I16_TO_I8:   return 2;  // int16
     case VOP_DEQUANTIZE_I8_TO_I32: return 1;  // int8
     case VOP_DOT_PRODUCT_I8:       return 1;  // int8 (two i8 operand vectors)
+    case VOP_SCALE_REQUANT_I8:     return 1;  // int8 operand; i16 beta is in a register
     }
     return 1;
 }
@@ -180,6 +188,7 @@ static inline uint64_t vop_output_elem_bytes(VopType op)
     case VOP_QUANTIZE_I16_TO_I8:   return 1;  // int8
     case VOP_DEQUANTIZE_I8_TO_I32: return 4;  // int32
     case VOP_DOT_PRODUCT_I8:       return 0;  // accumulator-resident scalar
+    case VOP_SCALE_REQUANT_I8:     return 1;  // int8
     }
     return 1;
 }
@@ -234,6 +243,7 @@ static inline uint64_t vop_insn_count(VopType op)
     case VOP_QUANTIZE_I16_TO_I8:   return 5;  // vsra,vadd,vmax,vmin,vnsra
     case VOP_DEQUANTIZE_I8_TO_I32: return 3;  // vwadd,vwadd,vmul_vx
     case VOP_DOT_PRODUCT_I8:       return 2;  // vwmul_vv + vredsum_vs
+    case VOP_SCALE_REQUANT_I8:     return 5;  // vwmul_vx, vsra, vmax, vmin, vnsra
     }
     return 1;
 }
@@ -282,6 +292,7 @@ static inline const char *vop_name(VopType op)
     case VOP_QUANTIZE_I16_TO_I8:   return "mf_quantize_i16_to_i8";
     case VOP_DEQUANTIZE_I8_TO_I32: return "mf_dequantize_i8_to_i32";
     case VOP_DOT_PRODUCT_I8:       return "mf_dotprod_i8_to_i32";
+    case VOP_SCALE_REQUANT_I8:     return "mf_scale_requant_i8";
     }
     return "unknown";
 }

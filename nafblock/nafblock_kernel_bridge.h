@@ -41,6 +41,10 @@ inline DwConvRuntimeConfig nb_make_dwconv_cfg(const NafBlockLayerDesc &layer)
     cfg.pad          = layer.pad;
     cfg.stride       = layer.stride;
     cfg.worker_count = nafblock_cfg::N_WORKERS;
+    // Match the C reference (dw_conv3x3_bias_requant in nafnet_c_ops.h): the
+    // dwconv kernel's int32 accumulator must be requantized to int8 before
+    // the next sub-layer consumes it.
+    cfg.requant_enabled = true;
     return cfg;
 }
 
@@ -65,13 +69,23 @@ inline PoolRuntimeConfig nb_make_pool_cfg(const NafBlockLayerDesc &layer)
 }
 
 inline VecOpsRuntimeConfig nb_make_vecops_cfg(const NafBlockLayerDesc &layer,
-                                              VopType op)
+                                              VopType op,
+                                              int phase_idx = 0)
 {
     VecOpsRuntimeConfig cfg = VecOpsRuntimeConfig::defaults();
     cfg.op           = op;
     cfg.channels     = layer.Cout;
     cfg.height       = layer.Hout;
     cfg.width        = layer.Wout;
+    // Phase-2 shape override: non-zero secondary_* fields replace the primary
+    // shape for the second phase. Currently used by sca_conv to size the
+    // i32 -> i8 requant over the C partial sums instead of C*C tiles.
+    if (phase_idx == 1)
+    {
+        if (layer.secondary_Cout > 0) cfg.channels = layer.secondary_Cout;
+        if (layer.secondary_Hout > 0) cfg.height   = layer.secondary_Hout;
+        if (layer.secondary_Wout > 0) cfg.width    = layer.secondary_Wout;
+    }
     cfg.worker_count = nafblock_cfg::N_WORKERS;
     return cfg;
 }

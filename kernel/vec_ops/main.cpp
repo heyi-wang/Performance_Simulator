@@ -13,6 +13,8 @@ static bool parse_op(const std::string &name, VopType &op)
     if (name == "quantize_i32_to_i8" || name == "qi32") { op = VOP_QUANTIZE_I32_TO_I8;   return true; }
     if (name == "quantize_i16_to_i8" || name == "qi16") { op = VOP_QUANTIZE_I16_TO_I8;   return true; }
     if (name == "dequantize_i8_to_i32" || name == "deq"){ op = VOP_DEQUANTIZE_I8_TO_I32; return true; }
+    if (name == "dot_product_i8"      || name == "dot") { op = VOP_DOT_PRODUCT_I8;       return true; }
+    if (name == "scale_requant_i8"    || name == "srq") { op = VOP_SCALE_REQUANT_I8;     return true; }
     return false;
 }
 
@@ -23,7 +25,8 @@ static void print_usage(const char *prog)
               << " [--vec-instances N] [--op NAME]\n"
               << "  --op NAME           one of: elemwise_add, elemwise_mul,\n"
               << "                              scalar_mul, quantize_i32_to_i8,\n"
-              << "                              quantize_i16_to_i8, dequantize_i8_to_i32\n";
+              << "                              quantize_i16_to_i8, dequantize_i8_to_i32,\n"
+              << "                              dot_product_i8, scale_requant_i8\n";
 }
 
 static bool parse_args(int argc,

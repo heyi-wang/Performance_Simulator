@@ -242,7 +242,32 @@ struct DwConvPostProcessor : WorkerPostProcessor
             for (auto &req : pending)
                 worker.issue_end(req);
 
-            // --- (5) Fire-and-forget L2 writeback ----------
+            // --- (5a) Post-accumulation requant epilogue ---
+            // One extra vec request per strip: reads the int32
+            // accumulator strip back from L1, writes the int8
+            // requantized output to L1. Cost = requant_insns *
+            // vec_acc_cycle (default 6, mirrors VOP_QUANTIZE_I32_TO_I8).
+            // Gated by cfg.requant_enabled so the standalone
+            // dw_conv2d sim's byte-exact verification stays unchanged.
+            uint64_t wb_bytes = g.wr_bytes_strip;
+            if (cfg.requant_enabled)
+            {
+                const uint64_t rq_rd = g.vl * cfg.output_elem_bytes;
+                const uint64_t rq_wr = g.vl * cfg.requant_out_elem_bytes;
+                auto rq_req = worker.issue_begin(
+                    Interconnect::ADDR_VEC,
+                    cfg.requant_insns * cfg.vec_acc_cycle,
+                    rq_rd,
+                    rq_wr);
+                ++worker.vec_calls;
+                total_l1_rd_bytes += rq_rd;
+                total_l1_wr_bytes += rq_wr;
+                worker.do_scalar(cfg.scalar_overhead);
+                worker.issue_end(rq_req);
+                wb_bytes = rq_wr;
+            }
+
+            // --- (5b) Fire-and-forget L2 writeback ----------
             // Per the user's spec: charge the writeback DMA
             // scalar overhead at the end of the last
             // sub-request, then non-blocking L2 DMA.
@@ -255,8 +280,8 @@ struct DwConvPostProcessor : WorkerPostProcessor
                 write_inflight.pop_front();
             }
             Worker::DmaReq w =
-                worker.issue_dma_begin(true, g.wr_bytes_strip);
-            total_l2_wr_bytes += g.wr_bytes_strip;
+                worker.issue_dma_begin(true, wb_bytes);
+            total_l2_wr_bytes += wb_bytes;
             write_inflight.push_back(std::move(w));
         }
 
@@ -441,8 +466,24 @@ static void compute_expected(const DwConvRuntimeConfig &cfg,
                 if (oh == 0 && st == 0)
                     l2_rd += kernel_rd;
                 s.expected_l2_read_bytes  += l2_rd;
-                s.expected_l2_write_bytes += wr;
                 s.expected_vec_calls      += sub_per_strip;
+                // Requant epilogue adds one vec request per strip that
+                // reads vl*output_elem_bytes (i32) from L1 and writes
+                // vl*requant_out_elem_bytes (i8) to L1. The L2 writeback
+                // also shrinks from i32 to i8 when enabled.
+                if (cfg.requant_enabled)
+                {
+                    const uint64_t rq_rd = vl * cfg.output_elem_bytes;
+                    const uint64_t rq_wr = vl * cfg.requant_out_elem_bytes;
+                    s.expected_l1_read_bytes  += rq_rd;
+                    s.expected_l1_write_bytes += rq_wr;
+                    s.expected_l2_write_bytes += rq_wr;
+                    s.expected_vec_calls      += 1;
+                }
+                else
+                {
+                    s.expected_l2_write_bytes += wr;
+                }
                 ++total_strips;
             }
         }
@@ -452,6 +493,10 @@ static void compute_expected(const DwConvRuntimeConfig &cfg,
     // Sub-requests where the entire kh-row is out of bounds emit no L1
     // read; that's why we count them explicitly above.
     s.expected_l1_reqs = total_nonzero_l1_rd + total_strips;
+    // Requant epilogue adds one read (i32 acc) and one write (i8 out)
+    // per strip to the L1 traffic when enabled.
+    if (cfg.requant_enabled)
+        s.expected_l1_reqs += 2 * total_strips;
     // 1 L2 DMA read (prefetch) + 1 L2 DMA write (writeback) per strip.
     s.expected_l2_dma_reqs = 2 * total_strips;
 }

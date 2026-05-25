@@ -42,6 +42,16 @@ struct DwConvRuntimeConfig
     uint64_t max_inflight_vec_reqs = DW_MAX_INFLIGHT_VEC_REQS_CFG;
     uint64_t max_inflight_dma_writes = DW_MAX_INFLIGHT_DMA_WRITES_CFG;
 
+    // Post-accumulation requant epilogue: one extra vec request per strip
+    // that reads the strip's int32 accumulator from L1 and writes the int8
+    // requantized output back to L1. Cost = 6 RVV insns (matches
+    // VOP_QUANTIZE_I32_TO_I8). When enabled the strip's L2 writeback also
+    // shrinks from i32 to i8. Default off so the standalone dw_conv2d sim
+    // keeps its existing byte-exact verification.
+    bool     requant_enabled       = false;
+    uint64_t requant_insns         = 6;   // VOP_QUANTIZE_I32_TO_I8
+    uint64_t requant_out_elem_bytes = 1;  // int8
+
     static DwConvRuntimeConfig defaults()
     {
         return DwConvRuntimeConfig{};
