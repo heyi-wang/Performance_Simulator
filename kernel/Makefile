@@ -1,6 +1,7 @@
 CXX      := g++
 CXXFLAGS := -std=c++17 -O2 -Wall -Wno-unused-parameter \
             -DSC_INCLUDE_DYNAMIC_PROCESSES \
+            -DPERFETTO_TRACE \
             -MMD -MP
 EXTRA_CXXFLAGS ?=
 INCLUDES := -I/usr/include -I.. -I../src -I../config -I.

@@ -59,15 +59,50 @@ inline void perf_trace_declare(std::string group, std::string track)
     perf_declared_tracks().emplace_back(std::move(group), std::move(track));
 }
 
+// Runtime gate. Recording is skipped (and span-argument expressions are not
+// evaluated) unless this is set true — typically when a sim is given
+// --trace-out. This keeps the cost of a traced build to one branch per span
+// site when tracing is not requested (so sweeps pay ~nothing).
+inline bool &perf_trace_enabled()
+{
+    static bool enabled = false;
+    return enabled;
+}
+
 #ifdef PERFETTO_TRACE
-#  define PERF_TRACE_SPAN(group, track, name, ts_ns, dur_ns) \
-        perf_trace_record((group), (track), (name), (ts_ns), (dur_ns))
-#  define PERF_TRACE_DECLARE(group, track) \
-        perf_trace_declare((group), (track))
+#  define PERF_TRACE_SPAN(group, track, name, ts_ns, dur_ns)                  \
+        do {                                                                  \
+            if (perf_trace_enabled())                                         \
+                perf_trace_record((group), (track), (name), (ts_ns), (dur_ns)); \
+        } while (0)
+#  define PERF_TRACE_DECLARE(group, track)                                    \
+        do {                                                                  \
+            if (perf_trace_enabled())                                         \
+                perf_trace_declare((group), (track));                         \
+        } while (0)
 #else
 #  define PERF_TRACE_SPAN(group, track, name, ts_ns, dur_ns) ((void)0)
 #  define PERF_TRACE_DECLARE(group, track) ((void)0)
 #endif
+
+// Extract (and remove) a "--trace-out <path>" pair from argv so each sim's own
+// argument parser never sees it. Returns the path, or "" if not present.
+// Always compiled (independent of PERFETTO_TRACE) so the flag is accepted and
+// stripped uniformly; callers decide whether to act on it.
+inline std::string perf_take_trace_out_arg(int &argc, char **argv)
+{
+    std::string out;
+    int w = 1;
+    for (int i = 1; i < argc; ++i)
+    {
+        if (std::string(argv[i]) == "--trace-out" && i + 1 < argc)
+            out = argv[++i];
+        else
+            argv[w++] = argv[i];
+    }
+    argc = w;
+    return out;
+}
 
 // Emit nanoseconds as fractional microseconds (Chrome-JSON ts/dur unit),
 // trimming trailing zeros so 1500ns -> "1.5", 2000ns -> "2".

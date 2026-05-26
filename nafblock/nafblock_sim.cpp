@@ -571,6 +571,12 @@ int sc_main(int argc, char *argv[])
         return 2;
     }
 
+#ifdef PERFETTO_TRACE
+    // nafblock traces by default (single-run usage); recording must be on
+    // before the worker/accelerator SC_THREADs run during sc_start().
+    perf_trace_enabled() = true;
+#endif
+
     sc_start();
 
 #ifdef PERFETTO_TRACE

@@ -19,6 +19,7 @@ static std::string slurp(const char *path)
 int main()
 {
     perf_spans().clear();
+    perf_trace_enabled() = true;   // recording is gated on this at runtime
 
     // Two groups, two tracks, ns->us conversion (1500 ns -> 1.5 us).
     PERF_TRACE_SPAN("Workers", "worker_0", "run", 0, 1500);

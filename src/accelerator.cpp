@@ -230,8 +230,9 @@ void AcceleratorTLM::service_thread()
 
 #ifdef PERFETTO_TRACE
         // Serial mode: load = read, compute = svc wait, write = write-back.
-        perf_emit_service(accel_unit_group(name()), perf_last_busy_end,
-                          m0, m1, m1, m2, m2, m3);
+        if (perf_trace_enabled())
+            perf_emit_service(accel_unit_group(name()), perf_last_busy_end,
+                              m0, m1, m1, m2, m2, m3);
 #endif
 
         complete_request(e);
@@ -379,10 +380,11 @@ void AcceleratorTLM::write_thread()
         stage_exit();
 
 #ifdef PERFETTO_TRACE
-        perf_emit_service(accel_unit_group(name()), perf_last_busy_end,
-                          e.t_load_start,    e.t_load_end,
-                          e.t_compute_start, e.t_compute_end,
-                          e.t_write_start,   e.t_write_end);
+        if (perf_trace_enabled())
+            perf_emit_service(accel_unit_group(name()), perf_last_busy_end,
+                              e.t_load_start,    e.t_load_end,
+                              e.t_compute_start, e.t_compute_end,
+                              e.t_write_start,   e.t_write_end);
 #endif
 
         complete_request(e);

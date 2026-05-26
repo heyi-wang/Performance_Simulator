@@ -1,4 +1,5 @@
 #include "pooling_top.h"
+#include "perfetto_trace.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -92,6 +93,10 @@ static bool parse_args(int argc,
 
 int sc_main(int argc, char *argv[])
 {
+    [[maybe_unused]] std::string trace_out = perf_take_trace_out_arg(argc, argv);
+#ifdef PERFETTO_TRACE
+    if (!trace_out.empty()) perf_trace_enabled() = true;
+#endif
     int workers = -1;
     int channels = -1;
     int height = -1;
@@ -116,6 +121,14 @@ int sc_main(int argc, char *argv[])
 
     PoolTop top("pool_top", cfg);
     sc_start();
+
+#ifdef PERFETTO_TRACE
+    if (!trace_out.empty())
+    {
+        perf_trace_write_json(trace_out.c_str());
+        std::cerr << "Perfetto trace written to " << trace_out << "\n";
+    }
+#endif
 
     top.print_report(std::cout);
 

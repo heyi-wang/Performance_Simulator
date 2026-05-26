@@ -1,4 +1,5 @@
 #include "matmul_top.h"
+#include "perfetto_trace.h"
 
 #include <algorithm>
 #include <iostream>
@@ -86,6 +87,10 @@ static bool parse_args(int argc,
 
 int sc_main(int argc, char *argv[])
 {
+    [[maybe_unused]] std::string trace_out = perf_take_trace_out_arg(argc, argv);
+#ifdef PERFETTO_TRACE
+    if (!trace_out.empty()) perf_trace_enabled() = true;
+#endif
     int thread_count = MatmulConfig::default_thread_count;
     uint64_t gemm_m = MatmulConfig::gemm_m;
     uint64_t gemm_k = MatmulConfig::gemm_k;
@@ -116,6 +121,14 @@ int sc_main(int argc, char *argv[])
     MatmulTop top("top", cfg);
 
     sc_start();
+
+#ifdef PERFETTO_TRACE
+    if (!trace_out.empty())
+    {
+        perf_trace_write_json(trace_out.c_str());
+        std::cerr << "Perfetto trace written to " << trace_out << "\n";
+    }
+#endif
 
     const MatmulSimulationStats stats = top.collect_stats();
     top.print_report(std::cout);
