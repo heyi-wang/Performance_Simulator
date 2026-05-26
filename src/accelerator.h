@@ -71,6 +71,12 @@ struct AcceleratorTLM : sc_module
     uint64_t queue_wait_cycles = 0;
     uint64_t req_count         = 0;
 
+#ifdef PERFETTO_TRACE
+    // End time of the last request this unit serviced; used to emit the idle
+    // ("stall") lane in the Perfetto trace (gap until the next service start).
+    sc_time perf_last_busy_end = SC_ZERO_TIME;
+#endif
+
     SC_HAS_PROCESS(AcceleratorTLM);
 
     AcceleratorTLM(sc_module_name name, size_t cap, bool enable_pipeline = false);

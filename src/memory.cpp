@@ -82,7 +82,8 @@ void Memory::dispatch_thread()
             reqs += 1;
             busy_cycles += mem_lat;
             active_reqs += 1;
-            PERF_TRACE_SPAN("Memory", "DMA Engine",
+            PERF_TRACE_SPAN("DMA Engine",
+                            e.gp->is_write() ? "write" : "read",
                             e.gp->is_write() ? "write" : "read",
                             static_cast<uint64_t>(t_start / CYCLE), mem_lat);
             resp_peq.notify(*e.gp, mem_lat * CYCLE);
@@ -268,7 +269,8 @@ void L1L2Memory::dma_dispatch_thread()
             }
 
             dma_active_reqs += 1;
-            PERF_TRACE_SPAN("Memory", "DMA Engine",
+            PERF_TRACE_SPAN("DMA Engine",
+                            e.gp->is_write() ? "write" : "read",
                             e.gp->is_write() ? "write" : "read",
                             static_cast<uint64_t>(sc_time_stamp() / CYCLE), lat);
             resp_peq.notify(*e.gp, lat * CYCLE);

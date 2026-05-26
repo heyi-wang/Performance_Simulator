@@ -16,11 +16,12 @@
 #include <fstream>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 struct PerfSpan
 {
-    const char *group;   // process lane label (string literal; stable lifetime)
+    std::string group;   // process lane label (unit instance, e.g. "Vector Unit 0")
     std::string track;   // thread lane label within the group
     std::string name;    // span label
     uint64_t    ts_ns;   // start time, nanoseconds
@@ -34,21 +35,38 @@ inline std::vector<PerfSpan> &perf_spans()
     return v;
 }
 
-inline void perf_trace_record(const char *group,
+// Tracks declared up-front so an (always-)empty lane still appears in the UI.
+// Order of first appearance fixes the lane order within a group.
+inline std::vector<std::pair<std::string, std::string>> &perf_declared_tracks()
+{
+    static std::vector<std::pair<std::string, std::string>> v;
+    return v;
+}
+
+inline void perf_trace_record(std::string group,
                               std::string track,
                               std::string name,
                               uint64_t    ts_ns,
                               uint64_t    dur_ns)
 {
     perf_spans().push_back(
-        PerfSpan{group, std::move(track), std::move(name), ts_ns, dur_ns});
+        PerfSpan{std::move(group), std::move(track), std::move(name),
+                 ts_ns, dur_ns});
+}
+
+inline void perf_trace_declare(std::string group, std::string track)
+{
+    perf_declared_tracks().emplace_back(std::move(group), std::move(track));
 }
 
 #ifdef PERFETTO_TRACE
 #  define PERF_TRACE_SPAN(group, track, name, ts_ns, dur_ns) \
         perf_trace_record((group), (track), (name), (ts_ns), (dur_ns))
+#  define PERF_TRACE_DECLARE(group, track) \
+        perf_trace_declare((group), (track))
 #else
 #  define PERF_TRACE_SPAN(group, track, name, ts_ns, dur_ns) ((void)0)
+#  define PERF_TRACE_DECLARE(group, track) ((void)0)
 #endif
 
 // Emit nanoseconds as fractional microseconds (Chrome-JSON ts/dur unit),
@@ -78,12 +96,12 @@ inline void perf_trace_write_json(const char *path)
         return;
 
     // Stable pid per group (first-seen order); stable tid per (group,track).
-    std::vector<const char *>     group_order;
+    std::vector<std::string>      group_order;
     std::map<std::string, int>    group_pid;
     std::map<std::string, int>    track_tid;   // key: "<pid>\x1f<track>"
     int next_tid = 0;
 
-    auto pid_for = [&](const char *g) -> int {
+    auto pid_for = [&](const std::string &g) -> int {
         auto it = group_pid.find(g);
         if (it != group_pid.end())
             return it->second;
@@ -106,13 +124,19 @@ inline void perf_trace_write_json(const char *path)
     bool first = true;
     auto comma = [&]() { if (!first) f << ",\n"; first = false; };
 
-    // 1. process_name + thread_name metadata.
+    // 1. Assign pid/tid. Declared tracks come first so lane order within a
+    //    group is deterministic (and empty lanes still get a thread_name).
+    for (const auto &d : perf_declared_tracks())
+    {
+        int pid = pid_for(d.first);
+        (void)tid_for(pid, d.second);
+    }
     for (const auto &s : perf_spans())
     {
         int pid = pid_for(s.group);
         (void)tid_for(pid, s.track);
     }
-    for (const char *g : group_order)
+    for (const std::string &g : group_order)
     {
         comma();
         f << "{\"ph\":\"M\",\"name\":\"process_name\",\"pid\":"

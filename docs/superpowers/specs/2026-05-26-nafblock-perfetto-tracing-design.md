@@ -181,3 +181,34 @@ the cwd.
   user can shrink `--block-*`. No cap is imposed in v1.
 - Memory spans use dispatch-time latency, which is the modeled busy interval; this
   matches `busy_cycles` accounting and needs no end-time pairing.
+
+## Revision 2 (2026-05-26) — per-unit lanes
+
+Superseded the initial 3-flat-group layout (Threads/Accelerators/Memory, one lane
+each) with a per-unit-group layout matching a reference Perfetto capture. Each
+hardware unit is a group whose rows are named lanes:
+
+- **Scalar Unit `<tid>`** (one per worker): lanes `scalar`,
+  `stall (matrix FIFO full)`, `stall (vector FIFO full)`, `stall (DMA FIFO full)`.
+  Stall lane is routed by `issue_begin` target address (`Interconnect::ADDR_MAT` /
+  `ADDR_VEC`). All four lanes are pre-declared (`PERF_TRACE_DECLARE`) at the top of
+  `Worker::run()` so they always appear; `stall (DMA FIFO full)` stays empty because
+  the memory model applies no worker-facing backpressure.
+- **Matrix Unit `<n>` / Vector Unit `<n>`** (one per accelerator instance, label
+  derived from `accel_unit_group(name())`): lanes `load`, `compute`, `write`,
+  `stall`. Serial mode (`service_thread`) now splits its single occupied interval
+  into load/compute/write using the existing `m0..m3` timestamps; pipeline mode
+  reuses the `Entry` stage timestamps. `stall` = idle gap since the unit's previous
+  serviced request (tracked via the gated `AcceleratorTLM::perf_last_busy_end`
+  member); pipelined back-to-back requests yield no idle span. Only units that
+  service ≥1 request appear (idle instances emit nothing).
+- **DMA Engine** (single group): lanes `read`, `write`. L1 stays untraced.
+
+Implementation changes to the sink: `PerfSpan::group` became `std::string` (groups
+are now dynamic per-instance labels, not string literals), and a
+`perf_trace_declare` / `PERF_TRACE_DECLARE` path was added so an always-empty lane
+still gets a `thread_name` and renders. Declared tracks are assigned pid/tid before
+spans so lane order within a group is deterministic.
+
+Still observation-only: verified traced and untraced builds produce identical total
+cycles.

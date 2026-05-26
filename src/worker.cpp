@@ -113,6 +113,10 @@ void Worker::do_scalar(uint64_t cyc)
 {
     compute_cycles += cyc;
     wait(cyc * CYCLE);
+    // start = end - cyc; computed inside the (no-op-when-off) macro args so the
+    // untraced build pays nothing.
+    PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), "scalar", "scalar",
+                    static_cast<uint64_t>(sc_time_stamp() / CYCLE) - cyc, cyc);
 }
 
 Worker::PendingReqStorage *Worker::acquire_pending_req_storage()
@@ -226,7 +230,12 @@ Worker::PendingReq Worker::issue_begin(uint64_t addr,
         if (!p.done_entry->admit_fired)
             wait(p.done_entry->admit_ev);
         p.stall_cycles = (uint64_t)((sc_time_stamp() - t_stall_start) / CYCLE);
-        PERF_TRACE_SPAN("Threads", "thread_" + std::to_string(tid), "stalling",
+        [[maybe_unused]] const char *stall_lane =
+            (addr == Interconnect::ADDR_MAT) ? "stall (matrix FIFO full)" :
+            (addr == Interconnect::ADDR_VEC) ? "stall (vector FIFO full)" :
+                                               "stall (other)";
+        PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), stall_lane,
+                        stall_lane,
                         static_cast<uint64_t>(t_stall_start / CYCLE),
                         p.stall_cycles);
     }
@@ -603,6 +612,17 @@ void Worker::run()
 
     sc_time start = sc_time_stamp();
 
+    // Declare the Scalar Unit lanes in a fixed order so they always appear
+    // (the DMA-FIFO-full lane stays empty: the memory model never stalls a
+    // worker on a full DMA queue).
+    {
+        const std::string grp = "Scalar Unit " + std::to_string(tid);
+        PERF_TRACE_DECLARE(grp, "scalar");
+        PERF_TRACE_DECLARE(grp, "stall (matrix FIFO full)");
+        PERF_TRACE_DECLARE(grp, "stall (vector FIFO full)");
+        PERF_TRACE_DECLARE(grp, "stall (DMA FIFO full)");
+    }
+
     // ----------------------------------------------------------
     // Phase 1: Matrix multiply (mat accelerator)
     // Pipeline: issue → scalar (overlapped) → issue_end → issue...
@@ -670,9 +690,6 @@ void Worker::run()
 
     sc_time end        = sc_time_stamp();
     elapsed_cycles     = (uint64_t)((end - start) / CYCLE);
-    PERF_TRACE_SPAN("Threads", "thread_" + std::to_string(tid), "running",
-                    static_cast<uint64_t>(start / CYCLE),
-                    static_cast<uint64_t>((end - start) / CYCLE));
     if (completion_fifo)
         completion_fifo->write(tid);
 }

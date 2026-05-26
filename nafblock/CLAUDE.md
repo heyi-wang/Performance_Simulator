@@ -29,18 +29,22 @@ so every run writes a Chrome-Trace-Event JSON timeline:
 ```
 ./nafblock/build/nafblock_perf_sim --trace-out nafblock_trace.json
 ```
-Drag the JSON into https://ui.perfetto.dev/ . Three fixed process groups, with
-stable lanes that persist across all 14 sub-layers (no per-layer lanes):
-- **Threads** — one lane per CPU worker thread (`thread_<tid>`), showing the
-  two states `running` / `stalling` (backpressure). Scalar/DMA-setup time counts
-  as `running`.
-- **Accelerators** — both accelerator classes, one lane per unit:
-  `Matrix Accel <n>` and `Vector Accel <n>`, with `service` (serial) or
-  `load`/`compute`/`write` (pipeline) spans. Lanes are derived from the
-  accelerator's `mat_acc`/`vec_acc` + `accel_unit_N` name, so the same physical
-  unit shares a lane across every layer it serves.
-- **Memory** — a single `DMA Engine` lane, with `read` / `write` spans. On-chip
-  L1 traffic is intentionally not traced.
+Drag the JSON into https://ui.perfetto.dev/ . Each hardware unit is its own
+collapsible group (Perfetto "process"); its rows are named lanes. Groups are
+stable across all 14 sub-layers (no per-layer lanes):
+- **Scalar Unit `<tid>`** — one group per worker thread. Lanes: `scalar`
+  (`do_scalar` / DMA-setup intervals), `stall (matrix FIFO full)`,
+  `stall (vector FIFO full)`, `stall (DMA FIFO full)`. The stall lanes are routed
+  by issue target; `stall (DMA FIFO full)` is always empty (the memory model never
+  back-pressures the worker) but is declared so the lane is present.
+- **Matrix Unit `<n>` / Vector Unit `<n>`** — one group per accelerator instance,
+  derived from the `mat_acc`/`vec_acc` + `accel_unit_N` name (so the same physical
+  unit shares a group across every layer it serves). Lanes: `load`, `compute`,
+  `write`, and `stall` (idle gap before the unit's next serviced request). Both
+  serial and pipelined accelerators emit the same three phase lanes. Only units
+  that actually service a request appear.
+- **DMA Engine** — a single group with `read` / `write` lanes. On-chip L1 traffic
+  is intentionally not traced.
 
 Tracing is observation-only (reads `sc_time_stamp()`, never waits); total cycles
 are identical to an untraced build. Only the nafblock Makefile defines

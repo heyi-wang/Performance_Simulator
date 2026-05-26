@@ -7,19 +7,44 @@
 #include <string>
 
 // Collapse a per-layer hierarchical accelerator name (e.g.
-// "nafblock_top.nb_matmul_top_2.mat_acc.accel_unit_0") into a stable lane label
-// shared across layers: "Matrix Accel 0" / "Vector Accel 1". This keeps the
-// Perfetto trace to a fixed set of accelerator lanes instead of one per layer.
-static std::string accel_track_label(const std::string &nm)
+// "nafblock_top.nb_matmul_top_2.mat_acc.accel_unit_0") into a stable per-unit
+// group label shared across layers: "Matrix Unit 0" / "Vector Unit 1". This
+// keeps the Perfetto trace to a fixed set of unit groups instead of one per
+// layer instance.
+static std::string accel_unit_group(const std::string &nm)
 {
     const std::string cls =
-        (nm.find(".mat_acc") != std::string::npos) ? "Matrix Accel" :
-        (nm.find(".vec_acc") != std::string::npos) ? "Vector Accel" : "Accel";
+        (nm.find(".mat_acc") != std::string::npos) ? "Matrix Unit" :
+        (nm.find(".vec_acc") != std::string::npos) ? "Vector Unit" : "Accel Unit";
     const std::string key = "accel_unit_";
     const size_t p = nm.rfind(key);
     const std::string idx =
         (p != std::string::npos) ? nm.substr(p + key.size()) : "";
     return idx.empty() ? cls : cls + " " + idx;
+}
+
+// Emit one serviced request as load/compute/write lane spans on the unit's
+// group, plus a "stall" (idle) span for the gap since the previous request.
+static void perf_emit_service(const std::string &grp,
+                              sc_time &last_busy_end,
+                              sc_time t_load_start,    sc_time t_load_end,
+                              sc_time t_compute_start, sc_time t_compute_end,
+                              sc_time t_write_start,   sc_time t_write_end)
+{
+    if (last_busy_end > SC_ZERO_TIME && t_load_start > last_busy_end)
+        PERF_TRACE_SPAN(grp, "stall", "stall",
+                        static_cast<uint64_t>(last_busy_end / CYCLE),
+                        static_cast<uint64_t>((t_load_start - last_busy_end) / CYCLE));
+    PERF_TRACE_SPAN(grp, "load", "load",
+                    static_cast<uint64_t>(t_load_start / CYCLE),
+                    static_cast<uint64_t>((t_load_end - t_load_start) / CYCLE));
+    PERF_TRACE_SPAN(grp, "compute", "compute",
+                    static_cast<uint64_t>(t_compute_start / CYCLE),
+                    static_cast<uint64_t>((t_compute_end - t_compute_start) / CYCLE));
+    PERF_TRACE_SPAN(grp, "write", "write",
+                    static_cast<uint64_t>(t_write_start / CYCLE),
+                    static_cast<uint64_t>((t_write_end - t_write_start) / CYCLE));
+    last_busy_end = t_write_end;
 }
 #endif
 
@@ -203,9 +228,11 @@ void AcceleratorTLM::service_thread()
         if (busy_cb)
             busy_cb((uint64_t)(sc_time_stamp() / CYCLE), false);
 
-        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "service",
-                        static_cast<uint64_t>(t_start / CYCLE),
-                        static_cast<uint64_t>((sc_time_stamp() - t_start) / CYCLE));
+#ifdef PERFETTO_TRACE
+        // Serial mode: load = read, compute = svc wait, write = write-back.
+        perf_emit_service(accel_unit_group(name()), perf_last_busy_end,
+                          m0, m1, m1, m2, m2, m3);
+#endif
 
         complete_request(e);
     }
@@ -351,15 +378,12 @@ void AcceleratorTLM::write_thread()
             busy_cb(static_cast<uint64_t>(sc_time_stamp() / CYCLE), false);
         stage_exit();
 
-        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "load",
-                        static_cast<uint64_t>(e.t_load_start / CYCLE),
-                        static_cast<uint64_t>((e.t_load_end - e.t_load_start) / CYCLE));
-        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "compute",
-                        static_cast<uint64_t>(e.t_compute_start / CYCLE),
-                        static_cast<uint64_t>((e.t_compute_end - e.t_compute_start) / CYCLE));
-        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "write",
-                        static_cast<uint64_t>(e.t_write_start / CYCLE),
-                        static_cast<uint64_t>((e.t_write_end - e.t_write_start) / CYCLE));
+#ifdef PERFETTO_TRACE
+        perf_emit_service(accel_unit_group(name()), perf_last_busy_end,
+                          e.t_load_start,    e.t_load_end,
+                          e.t_compute_start, e.t_compute_end,
+                          e.t_write_start,   e.t_write_end);
+#endif
 
         complete_request(e);
     }
