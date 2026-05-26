@@ -1,6 +1,7 @@
 #include "accelerator.h"
 #include "interconnect.h"   // for Interconnect::ADDR_MEM
 #include "memory.h"
+#include "perfetto_trace.h"
 
 SC_HAS_PROCESS(AcceleratorTLM);
 
@@ -182,6 +183,10 @@ void AcceleratorTLM::service_thread()
         if (busy_cb)
             busy_cb((uint64_t)(sc_time_stamp() / CYCLE), false);
 
+        PERF_TRACE_SPAN("Accelerators", name(), "service",
+                        static_cast<uint64_t>(t_start / CYCLE),
+                        static_cast<uint64_t>((sc_time_stamp() - t_start) / CYCLE));
+
         complete_request(e);
     }
 }
@@ -325,6 +330,16 @@ void AcceleratorTLM::write_thread()
         if (busy_cb)
             busy_cb(static_cast<uint64_t>(sc_time_stamp() / CYCLE), false);
         stage_exit();
+
+        PERF_TRACE_SPAN("Accelerators", name(), "load",
+                        static_cast<uint64_t>(e.t_load_start / CYCLE),
+                        static_cast<uint64_t>((e.t_load_end - e.t_load_start) / CYCLE));
+        PERF_TRACE_SPAN("Accelerators", name(), "compute",
+                        static_cast<uint64_t>(e.t_compute_start / CYCLE),
+                        static_cast<uint64_t>((e.t_compute_end - e.t_compute_start) / CYCLE));
+        PERF_TRACE_SPAN("Accelerators", name(), "write",
+                        static_cast<uint64_t>(e.t_write_start / CYCLE),
+                        static_cast<uint64_t>((e.t_write_end - e.t_write_start) / CYCLE));
 
         complete_request(e);
     }
