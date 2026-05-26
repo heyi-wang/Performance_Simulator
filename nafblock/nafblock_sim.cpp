@@ -19,6 +19,7 @@
 
 #include "hardware_config.h"
 #include "report_formatter.h"
+#include "perfetto_trace.h"
 
 #include "../kernel/dw_conv2d/dw_conv2d_top.h"
 #include "../kernel/layer_norm/layer_norm_top.h"
@@ -449,6 +450,8 @@ struct BlockOptions
     int block_w = nafblock_cfg::DEFAULT_W;
     // L2 / DMA base latency override (cycles). -1 keeps per-kernel defaults.
     int dma_base_lat = -1;
+    // Perfetto trace output path (only consumed when built with PERFETTO_TRACE).
+    std::string trace_out = "nafblock_trace.json";
 };
 
 struct NafBlockTop : sc_module
@@ -487,6 +490,16 @@ static bool parse_args(int argc, char *argv[], BlockOptions &opts)
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
+        if (arg == "--trace-out")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Missing value for " << arg << "\n";
+                return false;
+            }
+            opts.trace_out = argv[++i];
+            continue;
+        }
         if (arg == "--block-c" || arg == "--block-h" || arg == "--block-w"
             || arg == "--dma-base-lat")
         {
@@ -522,7 +535,7 @@ static bool parse_args(int argc, char *argv[], BlockOptions &opts)
             std::cout
                 << "Usage: " << argv[0]
                 << " [--block-c N] [--block-h N] [--block-w N]"
-                << " [--dma-base-lat N]\n"
+                << " [--dma-base-lat N] [--trace-out FILE]\n"
                 << "Defaults: C=" << nafblock_cfg::DEFAULT_C
                 << ", H=" << nafblock_cfg::DEFAULT_H
                 << ", W=" << nafblock_cfg::DEFAULT_W
@@ -559,6 +572,11 @@ int sc_main(int argc, char *argv[])
     }
 
     sc_start();
+
+#ifdef PERFETTO_TRACE
+    perf_trace_write_json(opts.trace_out.c_str());
+    std::cerr << "Perfetto trace written to " << opts.trace_out << "\n";
+#endif
 
     const uint64_t total_cycles =
         static_cast<uint64_t>(sc_time_stamp() / CYCLE);
