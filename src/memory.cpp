@@ -82,7 +82,7 @@ void Memory::dispatch_thread()
             reqs += 1;
             busy_cycles += mem_lat;
             active_reqs += 1;
-            PERF_TRACE_SPAN("Memory", name(),
+            PERF_TRACE_SPAN("Memory", "DMA Engine",
                             e.gp->is_write() ? "write" : "read",
                             static_cast<uint64_t>(t_start / CYCLE), mem_lat);
             resp_peq.notify(*e.gp, mem_lat * CYCLE);
@@ -228,9 +228,8 @@ void L1L2Memory::l1_dispatch_thread()
             }
 
             l1_active_reqs += 1;
-            PERF_TRACE_SPAN("Memory", std::string(name()) + ":L1",
-                            e.gp->is_write() ? "write" : "read",
-                            static_cast<uint64_t>(sc_time_stamp() / CYCLE), lat);
+            // L1 (on-chip) traffic is intentionally not traced: the Memory lane
+            // in Perfetto models only the DMA engine.
             resp_peq.notify(*e.gp, lat * CYCLE);
         }
     }
@@ -269,7 +268,7 @@ void L1L2Memory::dma_dispatch_thread()
             }
 
             dma_active_reqs += 1;
-            PERF_TRACE_SPAN("Memory", std::string(name()) + ":DMA",
+            PERF_TRACE_SPAN("Memory", "DMA Engine",
                             e.gp->is_write() ? "write" : "read",
                             static_cast<uint64_t>(sc_time_stamp() / CYCLE), lat);
             resp_peq.notify(*e.gp, lat * CYCLE);

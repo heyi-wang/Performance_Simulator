@@ -112,10 +112,7 @@ void Worker::peq_thread()
 void Worker::do_scalar(uint64_t cyc)
 {
     compute_cycles += cyc;
-    const uint64_t t0 = static_cast<uint64_t>(sc_time_stamp() / CYCLE);
     wait(cyc * CYCLE);
-    PERF_TRACE_SPAN("Workers", "worker_" + std::to_string(tid), "scalar",
-                    t0, cyc);
 }
 
 Worker::PendingReqStorage *Worker::acquire_pending_req_storage()
@@ -229,7 +226,7 @@ Worker::PendingReq Worker::issue_begin(uint64_t addr,
         if (!p.done_entry->admit_fired)
             wait(p.done_entry->admit_ev);
         p.stall_cycles = (uint64_t)((sc_time_stamp() - t_stall_start) / CYCLE);
-        PERF_TRACE_SPAN("Workers", "worker_" + std::to_string(tid), "stall",
+        PERF_TRACE_SPAN("Threads", "thread_" + std::to_string(tid), "stalling",
                         static_cast<uint64_t>(t_stall_start / CYCLE),
                         p.stall_cycles);
     }
@@ -673,7 +670,7 @@ void Worker::run()
 
     sc_time end        = sc_time_stamp();
     elapsed_cycles     = (uint64_t)((end - start) / CYCLE);
-    PERF_TRACE_SPAN("Workers", "worker_" + std::to_string(tid), "run",
+    PERF_TRACE_SPAN("Threads", "thread_" + std::to_string(tid), "running",
                     static_cast<uint64_t>(start / CYCLE),
                     static_cast<uint64_t>((end - start) / CYCLE));
     if (completion_fifo)

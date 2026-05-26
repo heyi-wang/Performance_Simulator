@@ -3,6 +3,26 @@
 #include "memory.h"
 #include "perfetto_trace.h"
 
+#ifdef PERFETTO_TRACE
+#include <string>
+
+// Collapse a per-layer hierarchical accelerator name (e.g.
+// "nafblock_top.nb_matmul_top_2.mat_acc.accel_unit_0") into a stable lane label
+// shared across layers: "Matrix Accel 0" / "Vector Accel 1". This keeps the
+// Perfetto trace to a fixed set of accelerator lanes instead of one per layer.
+static std::string accel_track_label(const std::string &nm)
+{
+    const std::string cls =
+        (nm.find(".mat_acc") != std::string::npos) ? "Matrix Accel" :
+        (nm.find(".vec_acc") != std::string::npos) ? "Vector Accel" : "Accel";
+    const std::string key = "accel_unit_";
+    const size_t p = nm.rfind(key);
+    const std::string idx =
+        (p != std::string::npos) ? nm.substr(p + key.size()) : "";
+    return idx.empty() ? cls : cls + " " + idx;
+}
+#endif
+
 SC_HAS_PROCESS(AcceleratorTLM);
 
 AcceleratorTLM::AcceleratorTLM(sc_module_name name, size_t cap, bool enable_pipeline)
@@ -183,7 +203,7 @@ void AcceleratorTLM::service_thread()
         if (busy_cb)
             busy_cb((uint64_t)(sc_time_stamp() / CYCLE), false);
 
-        PERF_TRACE_SPAN("Accelerators", name(), "service",
+        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "service",
                         static_cast<uint64_t>(t_start / CYCLE),
                         static_cast<uint64_t>((sc_time_stamp() - t_start) / CYCLE));
 
@@ -331,13 +351,13 @@ void AcceleratorTLM::write_thread()
             busy_cb(static_cast<uint64_t>(sc_time_stamp() / CYCLE), false);
         stage_exit();
 
-        PERF_TRACE_SPAN("Accelerators", name(), "load",
+        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "load",
                         static_cast<uint64_t>(e.t_load_start / CYCLE),
                         static_cast<uint64_t>((e.t_load_end - e.t_load_start) / CYCLE));
-        PERF_TRACE_SPAN("Accelerators", name(), "compute",
+        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "compute",
                         static_cast<uint64_t>(e.t_compute_start / CYCLE),
                         static_cast<uint64_t>((e.t_compute_end - e.t_compute_start) / CYCLE));
-        PERF_TRACE_SPAN("Accelerators", name(), "write",
+        PERF_TRACE_SPAN("Accelerators", accel_track_label(name()), "write",
                         static_cast<uint64_t>(e.t_write_start / CYCLE),
                         static_cast<uint64_t>((e.t_write_end - e.t_write_start) / CYCLE));
 

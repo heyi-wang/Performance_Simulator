@@ -29,12 +29,18 @@ so every run writes a Chrome-Trace-Event JSON timeline:
 ```
 ./nafblock/build/nafblock_perf_sim --trace-out nafblock_trace.json
 ```
-Drag the JSON into https://ui.perfetto.dev/ . Lanes:
-- **Workers** — one continuous lane per worker tid (across all 14 sub-layers),
-  with `run` / `scalar` / `stall` spans.
-- **Accelerators** — one lane per accelerator instance per layer (unique SystemC
-  name), with `service` (serial) or `load`/`compute`/`write` (pipeline) spans.
-- **Memory** — one lane per memory port (`:L1` / `:DMA`), with `read` / `write` spans.
+Drag the JSON into https://ui.perfetto.dev/ . Three fixed process groups, with
+stable lanes that persist across all 14 sub-layers (no per-layer lanes):
+- **Threads** — one lane per CPU worker thread (`thread_<tid>`), showing the
+  two states `running` / `stalling` (backpressure). Scalar/DMA-setup time counts
+  as `running`.
+- **Accelerators** — both accelerator classes, one lane per unit:
+  `Matrix Accel <n>` and `Vector Accel <n>`, with `service` (serial) or
+  `load`/`compute`/`write` (pipeline) spans. Lanes are derived from the
+  accelerator's `mat_acc`/`vec_acc` + `accel_unit_N` name, so the same physical
+  unit shares a lane across every layer it serves.
+- **Memory** — a single `DMA Engine` lane, with `read` / `write` spans. On-chip
+  L1 traffic is intentionally not traced.
 
 Tracing is observation-only (reads `sc_time_stamp()`, never waits); total cycles
 are identical to an untraced build. Only the nafblock Makefile defines
