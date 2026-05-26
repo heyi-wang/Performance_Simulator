@@ -23,6 +23,24 @@ make -C nafblock run          # runs with default shape
 ```
 Defaults: `C=32, H=64, W=64`. Exit codes: `0`=PASS, `1`=bad CLI, `2`=verification failure.
 
+#### Perfetto timeline trace
+The nafblock build compiles with `-DPERFETTO_TRACE` (set in [Makefile](Makefile)),
+so every run writes a Chrome-Trace-Event JSON timeline:
+```
+./nafblock/build/nafblock_perf_sim --trace-out nafblock_trace.json
+```
+Drag the JSON into https://ui.perfetto.dev/ . Lanes:
+- **Workers** — one continuous lane per worker tid (across all 14 sub-layers),
+  with `run` / `scalar` / `stall` spans.
+- **Accelerators** — one lane per accelerator instance per layer (unique SystemC
+  name), with `service` (serial) or `load`/`compute`/`write` (pipeline) spans.
+- **Memory** — one lane per memory port (`:L1` / `:DMA`), with `read` / `write` spans.
+
+Tracing is observation-only (reads `sc_time_stamp()`, never waits); total cycles
+are identical to an untraced build. Only the nafblock Makefile defines
+`PERFETTO_TRACE`; kernel sims and `nafnet/` are unaffected. See
+[src/perfetto_trace.h](../src/perfetto_trace.h).
+
 ### Files
 - [nafblock_config.h](nafblock_config.h) — `N_WORKERS` and default tensor shape.
 - [nafblock_layers.h](nafblock_layers.h) — `NafBlockLayerDesc`, per-op factory
@@ -85,6 +103,10 @@ Every sub-layer ends with an int8 quant step matching the reference C
 - Bad CLI (`--block-c 0`, unknown arg) → exit 1 with stderr error.
 
 ### Gotchas
+- **Perfetto tracing is nafblock-only**: `-DPERFETTO_TRACE` lives in this
+  subproject's Makefile and gates all span code in `src/{worker,accelerator,memory}.cpp`
+  via `PERF_TRACE_SPAN`. Don't define it for other sims — their `src/*.o` must stay
+  untraced. The macro-off expansion is a no-op, so the same sources compile both ways.
 - **DWCONV L1 req counting**: a single TLM vec request with `rd > 0` AND
   `wr > 0` charges **two** L1 requests in the memory model (read and
   write counted separately). `compute_expected` reflects this — the
