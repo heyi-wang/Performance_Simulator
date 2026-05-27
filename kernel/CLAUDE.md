@@ -27,12 +27,15 @@ site, no file written), so the sweep scripts are unaffected. The trace sink is
 ./kernel/build/layer_norm_sim --channels 32 --trace-out ln.json
 ```
 
-Lanes per run: **Scalar Unit `<tid>`** (worker threads), **Matrix/Vector Unit
-`<n>`** (accelerator instances), **DMA Engine**.
+Lanes per run: **Scalar Unit `<tid>`** (worker threads) with `scalar` +
+`stall (matrix/vector/DMA FIFO full)` lanes, **Matrix/Vector Unit `<n>`**
+(accelerator instances) with `load`/`compute`/`write`/`stall`, and **DMA
+Engine** with `read`/`write`.
 
-- Scalar Unit lanes appear only for kernels that use the shared `src/Worker`
-  (matmul, layer_norm, dw_conv2d). **pooling** (`PoolWorker`) and **vec_ops**
-  (`VecOpsWorker`) run custom worker SC_THREADs that bypass the instrumented
-  `Worker::do_scalar`/`issue_begin`, so they show accelerator + DMA lanes but no
-  Scalar Unit lanes. Instrumenting those custom workers would require editing
-  kernel execution code (ask first).
+- matmul / layer_norm / dw_conv2d emit Scalar Unit lanes from the shared
+  `src/Worker`. **pooling** (`PoolWorker`) and **vec_ops** (`VecOpsWorker`) run
+  their own worker SC_THREADs; their `do_scalar` / `issue_begin` are
+  instrumented directly (same `Scalar Unit` group + lanes), so they emit scalar
+  and vector-FIFO-stall spans too. These two only issue to the vector pool, so
+  their `stall (matrix FIFO full)` lane is always empty (declared for layout
+  parity, alongside the always-empty `stall (DMA FIFO full)`).

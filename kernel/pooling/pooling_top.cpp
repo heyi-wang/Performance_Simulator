@@ -16,6 +16,7 @@
 
 #include "common.h"
 #include "extensions.h"
+#include "perfetto_trace.h"
 #include "report_formatter.h"
 
 using namespace sc_core;
@@ -149,6 +150,8 @@ struct PoolWorker : sc_module
     {
         total_scalar_cycles += cyc;
         wait(cyc * CYCLE);
+        PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), "scalar", "scalar",
+                        static_cast<uint64_t>(sc_time_stamp() / CYCLE) - cyc, cyc);
     }
 
     PendingReq issue_begin(uint64_t rd, uint64_t wr, int channel_id, int tile_idx)
@@ -193,6 +196,10 @@ struct PoolWorker : sc_module
             sc_time t_stall_start = sc_time_stamp();
             wait(*p.done_entry->admit_ev);
             p.stall_cycles = static_cast<uint64_t>((sc_time_stamp() - t_stall_start) / CYCLE);
+            PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid),
+                            "stall (vector FIFO full)", "stall (vector FIFO full)",
+                            static_cast<uint64_t>(t_stall_start / CYCLE),
+                            p.stall_cycles);
         }
         else if (status == TLM_COMPLETED)
         {
@@ -330,6 +337,13 @@ struct PoolWorker : sc_module
             wait(*start_event);
 
         sc_time t_start = sc_time_stamp();
+        {
+            const std::string grp = "Scalar Unit " + std::to_string(tid);
+            PERF_TRACE_DECLARE(grp, "scalar");
+            PERF_TRACE_DECLARE(grp, "stall (matrix FIFO full)");
+            PERF_TRACE_DECLARE(grp, "stall (vector FIFO full)");
+            PERF_TRACE_DECLARE(grp, "stall (DMA FIFO full)");
+        }
         int c_start = (tid * cfg.channels) / n_workers;
         int c_end = ((tid + 1) * cfg.channels) / n_workers;
 
