@@ -12,7 +12,7 @@ MatmulTop::MatmulTop(sc_module_name nm,
                      sc_event *done_event_)
     : sc_module(nm),
       cfg(cfg_),
-      vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap(), /*enable_unit_pipeline=*/false),
+      vec_acc("vec_acc", cfg.vec_accel_count, cfg.vec_acc_queue_cap(), /*enable_unit_pipeline=*/true),
       noc("noc"),
       memory("memory",
              cfg.l1_base_lat,
