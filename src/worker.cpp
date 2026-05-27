@@ -440,8 +440,9 @@ void Worker::issue_stream(uint64_t addr,
     };
 
     auto issue_accel = [&]() {
-        if (accel_issued > 0 || (scalar_between_streams && call_counter > 0))
-            do_scalar(scalar_cycles);
+        // Every dispatch pays the per-request scalar overhead, including the
+        // very first one (no first-request exemption).
+        do_scalar(scalar_cycles);
         accel_inflight.push_back(issue_begin(addr, svc_cycles, rd, wr));
         ++call_counter;
         if (phase_counter)
@@ -572,36 +573,174 @@ void Worker::issue_gemm_reuse_stream()
     if (gemm_m_tiles == 0 || gemm_n_tiles == 0 || gemm_k_tiles == 0)
         return;
 
-    const uint64_t regs = std::max<uint64_t>(accumulator_register_count, 1);
+    const uint64_t regs   = std::max<uint64_t>(accumulator_register_count, 1);
+    const uint64_t window = std::max<uint64_t>(max_inflight_mat_reqs, 1);
 
+    // Flatten every (mg, nt, kt) tile-group into one dispatch schedule. Each
+    // dispatch consumes its own A-tile (one DMA read); the first dispatch of a
+    // group also triggers that group's single shared B-tile read; a final-K
+    // dispatch writes back a C tile. Running the whole GEMM as ONE pipeline
+    // (instead of one drained issue_stream per group) lets the next batch's
+    // B/A reads start as soon as the inflight window has room — i.e. once the
+    // previous batch's requests are *sent*, not after it finishes computing.
+    struct Disp { bool first_in_group; bool writes_c; };
+    std::vector<Disp> sched;
+    sched.reserve(static_cast<size_t>(gemm_m_tiles) *
+                  static_cast<size_t>(gemm_n_tiles) *
+                  static_cast<size_t>(gemm_k_tiles));
     for (uint64_t mg = 0; mg < gemm_m_tiles; mg += regs)
     {
         const uint64_t m_batch = std::min<uint64_t>(regs, gemm_m_tiles - mg);
-
         for (uint64_t nt = 0; nt < gemm_n_tiles; ++nt)
-        {
             for (uint64_t kt = 0; kt < gemm_k_tiles; ++kt)
             {
-                if (dma_b_tile_scalar > 0)
-                    do_scalar(dma_b_tile_scalar);
-                DmaReq b_read = issue_dma_begin(false, B_bytes);
-                finish_dma(b_read);
-
                 const bool final_k = (kt + 1 == gemm_k_tiles);
-                issue_stream(Interconnect::ADDR_MAT,
-                             m_batch,
-                             mat_cycles,
-                             mat_scalar_cycles,
-                             A_bytes + B_bytes,
-                             final_k ? C_bytes : 0,
-                             A_bytes,
-                             final_k ? C_bytes : 0,
-                             mat_calls,
-                             nullptr,
-                             max_inflight_mat_reqs,
-                             true);
+                for (uint64_t i = 0; i < m_batch; ++i)
+                    sched.push_back({ i == 0, final_k });
             }
+    }
+    const size_t total = sched.size();
+
+    std::deque<DmaReq>     a_reads;        // one A-tile read per dispatch (in order)
+    std::deque<DmaReq>     b_reads;        // one B-tile read per group (in order)
+    std::deque<PendingReq> accel_inflight;
+    std::deque<DmaReq>     write_inflight;
+
+    size_t reads_issued  = 0;   // dispatches whose A-read has been issued
+    size_t accels_issued = 0;   // dispatches promoted to the accelerator
+    size_t accels_retired = 0;  // dispatches whose response has been consumed
+
+    auto dma_done = [](const DmaReq &p) {
+        return !p.gp || p.sync_done || (p.done_entry && p.done_entry->fired);
+    };
+    auto accel_done = [](const PendingReq &p) {
+        return p.sync_done || (p.done_entry && p.done_entry->fired);
+    };
+
+    // Prepare ONE more DMA read (the next dispatch's A-tile, plus its group's
+    // shared B-tile on the first dispatch of a group). Bounded only by the
+    // accelerator FIFO depth: the in-flight request count (reads waiting on DMA
+    // + dispatches queued on the accelerator) may not exceed `window`. The
+    // scalar core keeps doing this whenever no dispatch is ready to send, so it
+    // only goes idle once the FIFO is full (accel_inflight == window) and
+    // backpressure stalls it.
+    auto issue_one_read = [&]() {
+        if (reads_issued >= total ||
+            a_reads.size() + accel_inflight.size() >= window)
+            return false;
+        if (sched[reads_issued].first_in_group)
+        {
+            if (dma_b_tile_scalar > 0)
+                do_scalar(dma_b_tile_scalar);
+            b_reads.push_back(issue_dma_begin(false, B_bytes));
         }
+        if (dma_a_tile_scalar > 0)
+            do_scalar(dma_a_tile_scalar);
+        a_reads.push_back(issue_dma_begin(false, A_bytes));
+        ++reads_issued;
+        return true;
+    };
+
+    // Promote completed reads into accelerator dispatches (in order).
+    auto promote = [&]() {
+        bool progressed = false;
+        while (!a_reads.empty() && accel_inflight.size() < window &&
+               dma_done(a_reads.front()))
+        {
+            if (sched[accels_issued].first_in_group)
+            {
+                finish_dma(b_reads.front());   // group's B (already complete)
+                b_reads.pop_front();
+            }
+            finish_dma(a_reads.front());
+            a_reads.pop_front();
+
+            do_scalar(mat_scalar_cycles);
+            accel_inflight.push_back(
+                issue_begin(Interconnect::ADDR_MAT, mat_cycles,
+                            A_bytes + B_bytes,
+                            sched[accels_issued].writes_c ? C_bytes : 0));
+            ++mat_calls;
+            ++accels_issued;
+            progressed = true;
+        }
+        return progressed;
+    };
+
+    // Retire finished dispatches in order; final-K ones spawn a C-write DMA.
+    // The matmul matrix pool is per-worker pinned, so completion is in-order.
+    auto retire_accels = [&]() {
+        bool progressed = false;
+        while (!accel_inflight.empty() && write_inflight.size() < window &&
+               accel_done(accel_inflight.front()))
+        {
+            const bool writes_c = sched[accels_retired].writes_c;
+            issue_end(accel_inflight.front());
+            accel_inflight.pop_front();
+            ++accels_retired;
+            if (writes_c)
+            {
+                if (dma_c_rows > 0 && dma_c_row_scalar > 0)
+                    do_scalar(dma_c_rows * dma_c_row_scalar);
+                write_inflight.push_back(issue_dma_begin(true, C_bytes));
+            }
+            progressed = true;
+        }
+        return progressed;
+    };
+
+    auto retire_writes = [&](bool wait_for_front) {
+        bool progressed = false;
+        while (!write_inflight.empty() &&
+               (dma_done(write_inflight.front()) || wait_for_front))
+        {
+            finish_dma(write_inflight.front());
+            write_inflight.pop_front();
+            progressed = true;
+            wait_for_front = false;
+        }
+        return progressed;
+    };
+
+    auto wait_for_progress = [&]() {
+        sc_event_or_list wait_list;
+        bool has_event = false;
+        auto add_dma = [&](const DmaReq &p) {
+            if (p.gp && !p.sync_done && p.done_entry && !p.done_entry->fired)
+            { wait_list |= p.done_entry->ev; has_event = true; }
+        };
+        auto add_accel = [&](const PendingReq &p) {
+            if (!p.sync_done && p.done_entry && !p.done_entry->fired)
+            { wait_list |= p.done_entry->ev; has_event = true; }
+        };
+        for (const auto &p : a_reads)        add_dma(p);
+        for (const auto &p : accel_inflight) add_accel(p);
+        for (const auto &p : write_inflight) add_dma(p);
+        if (has_event)
+            wait(wait_list);
+    };
+
+    while (accels_issued < total ||
+           !accel_inflight.empty() ||
+           !write_inflight.empty())
+    {
+        // Reclaim finished work first (frees FIFO slots; final-K spawns C-write).
+        bool progressed = retire_accels();
+        progressed = retire_writes(false) || progressed;
+
+        // Priority: send any request whose tiles are ready. Only when none is
+        // ready does the scalar core fall back to preparing the next DMA read,
+        // so it stays busy until the accelerator FIFO is full.
+        if (promote())
+            progressed = true;
+        else if (issue_one_read())
+            progressed = true;
+
+        if (write_inflight.size() >= window)
+            progressed = retire_writes(true) || progressed;
+
+        if (!progressed)
+            wait_for_progress();
     }
 }
 
