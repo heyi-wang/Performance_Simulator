@@ -109,13 +109,13 @@ void Worker::peq_thread()
     }
 }
 
-void Worker::do_scalar(uint64_t cyc)
+void Worker::do_scalar(uint64_t cyc, const char *label)
 {
     compute_cycles += cyc;
     wait(cyc * CYCLE);
     // start = end - cyc; computed inside the (no-op-when-off) macro args so the
     // untraced build pays nothing.
-    PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), "scalar", "scalar",
+    PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), "scalar", label,
                     static_cast<uint64_t>(sc_time_stamp() / CYCLE) - cyc, cyc);
 }
 
@@ -234,8 +234,11 @@ Worker::PendingReq Worker::issue_begin(uint64_t addr,
             (addr == Interconnect::ADDR_MAT) ? "stall (matrix FIFO full)" :
             (addr == Interconnect::ADDR_VEC) ? "stall (vector FIFO full)" :
                                                "stall (other)";
+        // Slice name kept distinct from the lane name so Perfetto's UI doesn't
+        // treat the lane as a single-category track and add a density-summary
+        // row on top of the actual slices.
         PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), stall_lane,
-                        stall_lane,
+                        "stall",
                         static_cast<uint64_t>(t_stall_start / CYCLE),
                         p.stall_cycles);
     }
@@ -428,11 +431,11 @@ void Worker::issue_stream(uint64_t addr,
             if (dma_scalar_mode == DmaScalarMode::MatRow)
             {
                 if (dma_a_tile_scalar > 0)
-                    do_scalar(dma_a_tile_scalar);
+                    do_scalar(dma_a_tile_scalar, "scalar: A-tile load");
             }
             else if (dma_vec_rd_scalar > 0)
             {
-                do_scalar(dma_vec_rd_scalar);
+                do_scalar(dma_vec_rd_scalar, "scalar: vec tile load");
             }
         }
         read_inflight.push_back(issue_dma_begin(false, dma_rd));
@@ -442,7 +445,10 @@ void Worker::issue_stream(uint64_t addr,
     auto issue_accel = [&]() {
         // Every dispatch pays the per-request scalar overhead, including the
         // very first one (no first-request exemption).
-        do_scalar(scalar_cycles);
+        do_scalar(scalar_cycles,
+                  addr == Interconnect::ADDR_MAT
+                      ? "scalar: request to mat unit"
+                      : "scalar: request to vec unit");
         accel_inflight.push_back(issue_begin(addr, svc_cycles, rd, wr));
         ++call_counter;
         if (phase_counter)
@@ -483,11 +489,12 @@ void Worker::issue_stream(uint64_t addr,
                     if (dma_scalar_mode == DmaScalarMode::MatRow)
                     {
                         if (dma_c_rows > 0 && dma_c_row_scalar > 0)
-                            do_scalar(dma_c_rows * dma_c_row_scalar);
+                            do_scalar(dma_c_rows * dma_c_row_scalar,
+                                      "scalar: C-row store");
                     }
                     else if (dma_vec_wr_scalar > 0)
                     {
-                        do_scalar(dma_vec_wr_scalar);
+                        do_scalar(dma_vec_wr_scalar, "scalar: vec tile store");
                     }
                 }
                 write_inflight.push_back(issue_dma_begin(true, dma_wr));
@@ -631,11 +638,11 @@ void Worker::issue_gemm_reuse_stream()
         if (sched[reads_issued].first_in_group)
         {
             if (dma_b_tile_scalar > 0)
-                do_scalar(dma_b_tile_scalar);
+                do_scalar(dma_b_tile_scalar, "scalar: B-tile load");
             b_reads.push_back(issue_dma_begin(false, B_bytes));
         }
         if (dma_a_tile_scalar > 0)
-            do_scalar(dma_a_tile_scalar);
+            do_scalar(dma_a_tile_scalar, "scalar: A-tile load");
         a_reads.push_back(issue_dma_begin(false, A_bytes));
         ++reads_issued;
         return true;
@@ -655,7 +662,7 @@ void Worker::issue_gemm_reuse_stream()
             finish_dma(a_reads.front());
             a_reads.pop_front();
 
-            do_scalar(mat_scalar_cycles);
+            do_scalar(mat_scalar_cycles, "scalar: request to mat unit");
             accel_inflight.push_back(
                 issue_begin(Interconnect::ADDR_MAT, mat_cycles,
                             A_bytes + B_bytes,
@@ -681,7 +688,8 @@ void Worker::issue_gemm_reuse_stream()
             if (writes_c)
             {
                 if (dma_c_rows > 0 && dma_c_row_scalar > 0)
-                    do_scalar(dma_c_rows * dma_c_row_scalar);
+                    do_scalar(dma_c_rows * dma_c_row_scalar,
+                              "scalar: C-tile store");
                 write_inflight.push_back(issue_dma_begin(true, C_bytes));
             }
             progressed = true;

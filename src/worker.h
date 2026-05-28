@@ -195,7 +195,7 @@ struct Worker : sc_module
                                   sc_time &delay);
 
     void peq_thread();
-    void do_scalar(uint64_t cyc);
+    void do_scalar(uint64_t cyc, const char *label = "scalar");
 
     // issue_begin with explicit rd/wr bytes (used for vec/quant requests)
     PendingReq issue_begin(uint64_t addr, uint64_t svc_cycles, uint64_t rd, uint64_t wr);

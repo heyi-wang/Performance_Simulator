@@ -25,18 +25,24 @@ Defaults: `C=32, H=64, W=64`. Exit codes: `0`=PASS, `1`=bad CLI, `2`=verificatio
 
 #### Perfetto timeline trace
 The nafblock build compiles with `-DPERFETTO_TRACE` (set in [Makefile](Makefile)),
-so every run writes a Chrome-Trace-Event JSON timeline:
+so every run writes a Perfetto protobuf TrackEvent timeline:
 ```
-./nafblock/build/nafblock_perf_sim --trace-out nafblock_trace.json
+./nafblock/build/nafblock_perf_sim --trace-out nafblock_trace.pftrace
 ```
-Drag the JSON into https://ui.perfetto.dev/ . Each hardware unit is its own
-collapsible group (Perfetto "process"); its rows are named lanes. Groups are
-stable across all 14 sub-layers (no per-layer lanes):
+Drag the file into https://ui.perfetto.dev/ . Each hardware unit is its own
+collapsible group; its rows are named lanes. Track names are emitted verbatim
+(no pid/tid suffix). Group sort order: **Scalar Unit < DMA Engine <
+Matrix Unit < Vector Unit**. Groups are stable across all 14 sub-layers
+(no per-layer lanes):
 - **Scalar Unit `<tid>`** — one group per worker thread. Lanes: `scalar`
   (`do_scalar` / DMA-setup intervals), `stall (matrix FIFO full)`,
   `stall (vector FIFO full)`, `stall (DMA FIFO full)`. The stall lanes are routed
   by issue target; `stall (DMA FIFO full)` is always empty (the memory model never
-  back-pressures the worker) but is declared so the lane is present.
+  back-pressures the worker) but is declared so the lane is present. Slices on
+  the `scalar` lane are named `scalar: <what>` (e.g. `A-tile load`,
+  `B-tile load`, `request to mat unit`, `request to vec unit`, `C-row store`,
+  `tile load`/`store`, `mean compute`, `invstd compute`) so each scalar
+  interval identifies the work it is paying for.
 - **Matrix Unit `<n>` / Vector Unit `<n>`** — one group per accelerator instance,
   derived from the `mat_acc`/`vec_acc` + `accel_unit_N` name (so the same physical
   unit shares a group across every layer it serves). Lanes: `load`, `compute`,

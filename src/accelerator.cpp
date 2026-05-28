@@ -35,15 +35,22 @@ static void perf_emit_service(const std::string &grp,
         PERF_TRACE_SPAN(grp, "stall", "stall",
                         static_cast<uint64_t>(last_busy_end / CYCLE),
                         static_cast<uint64_t>((t_load_start - last_busy_end) / CYCLE));
-    PERF_TRACE_SPAN(grp, "load", "load",
-                    static_cast<uint64_t>(t_load_start / CYCLE),
-                    static_cast<uint64_t>((t_load_end - t_load_start) / CYCLE));
-    PERF_TRACE_SPAN(grp, "compute", "compute",
-                    static_cast<uint64_t>(t_compute_start / CYCLE),
-                    static_cast<uint64_t>((t_compute_end - t_compute_start) / CYCLE));
-    PERF_TRACE_SPAN(grp, "write", "write",
-                    static_cast<uint64_t>(t_write_start / CYCLE),
-                    static_cast<uint64_t>((t_write_end - t_write_start) / CYCLE));
+    // Only emit a phase span when that phase actually consumed time. A zero-
+    // duration load/write means the request had rd=0 / wr=0 (e.g. intermediate
+    // K-loop dispatches that accumulate into the matrix-unit registers without
+    // a memory write-back) — no work happened, so no mark belongs on the lane.
+    if (t_load_end > t_load_start)
+        PERF_TRACE_SPAN(grp, "load", "load",
+                        static_cast<uint64_t>(t_load_start / CYCLE),
+                        static_cast<uint64_t>((t_load_end - t_load_start) / CYCLE));
+    if (t_compute_end > t_compute_start)
+        PERF_TRACE_SPAN(grp, "compute", "compute",
+                        static_cast<uint64_t>(t_compute_start / CYCLE),
+                        static_cast<uint64_t>((t_compute_end - t_compute_start) / CYCLE));
+    if (t_write_end > t_write_start)
+        PERF_TRACE_SPAN(grp, "write", "write",
+                        static_cast<uint64_t>(t_write_start / CYCLE),
+                        static_cast<uint64_t>((t_write_end - t_write_start) / CYCLE));
     last_busy_end = t_write_end;
 }
 #endif

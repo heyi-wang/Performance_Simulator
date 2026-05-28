@@ -160,7 +160,7 @@ struct DwConvPostProcessor : WorkerPostProcessor
         {
             const StripGeom g0 = strip_geom(0);
             if (cfg.dma_vec_rd_scalar > 0)
-                worker.do_scalar(cfg.dma_vec_rd_scalar);
+                worker.do_scalar(cfg.dma_vec_rd_scalar, "scalar: tile load");
             pending_read = worker.issue_dma_begin(false, g0.prefetch_bytes);
         }
 
@@ -185,7 +185,8 @@ struct DwConvPostProcessor : WorkerPostProcessor
             {
                 const StripGeom gn = strip_geom(idx + 1);
                 if (cfg.dma_vec_rd_scalar > 0)
-                    worker.do_scalar(cfg.dma_vec_rd_scalar);
+                    worker.do_scalar(cfg.dma_vec_rd_scalar,
+                                     "scalar: tile load (lookahead)");
                 pending_read = worker.issue_dma_begin(false, gn.prefetch_bytes);
             }
 
@@ -226,7 +227,8 @@ struct DwConvPostProcessor : WorkerPostProcessor
 
                     // Per-request scalar dispatch overhead
                     // (matches matmul/pooling per-vec-call).
-                    worker.do_scalar(cfg.scalar_overhead);
+                    worker.do_scalar(cfg.scalar_overhead,
+                                     "scalar: request to vec unit");
                 }
             }
 
@@ -262,7 +264,8 @@ struct DwConvPostProcessor : WorkerPostProcessor
                 ++worker.vec_calls;
                 total_l1_rd_bytes += rq_rd;
                 total_l1_wr_bytes += rq_wr;
-                worker.do_scalar(cfg.scalar_overhead);
+                worker.do_scalar(cfg.scalar_overhead,
+                                 "scalar: request to vec unit");
                 worker.issue_end(rq_req);
                 wb_bytes = rq_wr;
             }
@@ -272,7 +275,7 @@ struct DwConvPostProcessor : WorkerPostProcessor
             // scalar overhead at the end of the last
             // sub-request, then non-blocking L2 DMA.
             if (cfg.dma_vec_wr_scalar > 0)
-                worker.do_scalar(cfg.dma_vec_wr_scalar);
+                worker.do_scalar(cfg.dma_vec_wr_scalar, "scalar: tile store");
 
             if (write_inflight.size() >= max_dma_writes)
             {

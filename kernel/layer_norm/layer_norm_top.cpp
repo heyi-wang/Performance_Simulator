@@ -103,7 +103,8 @@ struct LayerNormPostProcessor : WorkerPostProcessor
             ++(*pass_counter);
             inflight.push_back(std::move(req));
 
-            worker.do_scalar(cfg.scalar_overhead);
+            worker.do_scalar(cfg.scalar_overhead,
+                             "scalar: request to vec unit");
         }
 
         // Drain the rest of the pass before the next scalar
@@ -138,7 +139,7 @@ struct LayerNormPostProcessor : WorkerPostProcessor
             // Charge the per-DMA scalar before issue, mirroring
             // dw_conv2d's prefetch path.
             if (cfg.dma_vec_rd_scalar > 0)
-                worker.do_scalar(cfg.dma_vec_rd_scalar);
+                worker.do_scalar(cfg.dma_vec_rd_scalar, "scalar: tile load");
             const sc_time wait_start = sc_time_stamp();
             Worker::DmaReq rd = worker.issue_dma_begin(false, channel_in_bytes);
             worker.finish_dma(rd);
@@ -151,21 +152,21 @@ struct LayerNormPostProcessor : WorkerPostProcessor
 
             // --- (3) Scalar mean = sum / spatial. ---------------
             if (cfg.mean_cycles > 0)
-                worker.do_scalar(cfg.mean_cycles);
+                worker.do_scalar(cfg.mean_cycles, "scalar: mean compute");
 
             // --- (4) Pass 2: sum-of-squares (about mean). -------
             run_pass(worker, /*pass=*/2, vec_calls_local);
 
             // --- (5) Scalar var/N + isqrt + 1/std. --------------
             if (cfg.invstd_cycles > 0)
-                worker.do_scalar(cfg.invstd_cycles);
+                worker.do_scalar(cfg.invstd_cycles, "scalar: invstd compute");
 
             // --- (6) Pass 3: normalize and writeback to L1. -----
             run_pass(worker, /*pass=*/3, vec_calls_local);
 
             // --- (7) Fire-and-forget L1 -> L2 channel store. ----
             if (cfg.dma_vec_wr_scalar > 0)
-                worker.do_scalar(cfg.dma_vec_wr_scalar);
+                worker.do_scalar(cfg.dma_vec_wr_scalar, "scalar: tile store");
             if (write_inflight.size() >= max_dma_writes)
             {
                 worker.finish_dma(write_inflight.front());

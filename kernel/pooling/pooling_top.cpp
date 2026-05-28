@@ -146,11 +146,11 @@ struct PoolWorker : sc_module
         }
     }
 
-    void do_scalar(uint64_t cyc)
+    void do_scalar(uint64_t cyc, const char *label = "scalar")
     {
         total_scalar_cycles += cyc;
         wait(cyc * CYCLE);
-        PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), "scalar", "scalar",
+        PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid), "scalar", label,
                         static_cast<uint64_t>(sc_time_stamp() / CYCLE) - cyc, cyc);
     }
 
@@ -197,7 +197,7 @@ struct PoolWorker : sc_module
             wait(*p.done_entry->admit_ev);
             p.stall_cycles = static_cast<uint64_t>((sc_time_stamp() - t_stall_start) / CYCLE);
             PERF_TRACE_SPAN("Scalar Unit " + std::to_string(tid),
-                            "stall (vector FIFO full)", "stall (vector FIFO full)",
+                            "stall (vector FIFO full)", "stall",
                             static_cast<uint64_t>(t_stall_start / CYCLE),
                             p.stall_cycles);
         }
@@ -257,7 +257,8 @@ struct PoolWorker : sc_module
         const uint64_t scalar_cost =
             is_write ? cfg.dma_vec_wr_scalar : cfg.dma_vec_rd_scalar;
         if (scalar_cost > 0)
-            do_scalar(scalar_cost);
+            do_scalar(scalar_cost,
+                      is_write ? "scalar: tile store" : "scalar: tile load");
 
         return p;
     }
@@ -407,7 +408,7 @@ struct PoolWorker : sc_module
                 total_wr_bytes += wr;
                 accel_inflight.push_back(std::move(req));
 
-                do_scalar(cfg.scalar_overhead);
+                do_scalar(cfg.scalar_overhead, "scalar: request to vec unit");
                 return true;
             };
 
